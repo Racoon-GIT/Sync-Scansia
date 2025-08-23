@@ -11,7 +11,6 @@ def _init_logging():
         level=getattr(logging, level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    # reduce noise from requests
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)
 
@@ -79,7 +78,7 @@ def main():
     raw_df = read_table_from_source(src)
     df = parse_scansia(raw_df, sample_rows=sample_rows)
 
-    # Preprocessing: per ogni riga, trova prodotto/variante da SKU
+    # Preprocessing
     rows = []
     skipped_sku = 0
     for _, r in df.iterrows():
@@ -132,27 +131,27 @@ def main():
         base_handle = items[0]["product_handle"]
         outlet_title, outlet_handle = make_outlet_title_handle(base_title, base_handle)
 
-        # Check esistenza Outlet ACTIVE con titolo esatto
+        # Se esiste già OUTLET ACTIVE → skip
         existing = client.products_search_by_title_active(outlet_title)
         if existing:
             skipped_existing += 1
             logger.info(f"[SKIP] Esiste già OUTLET ACTIVE per '{base_title}' → {existing[0]['id']}")
             continue
 
-        # Duplica
+        # Duplica subito con il titolo outlet (nuova API richiede newTitle)
         if dry_run:
             new_pid = "gid://shopify/Product/DRYRUN"
-            logger.info(f"[DRY-RUN] Duplicazione di {pid} → {new_pid}")
+            logger.info(f"[DRY-RUN] Duplicazione di {pid} → {new_pid} con titolo '{outlet_title}'")
         else:
-            new_pid = client.product_duplicate(pid)
+            new_pid = client.product_duplicate(pid, outlet_title)
             if not new_pid:
                 logger.error(f"[ERR] productDuplicate fallita per {pid}")
                 continue
             created += 1
 
-        # Rinomina + ACTIVE + tags=[]
+        # Aggiorna handle, status ACTIVE e svuota tag
         if dry_run:
-            logger.info(f"[DRY-RUN] Imposterei title='{outlet_title}', handle~='{outlet_handle}', status=ACTIVE, tags=[] su {new_pid}")
+            logger.info(f"[DRY-RUN] Imposterei handle~='{outlet_handle}', status=ACTIVE, tags=[] su {new_pid}")
         else:
             ensure_unique_handle(client, new_pid, outlet_title, outlet_handle)
 
@@ -162,7 +161,7 @@ def main():
         else:
             outlet_variants = client.get_product_variants(new_pid)
 
-        # Costruisci mapping KEY -> variante duplicata
+        # KEY -> variante duplicata
         var_by_key = {}
         for node in outlet_variants:
             size_val = ""
@@ -173,7 +172,7 @@ def main():
             key = build_key(node.get("sku",""), size_val)
             var_by_key[key] = node
 
-        # INVENTARIO: azzera tutto su tutte le locations
+        # INVENTARIO: azzera tutto
         if not dry_run:
             for node in outlet_variants:
                 inv_item = node["inventoryItem"]["id"].split("/")[-1]
@@ -182,7 +181,7 @@ def main():
                     loc_id = lvl["location_id"]
                     client.inventory_set(inv_item, loc_id, 0)
 
-        # PREZZI (bulk) + INVENTARIO PROMO per varianti presenti in sheet
+        # PREZZI (bulk) + INVENTARIO PROMO
         updates = []
         for it in items:
             key = it["key"]
@@ -216,7 +215,7 @@ def main():
                 client.product_variants_bulk_update(new_pid, updates)
                 price_updates += len(updates)
 
-        # INVENTARIO @ Promo per varianti presenti
+        # INVENTARIO @ Promo
         for it in items:
             key = it["key"]
             node = var_by_key.get(key)
