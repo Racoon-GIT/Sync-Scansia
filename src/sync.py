@@ -68,6 +68,37 @@ def _find_variant_by_size(variants_nodes, target_size: str):
             return n
     return None
 
+def _choose_product_prices(items):
+    """
+    Dato l'elenco di righe del GSheet per lo stesso prodotto,
+    sceglie un prezzo 'di prodotto' da applicare a tutte le varianti:
+      - sale = MIN dei Prezzo Scontato (se presenti)
+      - full = MAX dei Prezzo Pieno (se presenti)
+    Questo riduce inconsistenze tra righe e mantiene compareAt > price.
+    """
+    sale_candidates = [it["price_sale"] for it in items if it.get("price_sale") is not None]
+    full_candidates = [it["price_full"] for it in items if it.get("price_full") is not None]
+
+    sale_price = min(sale_candidates) if sale_candidates else None
+    full_price = max(full_candidates) if full_candidates else None
+
+    if sale_price is None and full_price is None:
+        logger.info("[PREZZI] Nessun prezzo disponibile nel GSheet per questo prodotto; salto update prezzi.")
+        return None, None
+
+    # Arrotonda a 2 decimali
+    if sale_price is not None:
+        sale_price = float(round(sale_price, 2))
+    if full_price is not None:
+        full_price = float(round(full_price, 2))
+
+    # Regola Shopify: compareAt deve essere > price
+    if sale_price is not None and full_price is not None and not (full_price > sale_price):
+        logger.warning(f"[PREZZI] compareAt ({full_price}) non > price ({sale_price}). Userò solo price.")
+        return sale_price, None
+
+    return sale_price, full_price
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--file", dest="file", help="Percorso locale (xlsx/csv)")
@@ -241,6 +272,7 @@ def main():
 
             # Imposta quantità corrette per le righe del GSheet
             for it in items:
+                # match per taglia (solo per inventario)
                 node = _find_variant_by_size(outlet_variants, it["size"])
                 if not node:
                     logger.warning(f"[WARN] Variante outlet non trovata per size='{it['size']}' (SKU={it['sku']})")
@@ -265,44 +297,35 @@ def main():
                     except Exception as e:
                         logger.warning(f"inventory_delete@Magazzino fallita item={inv_item}: {e}")
 
-        # PREZZI: applica price / compareAtPrice rispettando regola Shopify
+        # ===== PREZZI SU TUTTE LE VARIANTI =====
+        sale_price_product, full_price_product = _choose_product_prices(items)
+
         updates = []
-        for it in items:
-            node = _find_variant_by_size(outlet_variants, it["size"]) if outlet_variants else None
-            if not node:
-                logger.warning(f"[WARN] Variante outlet non trovata per SKU={it['sku']} Size={it['size']}")
-                continue
+        if outlet_variants and (sale_price_product is not None or full_price_product is not None):
+            for node in outlet_variants:
+                upd = {"id": node["id"]}
 
-            upd = {"id": node["id"]}
-            price_sale = it["price_sale"]
-            price_full = it["price_full"]
+                if sale_price_product is not None and full_price_product is not None:
+                    # compareAtPrice deve essere > price
+                    if full_price_product > sale_price_product:
+                        upd["price"] = float(sale_price_product)
+                        upd["compareAtPrice"] = float(full_price_product)
+                    else:
+                        upd["price"] = float(sale_price_product)
+                elif sale_price_product is not None:
+                    upd["price"] = float(sale_price_product)
+                elif full_price_product is not None:
+                    upd["price"] = float(full_price_product)
 
-            if price_sale is not None and price_full is not None:
-                # compareAtPrice deve essere > price
-                if price_full > price_sale:
-                    upd["price"] = float(round(price_sale, 2))
-                    upd["compareAtPrice"] = float(round(price_full, 2))
-                else:
-                    upd["price"] = float(round(price_sale, 2))
-            elif price_sale is not None:
-                upd["price"] = float(round(price_sale, 2))
-            elif price_full is not None:
-                upd["price"] = float(round(price_full, 2))
-
-            logger.debug(
-                "Variant %s → price=%s compareAt=%s (sku=%s size=%s)",
-                node["id"], upd.get("price"), upd.get("compareAtPrice"), it["sku"], it["size"]
-            )
-            if "price" in upd or "compareAtPrice" in upd:
                 updates.append(upd)
 
-        if updates:
             logger.info(
-                "Aggiorno %d varianti su %s con prezzi: %s",
-                len(updates), new_pid,
-                [(u.get("id"), u.get("price"), u.get("compareAtPrice")) for u in updates]
+                "Aggiorno PREZZI su tutte le %d varianti di %s → price=%s compareAt=%s",
+                len(outlet_variants), new_pid, sale_price_product if sale_price_product is not None else full_price_product, full_price_product if sale_price_product is not None else None
             )
-            if not dry_run:
+            logger.debug("Payload prezzi: %s", [(u.get("id"), u.get("price"), u.get("compareAtPrice")) for u in updates])
+
+            if not dry_run and updates:
                 client.product_variants_bulk_update(new_pid, updates)
                 price_updates += len(updates)
 
