@@ -209,10 +209,11 @@ class ShopifyClient:
         nodes = data["product"]["variants"]["nodes"] if data.get("product") else []
         logger.debug(f"get_product_variants({product_id}) → {len(nodes)} varianti")
         return nodes
+        
 
     def product_variants_bulk_update(self, product_id, variants_updates):
         q = """
-        mutation($pid: ID!, $variants: [ProductVariantBulkInput!]!) {
+        mutation($pid: ID!, $variants: [ProductVariantsBulkInput!]!) {
           productVariantsBulkUpdate(productId: $pid, variants: $variants) {
             product { id }
             userErrors { field message }
@@ -224,6 +225,7 @@ class ShopifyClient:
         if errs:
             raise RuntimeError(f"productVariantsBulkUpdate errors: {errs}")
         logger.debug(f"product_variants_bulk_update({product_id}) con {len(variants_updates)} varianti")
+
 
     def find_variants_by_sku(self, sku):
         q = """
