@@ -103,7 +103,7 @@ def parse_scansia(df: pd.DataFrame, sample_rows: int = 10) -> pd.DataFrame:
     # Debug: conteggi prima del filtro
     tot = len(out)
     mask_online = out["online"]
-    mask_qta = out["Qta"] > 1
+    mask_qta = out["Qta"] > 0
     passed = out[mask_online & mask_qta]
     dropped_online = out[~mask_online]
     dropped_qta = out[mask_online & ~mask_qta]
