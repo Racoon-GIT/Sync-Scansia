@@ -2,7 +2,7 @@ services:
 - type: cron
   name: scansia-shopify-sync
   runtime: python
-  schedule: "0 7 * * *"  # 09:00 Europe/Rome (07:00 UTC) in ora legale
+  schedule: "0 0 1 1 *"  # rarissimo; usa "Run job now" per lanciare manualmente
   buildCommand: "pip install -r requirements.txt"
   startCommand: "python -m src.sync --apply"
   envVars:
@@ -14,5 +14,9 @@ services:
     value: 2025-01
   - key: PROMO_LOCATION_NAME
     value: Promo
+  - key: MAGAZZINO_LOCATION_NAME
+    value: Magazzino
   - key: SCANSIA_URL
     sync: false
+  - key: LOG_LEVEL
+    value: INFO

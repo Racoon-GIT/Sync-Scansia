@@ -41,6 +41,14 @@ class ShopifyClient:
         r.raise_for_status()
         return r.json()
 
+    def rest_delete(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        url = f"https://{self.store}/admin/api/{self.api_version}{path}"
+        logger.debug(f"[REST] DELETE {url} params={params}")
+        r = self.session.delete(url, params=params, timeout=60)
+        if r.status_code >= 400:
+            r.raise_for_status()
+        return {}
+
     # ---- Lookups ----
     def find_variants_by_sku(self, sku: str) -> List[Dict[str, Any]]:
         q = """
@@ -64,7 +72,7 @@ class ShopifyClient:
         logger.debug(f"find_variants_by_sku({sku}) → {len(edges)} varianti")
         return [e["node"] for e in edges]
 
-    # ✅ aggiornato: richiede productId e newTitle
+    # --- Duplicate product (new args) ---
     def product_duplicate(self, product_id: str, new_title: str) -> Optional[str]:
         q = """
         mutation($productId: ID!, $newTitle: String!) {
@@ -111,7 +119,7 @@ class ShopifyClient:
         """
         data = self.graphql(q, {"q": query_str})
         nodes = [e["node"] for e in data["products"]["edges"]]
-        exact = [n for n in nodes if (n.get("title","") == title and n.get("status") == "ACTIVE")]
+        exact = [n for n in nodes if (n.get("title","") == title and n.get("status") == "ACTIVE") ]
         logger.debug(f"products_search_by_title_active('{title}') → {len(exact)} match esatti")
         return exact
 
@@ -152,6 +160,102 @@ class ShopifyClient:
         logger.debug(f"get_product_variants({product_id}) → {len(nodes)} varianti")
         return nodes
 
+    # ---- Media ----
+    def get_product_media(self, product_id: str) -> List[Dict[str, Any]]:
+        q = """
+        query($id: ID!) {
+          product(id: $id) {
+            id
+            media(first: 100) {
+              edges {
+                node {
+                  __typename
+                  ... on MediaImage {
+                    id
+                    alt
+                    image { id originalSrc }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        data = self.graphql(q, {"id": product_id})
+        nodes = [e["node"] for e in data["product"]["media"]["edges"]]
+        logger.debug(f"get_product_media({product_id}) → {len(nodes)} media")
+        return nodes
+
+    def product_update_media_alt(self, product_id: str, media_updates: List[Dict[str, Any]]):
+        q = """
+        mutation($productId: ID!, $media: [UpdateMediaInput!]!) {
+          productUpdateMedia(productId: $productId, media: $media) {
+            media { ... on MediaImage { id alt } }
+            userErrors { field message }
+          }
+        }
+        """
+        data = self.graphql(q, {"productId": product_id, "media": media_updates})
+        errs = data["productUpdateMedia"]["userErrors"]
+        if errs:
+            logger.warning(f"productUpdateMedia userErrors: {errs}")
+        return data["productUpdateMedia"].get("media", [])
+
+    def file_update(self, file_updates: List[Dict[str, Any]]):
+        q = """
+        mutation($files: [FileUpdateInput!]!) {
+          fileUpdate(files: $files) {
+            files { id filename }
+            userErrors { field message }
+          }
+        }
+        """
+        data = self.graphql(q, {"files": file_updates})
+        errs = data["fileUpdate"]["userErrors"]
+        if errs:
+            logger.warning(f"fileUpdate userErrors: {errs}")
+        return data["fileUpdate"].get("files", [])
+
+    # ---- Metafields ----
+    def get_product_metafields(self, product_id: str) -> List[Dict[str, Any]]:
+        q = """
+        query($id: ID!) {
+          product(id: $id) {
+            id
+            metafields(first: 100) {
+              edges {
+                node {
+                  id
+                  namespace
+                  key
+                  type
+                  value
+                }
+              }
+            }
+          }
+        }
+        """
+        data = self.graphql(q, {"id": product_id})
+        nodes = [e["node"] for e in data["product"]["metafields"]["edges"]]
+        logger.debug(f"get_product_metafields({product_id}) → {len(nodes)}")
+        return nodes
+
+    def metafields_set(self, entries: List[Dict[str, Any]]):
+        q = """
+        mutation($metafields: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metafields) {
+            metafields { key namespace value }
+            userErrors { field message code }
+          }
+        }
+        """
+        data = self.graphql(q, {"metafields": entries})
+        errs = data["metafieldsSet"]["userErrors"]
+        if errs:
+            logger.warning(f"metafieldsSet userErrors: {errs}")
+        return data["metafieldsSet"].get("metafields", [])
+
     # ---- Inventory / Locations (REST) ----
     def get_locations(self) -> list[dict]:
         resp = self.rest_get("/locations.json")
@@ -161,8 +265,6 @@ class ShopifyClient:
 
     def inventory_levels_for_item(self, inventory_item_id: int | str) -> dict:
         resp = self.rest_get("/inventory_levels.json", params={"inventory_item_ids": inventory_item_id})
-        levels = resp.get("inventory_levels", [])
-        logger.debug(f"inventory_levels_for_item({inventory_item_id}) → {len(levels)} locations")
         return resp
 
     def inventory_set(self, inventory_item_id: int | str, location_id: int | str, available: int):
@@ -178,4 +280,11 @@ class ShopifyClient:
         return self.rest_post("/inventory_levels/connect.json", {
             "location_id": int(location_id),
             "inventory_item_id": int(inventory_item_id),
+        })
+
+    def inventory_delete(self, inventory_item_id: int | str, location_id: int | str):
+        logger.debug(f"inventory_delete(item={inventory_item_id}, loc={location_id})")
+        return self.rest_delete("/inventory_levels.json", {
+            "inventory_item_id": int(inventory_item_id),
+            "location_id": int(location_id)
         })

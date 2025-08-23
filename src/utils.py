@@ -100,27 +100,27 @@ def parse_scansia(df: pd.DataFrame, sample_rows: int = 10) -> pd.DataFrame:
     out["Prezzo Pieno"] = pd.to_numeric(df[PFULL], errors="coerce") if PFULL else None
     out["Prezzo Scontato"] = pd.to_numeric(df[PSALE], errors="coerce") if PSALE else None
 
-    # Debug: conteggi prima del filtro
+    # Filtri
     tot = len(out)
     mask_online = out["online"]
-    mask_qta = out["Qta"] > 0
+    mask_qta = out["Qta"] > 0   # Qta > 0 come richiesto
     passed = out[mask_online & mask_qta]
     dropped_online = out[~mask_online]
     dropped_qta = out[mask_online & ~mask_qta]
 
     logger.info(f"Righe iniziali: {tot}")
     logger.info(f"Dopo filtro online==SI: {mask_online.sum()} (scartate: {len(dropped_online)})")
-    logger.info(f"Dopo filtro Qta>1 (tra quelle online): {mask_qta.sum()} (scartate per Qta<=1: {len(dropped_qta)})")
+    logger.info(f"Dopo filtro Qta>0 (tra quelle online): {mask_qta.sum()} (scartate per Qta<=0: {len(dropped_qta)})")
     logger.info(f"Totale righe pronte all'elaborazione: {len(passed)}")
 
     if logger.isEnabledFor(logging.DEBUG):
         if len(dropped_online) > 0:
             logger.debug("Esempi scartati per online!=SI:")
-            for i, row in dropped_online.head(sample_rows).iterrows():
+            for _, row in dropped_online.head(sample_rows).iterrows():
                 logger.debug(f"- SKU={row['SKU']} Size={row['Size']} online_raw={row['_online_raw']}")
         if len(dropped_qta) > 0:
-            logger.debug("Esempi scartati per Qta<=1:")
-            for i, row in dropped_qta.head(sample_rows).iterrows():
+            logger.debug("Esempi scartati per Qta<=0:")
+            for _, row in dropped_qta.head(sample_rows).iterrows():
                 logger.debug(f"- SKU={row['SKU']} Size={row['Size']} Qta_raw={row['_qta_raw']} Qta={row['Qta']}")
 
     passed = passed.drop(columns=[c for c in ["_online_raw","_qta_raw"] if c in passed.columns])

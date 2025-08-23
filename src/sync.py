@@ -4,7 +4,6 @@ from dotenv import load_dotenv
 from .utils import read_table_from_source, parse_scansia, build_key
 from .shopify_client import ShopifyClient
 
-# ---------- logging init ----------
 def _init_logging():
     level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
@@ -20,7 +19,7 @@ logger = logging.getLogger("sync")
 load_dotenv()
 
 def make_outlet_title_handle(title: str, handle: str):
-    new_title = f"{title} - outlet" if not title.lower().endswith(" - outlet") else title
+    new_title = f"{title} - Outlet" if not title.lower().endswith(" - outlet") else title.replace(" - outlet"," - Outlet")
     base_handle = f"{handle}-outlet" if not handle.endswith("-outlet") else handle
     return new_title, base_handle
 
@@ -56,6 +55,7 @@ def main():
     token = os.environ.get("SHOPIFY_ADMIN_TOKEN")
     api_version = os.environ.get("SHOPIFY_API_VERSION","2025-01")
     promo_location_name = os.environ.get("PROMO_LOCATION_NAME","Promo")
+    magazzino_location_name = os.environ.get("MAGAZZINO_LOCATION_NAME","Magazzino")
     env_url = os.environ.get("SCANSIA_URL")
     env_file = os.environ.get("SCANSIA_FILE")
     sample_rows = int(os.environ.get("LOG_SAMPLE_ROWS", "10"))
@@ -66,7 +66,7 @@ def main():
     env_dry = str(os.environ.get("DRY_RUN", "true")).strip().lower() in {"1","true","yes","y","si","sì","on","x"}
     dry_run = True if args.dry_run else (False if args.apply else env_dry)
 
-    logger.info(f"Avvio sync | store={store} | api_version={api_version} | promo_location={promo_location_name} | dry_run={dry_run}")
+    logger.info(f"Avvio sync | store={store} | api_version={api_version} | promo_location={promo_location_name} | magazzino_location={magazzino_location_name} | dry_run={dry_run}")
 
     client = ShopifyClient(store, token, api_version)
 
@@ -121,9 +121,12 @@ def main():
         raise SystemExit(f"Location '{promo_location_name}' non trovata su Shopify.")
     promo_id = promo["id"]
 
+    magazzino = next((loc for loc in locations if loc["name"].strip().lower() == magazzino_location_name.strip().lower()), None)
+    magazzino_id = magazzino["id"] if magazzino else None
+
     logger.info(f"Processing {len(by_product)} prodotti")
 
-    processed = created = skipped_existing = price_updates = inv_updates = 0
+    processed = created = skipped_existing = price_updates = inv_updates = media_updates = metafield_copied = 0
 
     for pid, items in by_product.items():
         processed += 1
@@ -131,14 +134,14 @@ def main():
         base_handle = items[0]["product_handle"]
         outlet_title, outlet_handle = make_outlet_title_handle(base_title, base_handle)
 
-        # Se esiste già OUTLET ACTIVE → skip
+        # Già esistente?
         existing = client.products_search_by_title_active(outlet_title)
         if existing:
             skipped_existing += 1
             logger.info(f"[SKIP] Esiste già OUTLET ACTIVE per '{base_title}' → {existing[0]['id']}")
             continue
 
-        # Duplica subito con il titolo outlet (nuova API richiede newTitle)
+        # Duplica con titolo outlet
         if dry_run:
             new_pid = "gid://shopify/Product/DRYRUN"
             logger.info(f"[DRY-RUN] Duplicazione di {pid} → {new_pid} con titolo '{outlet_title}'")
@@ -149,17 +152,42 @@ def main():
                 continue
             created += 1
 
-        # Aggiorna handle, status ACTIVE e svuota tag
+        # Handle + ACTIVE + tags vuoti
         if dry_run:
             logger.info(f"[DRY-RUN] Imposterei handle~='{outlet_handle}', status=ACTIVE, tags=[] su {new_pid}")
         else:
             ensure_unique_handle(client, new_pid, outlet_title, outlet_handle)
 
+        # === MEDIA ===
+        if not dry_run:
+            media = client.get_product_media(new_pid)
+            # 1) azzera ALT
+            to_clear = []
+            for m in media:
+                if m.get("__typename") == "MediaImage" and (m.get("alt") or "") != "":
+                    to_clear.append({"id": m["id"], "alt": ""})
+            if to_clear:
+                client.product_update_media_alt(new_pid, to_clear)
+                media_updates += len(to_clear)
+
+            # 2) tenta rename filename con suffisso -Outlet (se supportato)
+            upd = []
+            for m in media:
+                if m.get("__typename") != "MediaImage": 
+                    continue
+                if not (m.get("image") and m["image"].get("id")):
+                    continue
+                fid = m["image"]["id"]
+                new_name = f"{outlet_handle}-Outlet.jpg"
+                upd.append({"id": fid, "filename": new_name})
+            if upd:
+                try:
+                    client.file_update(upd)
+                except Exception as e:
+                    logger.warning(f"fileUpdate non supportato per questi media: {e}")
+
         # Varianti outlet
-        if dry_run:
-            outlet_variants = []
-        else:
-            outlet_variants = client.get_product_variants(new_pid)
+        outlet_variants = [] if dry_run else client.get_product_variants(new_pid)
 
         # KEY -> variante duplicata
         var_by_key = {}
@@ -172,16 +200,23 @@ def main():
             key = build_key(node.get("sku",""), size_val)
             var_by_key[key] = node
 
-        # INVENTARIO: azzera tutto
+        # === INVENTARIO ===
         if not dry_run:
+            # 1) azzera tutto ovunque
             for node in outlet_variants:
                 inv_item = node["inventoryItem"]["id"].split("/")[-1]
                 levels = client.inventory_levels_for_item(inv_item)
                 for lvl in levels.get("inventory_levels", []):
                     loc_id = lvl["location_id"]
                     client.inventory_set(inv_item, loc_id, 0)
+                    # 2) se la location è "Magazzino" → de-stocca (disconnect)
+                    if magazzino_id and int(loc_id) == int(magazzino_id):
+                        try:
+                            client.inventory_delete(inv_item, magazzino_id)
+                        except Exception as e:
+                            logger.warning(f"inventory_delete fallita item={inv_item} loc={magazzino_id}: {e}")
 
-        # PREZZI (bulk) + INVENTARIO PROMO
+        # PREZZI (bulk) + INVENTARIO @ Promo per varianti presenti nel foglio
         updates = []
         for it in items:
             key = it["key"]
@@ -232,7 +267,33 @@ def main():
                     pass
                 client.inventory_set(inv_item, promo_id, int(it["qta"]))
 
-    logger.info(f"FINITO | prodotti analizzati={processed} | creati={created} | già esistenti (skip)={skipped_existing} | updates_prezzi={price_updates} | updates_inventario={inv_updates}")
+        # === METAFIELD (copia dal prodotto originale) ===
+        if not dry_run:
+            try:
+                src_metafields = client.get_product_metafields(pid)
+                batch = []
+                for mf in src_metafields:
+                    batch.append({
+                        "ownerId": new_pid,
+                        "namespace": mf["namespace"],
+                        "key": mf["key"],
+                        "type": mf["type"],
+                        "value": mf["value"],
+                    })
+                    if len(batch) == 25:
+                        client.metafields_set(batch)
+                        metafield_copied += len(batch)
+                        batch = []
+                if batch:
+                    client.metafields_set(batch)
+                    metafield_copied += len(batch)
+            except Exception as e:
+                logger.warning(f"metafields copy fallita: {e}")
+
+    logger.info(
+        f"FINITO | prodotti analizzati={processed} | creati={created} | già esistenti (skip)={skipped_existing} | "
+        f"updates_prezzi={price_updates} | updates_inventario={inv_updates} | updates_media={media_updates} | metafield_copiati={metafield_copied}"
+    )
 
 if __name__ == "__main__":
     main()
