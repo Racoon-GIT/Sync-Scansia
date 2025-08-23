@@ -160,31 +160,41 @@ def main():
 
         # === MEDIA ===
         if not dry_run:
-            media = client.get_product_media(new_pid)
-            # 1) azzera ALT
-            to_clear = []
-            for m in media:
-                if m.get("__typename") == "MediaImage" and (m.get("alt") or "") != "":
-                    to_clear.append({"id": m["id"], "alt": ""})
-            if to_clear:
-                client.product_update_media_alt(new_pid, to_clear)
-                media_updates += len(to_clear)
+            # Se il duplicato è senza media, copia immagini dal prodotto sorgente
+            new_media = client.product_images_list(new_pid)
+            if not new_media:
+                src_media_nodes = client.get_product_media(pid)
+                src_urls = [m["image"]["originalSrc"] for m in src_media_nodes
+                            if m.get("__typename") == "MediaImage" and m.get("image") and m["image"].get("originalSrc")]
+                pos = 1
+                for url in src_urls:
+                    try:
+                        client.product_image_create(new_pid, url, position=pos, alt="")  # alt già vuoto
+                        pos += 1
+                        media_updates += 1
+                    except Exception as e:
+                        logger.warning(f"copy image fallita url={url}: {e}")
 
-            # 2) tenta rename filename con suffisso -Outlet (se supportato)
-            upd = []
-            for m in media:
-                if m.get("__typename") != "MediaImage": 
-                    continue
-                if not (m.get("image") and m["image"].get("id")):
-                    continue
-                fid = m["image"]["id"]
-                new_name = f"{outlet_handle}-Outlet.jpg"
-                upd.append({"id": fid, "filename": new_name})
-            if upd:
-                try:
-                    client.file_update(upd)
-                except Exception as e:
-                    logger.warning(f"fileUpdate non supportato per questi media: {e}")
+            # azzera comunque gli ALT (se presenti)
+            new_media = client.product_images_list(new_pid)
+            for im in new_media:
+                if im.get("alt"):
+                    try:
+                        client.product_image_update(new_pid, im["id"], alt="")
+                    except Exception as e:
+                        logger.warning(f"alt reset fallito image_id={im.get('id')}: {e}")
+
+        # === RIMUOVI COLLECTIONS (custom) ===
+        if not dry_run:
+            try:
+                collects = client.collects_for_product(new_pid)
+                for c in collects:
+                    try:
+                        client.delete_collect(c["id"])
+                    except Exception as e:
+                        logger.warning(f"delete_collect {c.get('id')} fallito: {e}")
+            except Exception as e:
+                logger.warning(f"collects_for_product fallito: {e}")
 
         # Varianti outlet
         outlet_variants = [] if dry_run else client.get_product_variants(new_pid)
@@ -200,27 +210,50 @@ def main():
             key = build_key(node.get("sku",""), size_val)
             var_by_key[key] = node
 
-        # === INVENTARIO ===
+        # === INVENTARIO — Ordine richiesto ===
         if not dry_run:
-            # 1) azzera tutto ovunque
+            # 1) PROMO: collega e metti TUTTE le varianti a 0
             for node in outlet_variants:
                 inv_item = node["inventoryItem"]["id"].split("/")[-1]
-                levels = client.inventory_levels_for_item(inv_item)
-                for lvl in levels.get("inventory_levels", []):
-                    loc_id = lvl["location_id"]
-                    client.inventory_set(inv_item, loc_id, 0)
-                    # 2) se la location è "Magazzino" → de-stocca (disconnect)
-                    if magazzino_id and int(loc_id) == int(magazzino_id):
-                        try:
-                            client.inventory_delete(inv_item, magazzino_id)
-                        except Exception as e:
-                            logger.warning(f"inventory_delete fallita item={inv_item} loc={magazzino_id}: {e}")
+                try:
+                    client.inventory_connect(inv_item, promo_id)
+                except Exception:
+                    pass
+                try:
+                    client.inventory_set(inv_item, promo_id, 0)
+                except Exception as e:
+                    logger.warning(f"inventory_set@Promo=0 fallita item={inv_item}: {e}")
 
-        # PREZZI (bulk) + INVENTARIO @ Promo per varianti presenti nel foglio
+            # 2) Imposta quantità corretta SOLO per le varianti in GSheet (su Promo)
+            for it in items:
+                node = var_by_key.get(it["key"])
+                if not node:
+                    continue
+                inv_item = node["inventoryItem"]["id"].split("/")[-1]
+                try:
+                    client.inventory_set(inv_item, promo_id, int(it["qta"]))
+                    inv_updates += 1
+                except Exception as e:
+                    logger.warning(f"inventory_set@Promo={int(it['qta'])} fallita item={inv_item}: {e}")
+
+            # 3) MAGAZZINO: metti a 0 e poi prova a disconnettere
+            if magazzino_id:
+                for node in outlet_variants:
+                    inv_item = node["inventoryItem"]["id"].split("/")[-1]
+                    try:
+                        client.inventory_set(inv_item, magazzino_id, 0)
+                    except Exception as e:
+                        logger.warning(f"inventory_set@Magazzino=0 fallita item={inv_item}: {e}")
+                    try:
+                        client.inventory_delete(inv_item, magazzino_id)
+                    except Exception as e:
+                        # 422 è normale per location primaria/non disconnettibile
+                        logger.warning(f"inventory_delete@Magazzino fallita item={inv_item}: {e}")
+
+        # PREZZI (bulk) su varianti presenti nel foglio
         updates = []
         for it in items:
-            key = it["key"]
-            node = var_by_key.get(key)
+            node = var_by_key.get(it["key"])
             if not node:
                 # fallback: match per sola taglia
                 for n in outlet_variants:
@@ -233,7 +266,7 @@ def main():
                         node = n
                         break
             if not node:
-                logger.warning(f"[WARN] Variante outlet non trovata per KEY={key}")
+                logger.warning(f"[WARN] Variante outlet non trovata per KEY={it['key']}")
                 continue
 
             upd = {"id": node["id"]}
@@ -249,23 +282,6 @@ def main():
             else:
                 client.product_variants_bulk_update(new_pid, updates)
                 price_updates += len(updates)
-
-        # INVENTARIO @ Promo
-        for it in items:
-            key = it["key"]
-            node = var_by_key.get(key)
-            if not node:
-                continue
-            inv_updates += 1
-            if dry_run:
-                logger.info(f"[DRY-RUN] inventory_connect/set {key} @ PROMO {promo_id} = {int(it['qta'])}")
-            else:
-                inv_item = node["inventoryItem"]["id"].split("/")[-1]
-                try:
-                    client.inventory_connect(inv_item, promo_id)
-                except Exception:
-                    pass
-                client.inventory_set(inv_item, promo_id, int(it["qta"]))
 
         # === METAFIELD (copia dal prodotto originale) ===
         if not dry_run:
