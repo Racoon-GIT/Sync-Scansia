@@ -3,7 +3,7 @@ import pandas as pd
 
 logger = logging.getLogger("sync.utils")
 
-TRUE_VALUES = {"x","1","true","yes","si","sì","y","ok","on","si'", "si’", "sì'", "sì"}  # include i + accent grave variant
+TRUE_VALUES = {"x","1","true","yes","si","sì","y","ok","on","si'", "si’", "sì'", "sì"}
 
 def to_bool_si(x) -> bool:
     if isinstance(x, bool):
@@ -20,7 +20,6 @@ def build_key(sku: str, size: str) -> str:
     return f"{norm_str(sku)}{norm_str(size)}"
 
 def gsheet_to_export_url(url: str) -> str:
-    # Converte link "edit" in export CSV
     if "docs.google.com/spreadsheets" in url and "export" not in url:
         gid = None
         m = re.search(r"[?&]gid=(\d+)", url)
@@ -36,23 +35,20 @@ def gsheet_to_export_url(url: str) -> str:
     return url
 
 def read_table_from_source(path_or_url: str) -> pd.DataFrame:
-    """Legge tabella da URL (CSV/XLSX) o locale (CSV/XLSX)."""
     if re.match(r"^https?://", str(path_or_url), flags=re.I):
         url = gsheet_to_export_url(path_or_url)
         logger.info("Scarico sorgente dati da URL")
         logger.debug(f"URL di download: {url}")
         r = requests.get(url, timeout=60)
         r.raise_for_status()
-        content_type = r.headers.get("Content-Type","").lower()
         data = r.content
-        if "text/csv" in content_type or url.endswith(".csv"):
+        if url.endswith(".csv") or "text/csv" in (r.headers.get("Content-Type","").lower()):
             df = pd.read_csv(io.BytesIO(data))
         else:
             df = pd.read_excel(io.BytesIO(data))
         logger.info(f"Tabella caricata da URL: {len(df)} righe, {len(df.columns)} colonne")
         logger.debug(f"Colonne: {list(df.columns)}")
         return df
-    # locale
     logger.info(f"Carico sorgente dati locale: {path_or_url}")
     if str(path_or_url).lower().endswith(".csv"):
         df = pd.read_csv(path_or_url)
@@ -63,7 +59,6 @@ def read_table_from_source(path_or_url: str) -> pd.DataFrame:
     return df
 
 def parse_scansia(df: pd.DataFrame, sample_rows: int = 10) -> pd.DataFrame:
-    """Mappa le colonne del Google Sheet nel formato richiesto e filtra per online/Qta."""
     cols = {c.lower().strip(): c for c in df.columns}
     logger.debug(f"Mapping colonne normalizzate → originali: {cols}")
 
@@ -85,8 +80,6 @@ def parse_scansia(df: pd.DataFrame, sample_rows: int = 10) -> pd.DataFrame:
     out = pd.DataFrame()
     out["SKU"] = df[SKU].map(norm_str)
     out["Size"] = df[SIZE].map(norm_str)
-
-    # Salvo valori raw per debug
     out["_online_raw"] = df[ONLINE]
     out["online"] = df[ONLINE].map(to_bool_si)
 
@@ -100,10 +93,9 @@ def parse_scansia(df: pd.DataFrame, sample_rows: int = 10) -> pd.DataFrame:
     out["Prezzo Pieno"] = pd.to_numeric(df[PFULL], errors="coerce") if PFULL else None
     out["Prezzo Scontato"] = pd.to_numeric(df[PSALE], errors="coerce") if PSALE else None
 
-    # Filtri
     tot = len(out)
     mask_online = out["online"]
-    mask_qta = out["Qta"] > 0   # Qta > 0 come richiesto
+    mask_qta = out["Qta"] > 0
     passed = out[mask_online & mask_qta]
     dropped_online = out[~mask_online]
     dropped_qta = out[mask_online & ~mask_qta]

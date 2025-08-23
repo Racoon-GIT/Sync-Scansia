@@ -2,3 +2,5 @@ pandas
 openpyxl
 requests
 python-dotenv
+gspread
+google-auth

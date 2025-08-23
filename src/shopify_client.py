@@ -1,10 +1,9 @@
-import requests, json, logging
+import requests, logging
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("sync.shopify")
 
 def _gid_to_num(gid: str) -> str:
-    # es: gid://shopify/Product/1234567890 -> 1234567890
     return str(gid).split("/")[-1]
 
 class ShopifyClient:
@@ -18,7 +17,6 @@ class ShopifyClient:
             "Content-Type": "application/json"
         })
 
-    # ---- GraphQL ----
     def graphql(self, query: str, variables: Dict[str, Any] | None=None) -> Dict[str, Any]:
         url = f"https://{self.store}/admin/api/{self.api_version}/graphql.json"
         logger.debug(f"[GraphQL] POST {url} vars={list((variables or {}).keys())}")
@@ -30,7 +28,6 @@ class ShopifyClient:
             raise RuntimeError(f"GraphQL errors: {data['errors']}")
         return data["data"]
 
-    # ---- REST ----
     def rest_get(self, path: str, params: Dict[str, Any] | None=None) -> Dict[str, Any]:
         url = f"https://{self.store}/admin/api/{self.api_version}{path}"
         logger.debug(f"[REST] GET {url} params={params}")
@@ -53,7 +50,6 @@ class ShopifyClient:
             r.raise_for_status()
         return {}
 
-    # ---- Lookups ----
     def find_variants_by_sku(self, sku: str) -> List[Dict[str, Any]]:
         q = """
         query($q: String!) {
@@ -76,7 +72,6 @@ class ShopifyClient:
         logger.debug(f"find_variants_by_sku({sku}) → {len(edges)} varianti")
         return [e["node"] for e in edges]
 
-    # --- Duplicate product (new args) ---
     def product_duplicate(self, product_id: str, new_title: str) -> Optional[str]:
         q = """
         mutation($productId: ID!, $newTitle: String!) {
@@ -165,7 +160,6 @@ class ShopifyClient:
         logger.debug(f"get_product_variants({product_id}) → {len(nodes)} varianti")
         return nodes
 
-    # ---- Media (GraphQL read; REST write for images) ----
     def get_product_media(self, product_id: str) -> List[Dict[str, Any]]:
         q = """
         query($id: ID!) {
@@ -206,7 +200,6 @@ class ShopifyClient:
             logger.warning(f"productUpdateMedia userErrors: {errs}")
         return data["productUpdateMedia"].get("media", [])
 
-    # --- REST helpers for product images (copy from URLs) ---
     def product_images_list(self, product_id_gid: str) -> List[Dict[str, Any]]:
         pid = _gid_to_num(product_id_gid)
         resp = self.rest_get(f"/products/{pid}/images.json")
@@ -232,23 +225,6 @@ class ShopifyClient:
         r.raise_for_status()
         return r.json()
 
-    # ---- Files API (best-effort rename) ----
-    def file_update(self, file_updates: List[Dict[str, Any]]):
-        q = """
-        mutation($files: [FileUpdateInput!]!) {
-          fileUpdate(files: $files) {
-            files { id filename }
-            userErrors { field message }
-          }
-        }
-        """
-        data = self.graphql(q, {"files": file_updates})
-        errs = data["fileUpdate"]["userErrors"]
-        if errs:
-            logger.warning(f"fileUpdate userErrors: {errs}")
-        return data["fileUpdate"].get("files", [])
-
-    # ---- Metafields ----
     def get_product_metafields(self, product_id: str) -> List[Dict[str, Any]]:
         q = """
         query($id: ID!) {
@@ -288,31 +264,19 @@ class ShopifyClient:
             logger.warning(f"metafieldsSet userErrors: {errs}")
         return data["metafieldsSet"].get("metafields", [])
 
-    # ---- Collections (REST Collects) ----
     def collects_for_product(self, product_id_gid: str) -> List[Dict[str, Any]]:
         pid = _gid_to_num(product_id_gid)
         resp = self.rest_get("/collects.json", params={"product_id": pid, "limit": 250})
-        collects = resp.get("collects", [])
-        logger.debug(f"collects_for_product({pid}) → {len(collects)}")
-        return collects
+        return resp.get("collects", [])
 
     def delete_collect(self, collect_id: int | str):
-        logger.debug(f"delete_collect({collect_id})")
         return self.rest_delete(f"/collects/{collect_id}.json", params={})
 
-    # ---- Inventory / Locations (REST) ----
     def get_locations(self) -> list[dict]:
         resp = self.rest_get("/locations.json")
-        locs = resp.get("locations", [])
-        logger.debug(f"get_locations() → {len(locs)}")
-        return locs
-
-    def inventory_levels_for_item(self, inventory_item_id: int | str) -> dict:
-        resp = self.rest_get("/inventory_levels.json", params={"inventory_item_ids": inventory_item_id})
-        return resp
+        return resp.get("locations", [])
 
     def inventory_set(self, inventory_item_id: int | str, location_id: int | str, available: int):
-        logger.debug(f"inventory_set(item={inventory_item_id}, loc={location_id}, qty={available})")
         return self.rest_post("/inventory_levels/set.json", {
             "location_id": int(location_id),
             "inventory_item_id": int(inventory_item_id),
@@ -320,14 +284,12 @@ class ShopifyClient:
         })
 
     def inventory_connect(self, inventory_item_id: int | str, location_id: int | str):
-        logger.debug(f"inventory_connect(item={inventory_item_id}, loc={location_id})")
         return self.rest_post("/inventory_levels/connect.json", {
             "location_id": int(location_id),
             "inventory_item_id": int(inventory_item_id),
         })
 
     def inventory_delete(self, inventory_item_id: int | str, location_id: int | str):
-        logger.debug(f"inventory_delete(item={inventory_item_id}, loc={location_id})")
         return self.rest_delete("/inventory_levels.json", {
             "inventory_item_id": int(inventory_item_id),
             "location_id": int(location_id)
