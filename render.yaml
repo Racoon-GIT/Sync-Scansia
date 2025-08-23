@@ -1,0 +1,18 @@
+services:
+- type: cron
+  name: scansia-shopify-sync
+  runtime: python
+  schedule: "0 7 * * *"  # 09:00 Europe/Rome (07:00 UTC) in ora legale
+  buildCommand: "pip install -r requirements.txt"
+  startCommand: "python -m src.sync --apply"
+  envVars:
+  - key: SHOPIFY_STORE
+    sync: false
+  - key: SHOPIFY_ADMIN_TOKEN
+    sync: false
+  - key: SHOPIFY_API_VERSION
+    value: 2025-01
+  - key: PROMO_LOCATION_NAME
+    value: Promo
+  - key: SCANSIA_URL
+    sync: false
