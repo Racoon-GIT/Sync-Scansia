@@ -19,4 +19,23 @@ python -m src.sync --dry-run
 python -m src.sync --apply
 ```
 
-Configura le variabili in `.env` (crealo partendo da `.env.example`) oppure come variabili d'ambiente.
+## Configurazione (.env)
+Vedi `.env.example` e imposta:
+```
+SHOPIFY_STORE=...
+SHOPIFY_ADMIN_TOKEN=...
+SHOPIFY_API_VERSION=2025-01
+PROMO_LOCATION_NAME=Promo
+SCANSIA_URL=https://docs.google.com/spreadsheets/d/XXXXX/edit#gid=0
+DRY_RUN=true
+LOG_LEVEL=INFO   # usa DEBUG per log dettagliato
+LOG_SAMPLE_ROWS=10
+```
+
+## Logging
+- **LOG_LEVEL=DEBUG** abilita logging strutturato e dettagliato:
+  - mapping delle colonne riconosciute,
+  - conteggio righe iniziali e dopo i filtri,
+  - motivi di esclusione (esempi fino a `LOG_SAMPLE_ROWS`),
+  - esito lookup SKU, duplicazione, update prezzi, inventario.
+- Tutto il logging usa il modulo standard `logging` con timestamp.

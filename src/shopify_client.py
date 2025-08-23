@@ -1,5 +1,7 @@
-import requests, json
+import requests, json, logging
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger("sync.shopify")
 
 class ShopifyClient:
     def __init__(self, store: str, token: str, api_version: str="2025-01"):
@@ -15,23 +17,26 @@ class ShopifyClient:
     # ---- GraphQL ----
     def graphql(self, query: str, variables: Dict[str, Any] | None=None) -> Dict[str, Any]:
         url = f"https://{self.store}/admin/api/{self.api_version}/graphql.json"
-        payload = {"query": query, "variables": variables or {}}
-        r = self.session.post(url, json=payload, timeout=60)
+        logger.debug(f"[GraphQL] POST {url} vars={list((variables or {}).keys())}")
+        r = self.session.post(url, json={"query": query, "variables": variables or {}}, timeout=60)
         r.raise_for_status()
         data = r.json()
         if "errors" in data:
+            logger.error(f"GraphQL errors: {data['errors']}")
             raise RuntimeError(f"GraphQL errors: {data['errors']}")
         return data["data"]
 
     # ---- REST ----
     def rest_get(self, path: str, params: Dict[str, Any] | None=None) -> Dict[str, Any]:
         url = f"https://{self.store}/admin/api/{self.api_version}{path}"
+        logger.debug(f"[REST] GET {url} params={params}")
         r = self.session.get(url, params=params, timeout=60)
         r.raise_for_status()
         return r.json()
 
     def rest_post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = f"https://{self.store}/admin/api/{self.api_version}{path}"
+        logger.debug(f"[REST] POST {url} payload_keys={list(payload.keys())}")
         r = self.session.post(url, json=payload, timeout=60)
         r.raise_for_status()
         return r.json()
@@ -55,7 +60,9 @@ class ShopifyClient:
         }
         """
         data = self.graphql(q, {"q": f"sku:{sku}"})
-        return [e["node"] for e in data["productVariants"]["edges"]]
+        edges = data["productVariants"]["edges"]
+        logger.debug(f"find_variants_by_sku({sku}) → {len(edges)} varianti")
+        return [e["node"] for e in edges]
 
     def product_duplicate(self, product_id: str) -> Optional[str]:
         q = """
@@ -69,8 +76,10 @@ class ShopifyClient:
         data = self.graphql(q, {"id": product_id})
         errs = data["productDuplicate"]["userErrors"]
         if errs:
+            logger.error(f"productDuplicate userErrors: {errs}")
             return None
         newp = data["productDuplicate"]["newProduct"]
+        logger.debug(f"product_duplicate({product_id}) → {newp}")
         return newp["id"] if newp else None
 
     def product_update(self, product_id: str, **fields):
@@ -82,15 +91,15 @@ class ShopifyClient:
           }
         }
         """
-        inp = {"id": product_id} | fields
-        data = self.graphql(q, {"input": inp})
+        logger.debug(f"product_update({product_id}, fields={list(fields.keys())})")
+        data = self.graphql(q, {"input": {"id": product_id} | fields})
         errs = data["productUpdate"]["userErrors"]
         if errs:
+            logger.error(f"productUpdate userErrors: {errs}")
             raise RuntimeError(f"productUpdate errors: {errs}")
         return data["productUpdate"]["product"]
 
     def products_search_by_title_active(self, title: str) -> List[Dict[str, Any]]:
-        # Cerca prodotti ACTIVE con titolo esatto lato client
         query_str = f'title:{json.dumps(title)} status:active'
         q = """
         query($q: String!) {
@@ -101,7 +110,9 @@ class ShopifyClient:
         """
         data = self.graphql(q, {"q": query_str})
         nodes = [e["node"] for e in data["products"]["edges"]]
-        return [n for n in nodes if (n.get("title","") == title and n.get("status") == "ACTIVE")]
+        exact = [n for n in nodes if (n.get("title","") == title and n.get("status") == "ACTIVE")]
+        logger.debug(f"products_search_by_title_active('{title}') → {len(exact)} match esatti")
+        return exact
 
     def product_variants_bulk_update(self, product_id: str, variants: List[Dict[str, Any]]):
         q = """
@@ -112,9 +123,11 @@ class ShopifyClient:
           }
         }
         """
+        logger.debug(f"product_variants_bulk_update({product_id}) con {len(variants)} varianti")
         data = self.graphql(q, {"pid": product_id, "variants": variants})
         errs = data["productVariantsBulkUpdate"]["userErrors"]
         if errs:
+            logger.error(f"productVariantsBulkUpdate userErrors: {errs}")
             raise RuntimeError(f"productVariantsBulkUpdate errors: {errs}")
         return data["productVariantsBulkUpdate"]["productVariants"]
 
@@ -134,16 +147,25 @@ class ShopifyClient:
         }
         """
         data = self.graphql(q, {"id": product_id})
-        return [e["node"] for e in data["product"]["variants"]["edges"]]
+        nodes = [e["node"] for e in data["product"]["variants"]["edges"]]
+        logger.debug(f"get_product_variants({product_id}) → {len(nodes)} varianti")
+        return nodes
 
     # ---- Inventory / Locations (REST) ----
     def get_locations(self) -> list[dict]:
-        return self.rest_get("/locations.json").get("locations", [])
+        resp = self.rest_get("/locations.json")
+        locs = resp.get("locations", [])
+        logger.debug(f"get_locations() → {len(locs)}")
+        return locs
 
     def inventory_levels_for_item(self, inventory_item_id: int | str) -> dict:
-        return self.rest_get("/inventory_levels.json", params={"inventory_item_ids": inventory_item_id})
+        resp = self.rest_get("/inventory_levels.json", params={"inventory_item_ids": inventory_item_id})
+        levels = resp.get("inventory_levels", [])
+        logger.debug(f"inventory_levels_for_item({inventory_item_id}) → {len(levels)} locations")
+        return resp
 
     def inventory_set(self, inventory_item_id: int | str, location_id: int | str, available: int):
+        logger.debug(f"inventory_set(item={inventory_item_id}, loc={location_id}, qty={available})")
         return self.rest_post("/inventory_levels/set.json", {
             "location_id": int(location_id),
             "inventory_item_id": int(inventory_item_id),
@@ -151,6 +173,7 @@ class ShopifyClient:
         })
 
     def inventory_connect(self, inventory_item_id: int | str, location_id: int | str):
+        logger.debug(f"inventory_connect(item={inventory_item_id}, loc={location_id})")
         return self.rest_post("/inventory_levels/connect.json", {
             "location_id": int(location_id),
             "inventory_item_id": int(inventory_item_id),
