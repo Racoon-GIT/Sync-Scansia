@@ -1,4 +1,7 @@
-import os, argparse, math, logging
+import os
+import argparse
+import math
+import logging
 from dotenv import load_dotenv
 
 from .utils import read_table_from_source, parse_scansia, build_key
@@ -7,21 +10,26 @@ from .gsheets import write_product_ids
 
 def _init_logging():
     level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(level=getattr(logging, level, logging.INFO),
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)
 
 _init_logging()
 logger = logging.getLogger("sync")
+
 load_dotenv()
 
 def make_outlet_title_handle(title: str, handle: str):
-    new_title = f"{title} - Outlet" if not title.lower().endswith(" - outlet") else title.replace(" - outlet"," - Outlet")
+    """Applica ' - Outlet' al titolo e '-outlet' all'handle."""
+    new_title = f"{title} - Outlet" if not title.lower().endswith(" - outlet") else title.replace(" - outlet", " - Outlet")
     base_handle = f"{handle}-outlet" if not handle.endswith("-outlet") else handle
     return new_title, base_handle
 
 def ensure_unique_handle(client: ShopifyClient, product_id: str, title: str, base_handle: str):
+    """Tenta fino a 10 handle diversi se quello desiderato è già preso."""
     attempt = 0
     while attempt < 10:
         try_handle = base_handle if attempt == 0 else f"{base_handle}-{attempt+1}"
@@ -41,19 +49,38 @@ def ensure_unique_handle(client: ShopifyClient, product_id: str, title: str, bas
     client.product_update(product_id, title=title, status="ACTIVE", tags=[])
     return None
 
+# Sinonimi possibili del nome opzione taglia
+SIZE_OPTION_NAMES = {"size", "taglia", "eu size", "taglia eu", "shoe size"}
+
+def _option_size_of(variant_node) -> str:
+    """Estrae il valore di size/taglia dalla variante (string normalizzata)."""
+    for opt in (variant_node.get("selectedOptions") or []):
+        name = (opt.get("name") or "").strip().lower()
+        if name in SIZE_OPTION_NAMES:
+            return (opt.get("value") or "").strip()
+    return ""
+
+def _find_variant_by_size(variants_nodes, target_size: str):
+    """Trova la variante con size==target_size (confronto stringa trim)."""
+    t = (target_size or "").strip()
+    for n in variants_nodes:
+        if _option_size_of(n) == t:
+            return n
+    return None
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--file", dest="file", help="Percorso locale (xlsx/csv)")
     ap.add_argument("--url", dest="url", help="URL Google Sheet/CSV/XLSX (pubblico)")
-    ap.add_argument("--apply", action="store_true")
-    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--apply", action="store_true", help="Applica modifiche (default: DRY_RUN)")
+    ap.add_argument("--dry-run", action="store_true", help="Forza dry-run (ignora --apply)")
     args = ap.parse_args()
 
     store = os.environ.get("SHOPIFY_STORE")
     token = os.environ.get("SHOPIFY_ADMIN_TOKEN")
-    api_version = os.environ.get("SHOPIFY_API_VERSION","2025-01")
-    promo_location_name = os.environ.get("PROMO_LOCATION_NAME","Promo")
-    magazzino_location_name = os.environ.get("MAGAZZINO_LOCATION_NAME","Magazzino")
+    api_version = os.environ.get("SHOPIFY_API_VERSION", "2025-01")
+    promo_location_name = os.environ.get("PROMO_LOCATION_NAME", "Promo")
+    magazzino_location_name = os.environ.get("MAGAZZINO_LOCATION_NAME", "Magazzino")
     env_url = os.environ.get("SCANSIA_URL")
     env_file = os.environ.get("SCANSIA_FILE")
     sample_rows = int(os.environ.get("LOG_SAMPLE_ROWS", "10"))
@@ -62,12 +89,14 @@ def main():
     if not (store and token):
         raise SystemExit("Config mancante: SHOPIFY_STORE/SHOPIFY_ADMIN_TOKEN")
 
-    env_dry = str(os.environ.get("DRY_RUN", "true")).strip().lower() in {"1","true","yes","y","si","sì","on","x"}
+    env_dry = str(os.environ.get("DRY_RUN", "true")).strip().lower() in {"1", "true", "yes", "y", "si", "sì", "on", "x"}
     dry_run = True if args.dry_run else (False if args.apply else env_dry)
 
     logger.info(f"Avvio sync | store={store} | api_version={api_version} | promo_location={promo_location_name} | magazzino_location={magazzino_location_name} | dry_run={dry_run}")
 
     client = ShopifyClient(store, token, api_version)
+
+    # Sorgente dati
     src = args.url or env_url or args.file or env_file
     if not src:
         raise SystemExit("Specifica --url, --file o SCANSIA_URL/SCANSIA_FILE")
@@ -76,6 +105,7 @@ def main():
     raw_df = read_table_from_source(src)
     df = parse_scansia(raw_df, sample_rows=sample_rows)
 
+    # Prepara righe
     rows = []
     skipped_sku = 0
     for _, r in df.iterrows():
@@ -101,7 +131,7 @@ def main():
             "qta": qta,
             "price_full": (None if (isinstance(p_full, float) and math.isnan(p_full)) else p_full),
             "price_sale": (None if (isinstance(p_sale, float) and math.isnan(p_sale)) else p_sale),
-            "key": f"{sku}{size}",
+            "key": build_key(sku, size),
         })
 
     logger.info(f"Righe candidate dopo filtro: {len(df)} | con SKU validi: {len(rows)} | SKU non trovati: {skipped_sku}")
@@ -111,11 +141,13 @@ def main():
     for it in rows:
         by_product[it["product_id"]].append(it)
 
+    # Locations
     locations = client.get_locations()
     promo = next((loc for loc in locations if loc["name"].strip().lower() == promo_location_name.strip().lower()), None)
     if not promo:
         raise SystemExit(f"Location '{promo_location_name}' non trovata su Shopify.")
     promo_id = promo["id"]
+
     magazzino = next((loc for loc in locations if loc["name"].strip().lower() == magazzino_location_name.strip().lower()), None)
     magazzino_id = magazzino["id"] if magazzino else None
 
@@ -128,15 +160,16 @@ def main():
         processed += 1
         base_title = items[0]["product_title"]
         base_handle = items[0]["product_handle"]
-        outlet_title = f"{base_title} - Outlet" if not base_title.lower().endswith(" - outlet") else base_title.replace(" - outlet"," - Outlet")
-        outlet_handle = f"{base_handle}-outlet" if not base_handle.endswith("-outlet") else base_handle
+        outlet_title, outlet_handle = make_outlet_title_handle(base_title, base_handle)
 
+        # esiste già un prodotto ACTIVE con titolo outlet?
         existing = client.products_search_by_title_active(outlet_title)
         if existing:
             skipped_existing += 1
             logger.info(f"[SKIP] Esiste già OUTLET ACTIVE per '{base_title}' → {existing[0]['id']}")
             continue
 
+        # Duplica prodotto
         if dry_run:
             new_pid = "gid://shopify/Product/DRYRUN"
             logger.info(f"[DRY-RUN] Duplicazione di {pid} → {new_pid} con titolo '{outlet_title}'")
@@ -147,13 +180,13 @@ def main():
                 continue
             created += 1
 
-        if not dry_run:
-            try:
-                client.product_update(new_pid, title=outlet_title, handle=outlet_handle, status="ACTIVE", tags=[])
-                logger.info(f"Impostato title/handle/status/tags su prodotto outlet {new_pid} (handle={outlet_handle})")
-            except Exception as e:
-                logger.warning(f"product_update handle fallita: {e}")
+        # Titolo/handle/status/tags
+        if dry_run:
+            logger.info(f"[DRY-RUN] Imposterei handle~='{outlet_handle}', status=ACTIVE, tags=[] su {new_pid}")
+        else:
+            ensure_unique_handle(client, new_pid, outlet_title, outlet_handle)
 
+        # Media: copia se mancano e reset ALT
         if not dry_run:
             new_media = client.product_images_list(new_pid)
             if not new_media:
@@ -168,6 +201,7 @@ def main():
                         media_updates += 1
                     except Exception as e:
                         logger.warning(f"copy image fallita url={url}: {e}")
+            # reset ALT in ogni caso
             new_media = client.product_images_list(new_pid)
             for im in new_media:
                 if im.get("alt"):
@@ -176,6 +210,7 @@ def main():
                     except Exception as e:
                         logger.warning(f"alt reset fallito image_id={im.get('id')}: {e}")
 
+        # Collections: rimuovi eventuali collects del duplicato
         if not dry_run:
             try:
                 collects = client.collects_for_product(new_pid)
@@ -187,8 +222,12 @@ def main():
             except Exception as e:
                 logger.warning(f"collects_for_product fallito: {e}")
 
+        # Varianti del duplicato
         outlet_variants = [] if dry_run else client.get_product_variants(new_pid)
+
+        # INVENTORY: prima alloco su Promo (0 a tutte, poi quantità alle target), poi de-stock da Magazzino
         if not dry_run:
+            # Connetti e azzera su Promo tutte le varianti
             for node in outlet_variants:
                 inv_item = node["inventoryItem"]["id"].split("/")[-1]
                 try:
@@ -200,9 +239,11 @@ def main():
                 except Exception as e:
                     logger.warning(f"inventory_set@Promo=0 fallita item={inv_item}: {e}")
 
+            # Imposta quantità corrette per le righe del GSheet
             for it in items:
-                node = next((n for n in outlet_variants if any((opt.get("name","").lower() in ("size","taglia") and opt.get("value","")==it["size"]) for opt in (n.get("selectedOptions") or []))), None)
+                node = _find_variant_by_size(outlet_variants, it["size"])
                 if not node:
+                    logger.warning(f"[WARN] Variante outlet non trovata per size='{it['size']}' (SKU={it['sku']})")
                     continue
                 inv_item = node["inventoryItem"]["id"].split("/")[-1]
                 try:
@@ -211,6 +252,7 @@ def main():
                 except Exception as e:
                     logger.warning(f"inventory_set@Promo={int(it['qta'])} fallita item={inv_item}: {e}")
 
+            # Solo dopo, pulisci Magazzino
             if magazzino_id:
                 for node in outlet_variants:
                     inv_item = node["inventoryItem"]["id"].split("/")[-1]
@@ -223,22 +265,48 @@ def main():
                     except Exception as e:
                         logger.warning(f"inventory_delete@Magazzino fallita item={inv_item}: {e}")
 
+        # PREZZI: applica price / compareAtPrice rispettando regola Shopify
         updates = []
         for it in items:
-            node = next((n for n in outlet_variants if any((opt.get("name","").lower() in ("size","taglia") and opt.get("value","")==it["size"]) for opt in (n.get("selectedOptions") or []))), None)
+            node = _find_variant_by_size(outlet_variants, it["size"]) if outlet_variants else None
             if not node:
                 logger.warning(f"[WARN] Variante outlet non trovata per SKU={it['sku']} Size={it['size']}")
                 continue
-            upd = {"id": node["id"]}
-            if it["price_sale"] is not None:
-                upd["price"] = float(it["price_sale"])
-            if it["price_full"] is not None:
-                upd["compareAtPrice"] = float(it["price_full"])
-            updates.append(upd)
-        if updates and not dry_run:
-            client.product_variants_bulk_update(new_pid, updates)
-            price_updates += len(updates)
 
+            upd = {"id": node["id"]}
+            price_sale = it["price_sale"]
+            price_full = it["price_full"]
+
+            if price_sale is not None and price_full is not None:
+                # compareAtPrice deve essere > price
+                if price_full > price_sale:
+                    upd["price"] = float(round(price_sale, 2))
+                    upd["compareAtPrice"] = float(round(price_full, 2))
+                else:
+                    upd["price"] = float(round(price_sale, 2))
+            elif price_sale is not None:
+                upd["price"] = float(round(price_sale, 2))
+            elif price_full is not None:
+                upd["price"] = float(round(price_full, 2))
+
+            logger.debug(
+                "Variant %s → price=%s compareAt=%s (sku=%s size=%s)",
+                node["id"], upd.get("price"), upd.get("compareAtPrice"), it["sku"], it["size"]
+            )
+            if "price" in upd or "compareAtPrice" in upd:
+                updates.append(upd)
+
+        if updates:
+            logger.info(
+                "Aggiorno %d varianti su %s con prezzi: %s",
+                len(updates), new_pid,
+                [(u.get("id"), u.get("price"), u.get("compareAtPrice")) for u in updates]
+            )
+            if not dry_run:
+                client.product_variants_bulk_update(new_pid, updates)
+                price_updates += len(updates)
+
+        # Metafield (copia batch)
         if not dry_run:
             try:
                 src_metafields = client.get_product_metafields(pid)
@@ -252,16 +320,21 @@ def main():
                         "value": mf["value"],
                     })
                     if len(batch) == 25:
-                        client.metafields_set(batch); batch = []
+                        client.metafields_set(batch)
+                        metafield_copied += len(batch)
+                        batch = []
                 if batch:
                     client.metafields_set(batch)
+                    metafield_copied += len(batch)
             except Exception as e:
                 logger.warning(f"metafields copy fallita: {e}")
 
+        # Write-back Product_id al GSheet
         if not dry_run:
             for it in items:
                 writebacks.append({"sku": it["sku"], "size": it["size"], "new_product_id": new_pid})
 
+    # Salvataggio su GSheet
     if (not dry_run) and src.startswith("http"):
         try:
             written = write_product_ids(src, writebacks, worksheet_name=ws_name)
@@ -269,8 +342,11 @@ def main():
         except Exception as e:
             logger.warning(f"Write-back Product_id fallito: {e}")
 
-    logger.info("FINITO | prodotti analizzati=%d | creati=%d | già esistenti (skip)=%d | updates_prezzi=%d | updates_inventario=%d | updates_media=%d",
-                processed, created, skipped_existing, price_updates, inv_updates, media_updates)
+    logger.info(
+        "FINITO | prodotti analizzati=%d | creati=%d | già esistenti (skip)=%d | updates_prezzi=%d | "
+        "updates_inventario=%d | updates_media=%d | metafield_copiati=%d",
+        processed, created, skipped_existing, price_updates, inv_updates, media_updates, metafield_copied
+    )
 
 if __name__ == "__main__":
     main()
