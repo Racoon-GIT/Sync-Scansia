@@ -29,31 +29,26 @@ def make_outlet_title_handle(title: str, handle: str):
     return new_title, base_handle
 
 def ensure_unique_handle(client: ShopifyClient, product_id: str, title: str, base_handle: str):
-    """Tenta fino a 10 handle diversi se quello desiderato è già preso."""
-    attempt = 0
-    while attempt < 10:
-        try_handle = base_handle if attempt == 0 else f"{base_handle}-{attempt+1}"
-        try:
-            client.product_update(product_id, title=title, handle=try_handle, status="ACTIVE", tags=[])
-            logger.info(f"Impostato title/handle/status/tags su prodotto outlet {product_id} (handle={try_handle})")
-            return try_handle
-        except RuntimeError as e:
-            msg = str(e).lower()
-            if "handle" in msg and "taken" in msg:
-                logger.warning(f"Handle '{try_handle}' già in uso. Riprovo con suffisso...")
-                attempt += 1
-                continue
-            logger.error(f"Errore product_update: {e}")
-            raise
-    logger.warning("Tutti i tentativi handle falliti; aggiorno solo titolo+status+tags senza handle.")
-    client.product_update(product_id, title=title, status="ACTIVE", tags=[])
-    return None
+    """
+    Prova a impostare title/handle/status/tags. Se l'handle desiderato è già usato,
+    NON fallisce: applica comunque title/status/tags lasciando l'handle auto-generato da Shopify.
+    """
+    try:
+        client.product_update(product_id, title=title, handle=base_handle, status="ACTIVE", tags=[])
+        logger.info(f"Impostato title/handle/status/tags su prodotto outlet {product_id} (handle={base_handle})")
+        return base_handle
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if "handle" in msg and ("already in use" in msg or "taken" in msg):
+            logger.warning(f"Handle '{base_handle}' già in uso. Mantengo l'handle assegnato da Shopify e aggiorno solo il resto.")
+            client.product_update(product_id, title=title, status="ACTIVE", tags=[])
+            return None
+        logger.error(f"Errore product_update: {e}")
+        raise
 
-# Sinonimi possibili del nome opzione taglia
 SIZE_OPTION_NAMES = {"size", "taglia", "eu size", "taglia eu", "shoe size"}
 
 def _option_size_of(variant_node) -> str:
-    """Estrae il valore di size/taglia dalla variante (string normalizzata)."""
     for opt in (variant_node.get("selectedOptions") or []):
         name = (opt.get("name") or "").strip().lower()
         if name in SIZE_OPTION_NAMES:
@@ -61,7 +56,6 @@ def _option_size_of(variant_node) -> str:
     return ""
 
 def _find_variant_by_size(variants_nodes, target_size: str):
-    """Trova la variante con size==target_size (confronto stringa trim)."""
     t = (target_size or "").strip()
     for n in variants_nodes:
         if _option_size_of(n) == t:
@@ -69,34 +63,20 @@ def _find_variant_by_size(variants_nodes, target_size: str):
     return None
 
 def _choose_product_prices(items):
-    """
-    Dato l'elenco di righe del GSheet per lo stesso prodotto,
-    sceglie un prezzo 'di prodotto' da applicare a tutte le varianti:
-      - sale = MIN dei Prezzo Scontato (se presenti)
-      - full = MAX dei Prezzo Pieno (se presenti)
-    Questo riduce inconsistenze tra righe e mantiene compareAt > price.
-    """
     sale_candidates = [it["price_sale"] for it in items if it.get("price_sale") is not None]
     full_candidates = [it["price_full"] for it in items if it.get("price_full") is not None]
-
     sale_price = min(sale_candidates) if sale_candidates else None
     full_price = max(full_candidates) if full_candidates else None
-
     if sale_price is None and full_price is None:
         logger.info("[PREZZI] Nessun prezzo disponibile nel GSheet per questo prodotto; salto update prezzi.")
         return None, None
-
-    # Arrotonda a 2 decimali
     if sale_price is not None:
         sale_price = float(round(sale_price, 2))
     if full_price is not None:
         full_price = float(round(full_price, 2))
-
-    # Regola Shopify: compareAt deve essere > price
     if sale_price is not None and full_price is not None and not (full_price > sale_price):
         logger.warning(f"[PREZZI] compareAt ({full_price}) non > price ({sale_price}). Userò solo price.")
         return sale_price, None
-
     return sale_price, full_price
 
 def main():
@@ -127,7 +107,6 @@ def main():
 
     client = ShopifyClient(store, token, api_version)
 
-    # Sorgente dati
     src = args.url or env_url or args.file or env_file
     if not src:
         raise SystemExit("Specifica --url, --file o SCANSIA_URL/SCANSIA_FILE")
@@ -136,7 +115,6 @@ def main():
     raw_df = read_table_from_source(src)
     df = parse_scansia(raw_df, sample_rows=sample_rows)
 
-    # Prepara righe
     rows = []
     skipped_sku = 0
     for _, r in df.iterrows():
@@ -172,7 +150,6 @@ def main():
     for it in rows:
         by_product[it["product_id"]].append(it)
 
-    # Locations
     locations = client.get_locations()
     promo = next((loc for loc in locations if loc["name"].strip().lower() == promo_location_name.strip().lower()), None)
     if not promo:
@@ -193,14 +170,22 @@ def main():
         base_handle = items[0]["product_handle"]
         outlet_title, outlet_handle = make_outlet_title_handle(base_title, base_handle)
 
-        # esiste già un prodotto ACTIVE con titolo outlet?
-        existing = client.products_search_by_title_active(outlet_title)
-        if existing:
+        # 1) se esiste già un OUTLET ACTIVE → skip come prima
+        existing_active = client.products_search_by_title_active(outlet_title)
+        if existing_active:
             skipped_existing += 1
-            logger.info(f"[SKIP] Esiste già OUTLET ACTIVE per '{base_title}' → {existing[0]['id']}")
+            logger.info(f"[SKIP] Esiste già OUTLET ACTIVE per '{base_title}' → {existing_active[0]['id']}")
             continue
 
-        # Duplica prodotto
+        # 2) se NON esiste ACTIVE ma esistono DRAFT con esatto titolo → cancellali
+        existing_any = client.products_search_by_title_any(outlet_title)
+        drafts = [p for p in existing_any if p["title"] == outlet_title and p["status"] == "DRAFT"]
+        if drafts and not dry_run:
+            for d in drafts:
+                logger.info(f"Elimino OUTLET DRAFT pre-esistente prima della duplicazione → {d['id']} ({d['handle']})")
+                client.product_delete(d["id"])
+
+        # 3) Duplica prodotto (pulito)
         if dry_run:
             new_pid = "gid://shopify/Product/DRYRUN"
             logger.info(f"[DRY-RUN] Duplicazione di {pid} → {new_pid} con titolo '{outlet_title}'")
@@ -211,13 +196,13 @@ def main():
                 continue
             created += 1
 
-        # Titolo/handle/status/tags
+        # 4) Titolo/handle/status/tags
         if dry_run:
             logger.info(f"[DRY-RUN] Imposterei handle~='{outlet_handle}', status=ACTIVE, tags=[] su {new_pid}")
         else:
             ensure_unique_handle(client, new_pid, outlet_title, outlet_handle)
 
-        # Media: copia se mancano e reset ALT
+        # 5) Media: copia se mancano e reset ALT
         if not dry_run:
             new_media = client.product_images_list(new_pid)
             if not new_media:
@@ -232,7 +217,7 @@ def main():
                         media_updates += 1
                     except Exception as e:
                         logger.warning(f"copy image fallita url={url}: {e}")
-            # reset ALT in ogni caso
+            # reset ALT (anche se già copiate)
             new_media = client.product_images_list(new_pid)
             for im in new_media:
                 if im.get("alt"):
@@ -241,7 +226,7 @@ def main():
                     except Exception as e:
                         logger.warning(f"alt reset fallito image_id={im.get('id')}: {e}")
 
-        # Collections: rimuovi eventuali collects del duplicato
+        # 6) Collections: rimuovi collects
         if not dry_run:
             try:
                 collects = client.collects_for_product(new_pid)
@@ -253,12 +238,11 @@ def main():
             except Exception as e:
                 logger.warning(f"collects_for_product fallito: {e}")
 
-        # Varianti del duplicato
+        # 7) Varianti del duplicato
         outlet_variants = [] if dry_run else client.get_product_variants(new_pid)
 
-        # INVENTORY: prima alloco su Promo (0 a tutte, poi quantità alle target), poi de-stock da Magazzino
+        # 8) INVENTORY: prima Promo (0 a tutte, poi quantità target), poi de-stock Magazzino
         if not dry_run:
-            # Connetti e azzera su Promo tutte le varianti
             for node in outlet_variants:
                 inv_item = node["inventoryItem"]["id"].split("/")[-1]
                 try:
@@ -270,9 +254,7 @@ def main():
                 except Exception as e:
                     logger.warning(f"inventory_set@Promo=0 fallita item={inv_item}: {e}")
 
-            # Imposta quantità corrette per le righe del GSheet
             for it in items:
-                # match per taglia (solo per inventario)
                 node = _find_variant_by_size(outlet_variants, it["size"])
                 if not node:
                     logger.warning(f"[WARN] Variante outlet non trovata per size='{it['size']}' (SKU={it['sku']})")
@@ -284,7 +266,6 @@ def main():
                 except Exception as e:
                     logger.warning(f"inventory_set@Promo={int(it['qta'])} fallita item={inv_item}: {e}")
 
-            # Solo dopo, pulisci Magazzino
             if magazzino_id:
                 for node in outlet_variants:
                     inv_item = node["inventoryItem"]["id"].split("/")[-1]
@@ -297,16 +278,13 @@ def main():
                     except Exception as e:
                         logger.warning(f"inventory_delete@Magazzino fallita item={inv_item}: {e}")
 
-        # ===== PREZZI SU TUTTE LE VARIANTI =====
+        # 9) PREZZI su tutte le varianti
         sale_price_product, full_price_product = _choose_product_prices(items)
-
         updates = []
         if outlet_variants and (sale_price_product is not None or full_price_product is not None):
             for node in outlet_variants:
                 upd = {"id": node["id"]}
-
                 if sale_price_product is not None and full_price_product is not None:
-                    # compareAtPrice deve essere > price
                     if full_price_product > sale_price_product:
                         upd["price"] = float(sale_price_product)
                         upd["compareAtPrice"] = float(full_price_product)
@@ -316,12 +294,13 @@ def main():
                     upd["price"] = float(sale_price_product)
                 elif full_price_product is not None:
                     upd["price"] = float(full_price_product)
-
                 updates.append(upd)
 
             logger.info(
                 "Aggiorno PREZZI su tutte le %d varianti di %s → price=%s compareAt=%s",
-                len(outlet_variants), new_pid, sale_price_product if sale_price_product is not None else full_price_product, full_price_product if sale_price_product is not None else None
+                len(outlet_variants), new_pid,
+                sale_price_product if sale_price_product is not None else full_price_product,
+                full_price_product if sale_price_product is not None else None
             )
             logger.debug("Payload prezzi: %s", [(u.get("id"), u.get("price"), u.get("compareAtPrice")) for u in updates])
 
@@ -329,7 +308,7 @@ def main():
                 client.product_variants_bulk_update(new_pid, updates)
                 price_updates += len(updates)
 
-        # Metafield (copia batch)
+        # 10) Metafield (copia)
         if not dry_run:
             try:
                 src_metafields = client.get_product_metafields(pid)
@@ -352,7 +331,7 @@ def main():
             except Exception as e:
                 logger.warning(f"metafields copy fallita: {e}")
 
-        # Write-back Product_id al GSheet
+        # 11) Write-back Product_id al GSheet
         if not dry_run:
             for it in items:
                 writebacks.append({"sku": it["sku"], "size": it["size"], "new_product_id": new_pid})
