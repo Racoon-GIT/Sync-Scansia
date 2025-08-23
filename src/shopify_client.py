@@ -64,16 +64,17 @@ class ShopifyClient:
         logger.debug(f"find_variants_by_sku({sku}) → {len(edges)} varianti")
         return [e["node"] for e in edges]
 
-    def product_duplicate(self, product_id: str) -> Optional[str]:
+    # ✅ aggiornato: richiede productId e newTitle
+    def product_duplicate(self, product_id: str, new_title: str) -> Optional[str]:
         q = """
-        mutation($id: ID!) {
-          productDuplicate(id: $id) {
+        mutation($productId: ID!, $newTitle: String!) {
+          productDuplicate(productId: $productId, newTitle: $newTitle) {
             newProduct { id title handle status }
             userErrors { field message }
           }
         }
         """
-        data = self.graphql(q, {"id": product_id})
+        data = self.graphql(q, {"productId": product_id, "newTitle": new_title})
         errs = data["productDuplicate"]["userErrors"]
         if errs:
             logger.error(f"productDuplicate userErrors: {errs}")
