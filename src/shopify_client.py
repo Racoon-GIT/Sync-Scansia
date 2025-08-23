@@ -3,6 +3,10 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("sync.shopify")
 
+def _gid_to_num(gid: str) -> str:
+    # es: gid://shopify/Product/1234567890 -> 1234567890
+    return str(gid).split("/")[-1]
+
 class ShopifyClient:
     def __init__(self, store: str, token: str, api_version: str="2025-01"):
         self.store = store
@@ -109,7 +113,8 @@ class ShopifyClient:
         return data["productUpdate"]["product"]
 
     def products_search_by_title_active(self, title: str) -> List[Dict[str, Any]]:
-        query_str = f'title:{json.dumps(title)} status:active'
+        import json as _json
+        query_str = f'title:{_json.dumps(title)} status:active'
         q = """
         query($q: String!) {
           products(first: 10, query: $q) {
@@ -119,7 +124,7 @@ class ShopifyClient:
         """
         data = self.graphql(q, {"q": query_str})
         nodes = [e["node"] for e in data["products"]["edges"]]
-        exact = [n for n in nodes if (n.get("title","") == title and n.get("status") == "ACTIVE") ]
+        exact = [n for n in nodes if (n.get("title","") == title and n.get("status") == "ACTIVE")]
         logger.debug(f"products_search_by_title_active('{title}') → {len(exact)} match esatti")
         return exact
 
@@ -160,7 +165,7 @@ class ShopifyClient:
         logger.debug(f"get_product_variants({product_id}) → {len(nodes)} varianti")
         return nodes
 
-    # ---- Media ----
+    # ---- Media (GraphQL read; REST write for images) ----
     def get_product_media(self, product_id: str) -> List[Dict[str, Any]]:
         q = """
         query($id: ID!) {
@@ -201,6 +206,33 @@ class ShopifyClient:
             logger.warning(f"productUpdateMedia userErrors: {errs}")
         return data["productUpdateMedia"].get("media", [])
 
+    # --- REST helpers for product images (copy from URLs) ---
+    def product_images_list(self, product_id_gid: str) -> List[Dict[str, Any]]:
+        pid = _gid_to_num(product_id_gid)
+        resp = self.rest_get(f"/products/{pid}/images.json")
+        return resp.get("images", [])
+
+    def product_image_create(self, product_id_gid: str, src_url: str, position: int | None=None, alt: str | None=None):
+        pid = _gid_to_num(product_id_gid)
+        payload = {"image": {"src": src_url}}
+        if position is not None:
+            payload["image"]["position"] = position
+        if alt is not None:
+            payload["image"]["alt"] = alt
+        return self.rest_post(f"/products/{pid}/images.json", payload)
+
+    def product_image_update(self, product_id_gid: str, image_id: int | str, alt: str | None=None):
+        pid = _gid_to_num(product_id_gid)
+        payload = {"image": {"id": int(image_id)}}
+        if alt is not None:
+            payload["image"]["alt"] = alt
+        url = f"/products/{pid}/images/{image_id}.json"
+        logger.debug(f"[REST] PUT https://{self.store}/admin/api/{self.api_version}{url}")
+        r = self.session.put(f"https://{self.store}/admin/api/{self.api_version}{url}", json=payload, timeout=60)
+        r.raise_for_status()
+        return r.json()
+
+    # ---- Files API (best-effort rename) ----
     def file_update(self, file_updates: List[Dict[str, Any]]):
         q = """
         mutation($files: [FileUpdateInput!]!) {
@@ -255,6 +287,18 @@ class ShopifyClient:
         if errs:
             logger.warning(f"metafieldsSet userErrors: {errs}")
         return data["metafieldsSet"].get("metafields", [])
+
+    # ---- Collections (REST Collects) ----
+    def collects_for_product(self, product_id_gid: str) -> List[Dict[str, Any]]:
+        pid = _gid_to_num(product_id_gid)
+        resp = self.rest_get("/collects.json", params={"product_id": pid, "limit": 250})
+        collects = resp.get("collects", [])
+        logger.debug(f"collects_for_product({pid}) → {len(collects)}")
+        return collects
+
+    def delete_collect(self, collect_id: int | str):
+        logger.debug(f"delete_collect({collect_id})")
+        return self.rest_delete(f"/collects/{collect_id}.json", params={})
 
     # ---- Inventory / Locations (REST) ----
     def get_locations(self) -> list[dict]:
