@@ -1,6 +1,4 @@
-pandas
-openpyxl
-requests
-python-dotenv
-gspread
-google-auth
+pandas==2.2.2
+requests==2.32.3
+gspread==6.1.2
+google-auth==2.33.0
