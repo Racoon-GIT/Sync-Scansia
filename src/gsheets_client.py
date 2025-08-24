@@ -1,1 +1,1 @@
-<contenuto completo del nuovo gsheets_client.py>
+<contenuto corretto di gsheets_client.py>

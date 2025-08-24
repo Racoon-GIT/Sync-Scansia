@@ -1,1 +1,1 @@
-<contenuto completo del nuovo shopify_client.py>
+<contenuto corretto di shopify_client.py con triple virgolette>

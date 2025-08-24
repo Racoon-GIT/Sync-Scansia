@@ -1,1 +1,1 @@
-<contenuto completo del nuovo sync.py>
+<contenuto corretto di sync.py con triple virgolette per le query>

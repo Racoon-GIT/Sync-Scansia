@@ -1,1 +1,1 @@
-<contenuto completo del nuovo utils.py>
+<contenuto corretto di utils.py>
