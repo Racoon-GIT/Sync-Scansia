@@ -1,74 +1,81 @@
-import os, json, logging
-from typing import List, Dict
-import gspread
-from google.oauth2.service_account import Credentials
+# src/gsheets.py
+import os
+import io
+import json
+import logging
+import pandas as pd
+import requests
+from typing import Optional
 
-logger = logging.getLogger("sync.gsheets")
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+log = logging.getLogger("sync.gsheets")
 
-def _auth_from_env():
-    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    if not raw:
-        logger.info("GOOGLE_SERVICE_ACCOUNT_JSON non configurato: write-back disabilitato.")
-        return None
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        logger.error("GOOGLE_SERVICE_ACCOUNT_JSON non è un JSON valido.")
-        return None
-    creds = Credentials.from_service_account_info(data, scopes=SCOPES)
-    return gspread.authorize(creds)
 
-def _find_or_create_product_id_column(ws) -> int:
-    header = ws.row_values(1)
-    header_l = [h.strip().lower() for h in header]
-    if "product_id" in header_l:
-        return header_l.index("product_id") + 1
-    col = len(header) + 1
-    ws.update_cell(1, col, "Product_id")
-    logger.info(f"Aggiunta colonna 'Product_id' in posizione {col}")
-    return col
+def public_csv_url(sheet_url: str) -> str:
+    base = sheet_url.split("/edit")[0]
+    return f"{base}/export?format=csv"
 
-def write_product_ids(sheet_url: str, rows_to_write: List[Dict], worksheet_name: str | None=None):
-    gc = _auth_from_env()
-    if not gc:
-        logger.info("Write-back GSheet saltato (no credenziali).")
+
+def load_table(sheet_url: str) -> pd.DataFrame:
+    log.info("Scarico sorgente dati da URL")
+    csv_url = public_csv_url(sheet_url)
+    log.debug("URL di download: %s", csv_url)
+    r = requests.get(csv_url, timeout=60)
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    log.info("Tabella caricata da URL: %d righe, %d colonne", len(df), len(df.columns))
+    log.debug("Colonne: %s", list(df.columns))
+    return df
+
+
+def writeback_product_id(sheet_url: str, df_original: pd.DataFrame, df_processed: pd.DataFrame,
+                         key_cols=("SKU", "TAGLIA"), product_id_col="product_id") -> int:
+    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not sa_json:
+        log.info("GOOGLE_SERVICE_ACCOUNT_JSON non configurato: write-back disabilitato.")
+        log.info("Write-back GSheet saltato (no credenziali).");
         return 0
 
-    sh = gc.open_by_url(sheet_url)
-    ws = sh.worksheet(worksheet_name) if worksheet_name else sh.sheet1
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except Exception:
+        log.warning("Librerie Google non presenti. Aggiungi gspread + google-auth.")
+        return 0
 
-    header = ws.row_values(1)
-    header_l = [h.strip().lower() for h in header]
-    def col_idx(names):
-        for n in names:
-            if n.lower() in header_l:
-                return header_l.index(n.lower()) + 1
-        return None
+    creds_info = json.loads(sa_json)
+    creds = Credentials.from_service_account_info(
+        creds_info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"]
+    )
+    gc = gspread.authorize(creds)
 
-    col_sku = col_idx(["sku"])
-    col_size = col_idx(["taglia","size"])
-    if not (col_sku and col_size):
-        raise RuntimeError("Impossibile trovare colonne SKU e TAGLIA/Size sul foglio.")
-    col_pid = _find_or_create_product_id_column(ws)
+    spreadsheet_id = sheet_url.split("/d/")[1].split("/")[0]
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.sheet1
 
-    values = ws.get_all_values()
-    index = {}
-    for i in range(2, len(values)+1):
-        row = values[i-1]
-        sku = row[col_sku-1] if col_sku-1 < len(row) else ""
-        size = row[col_size-1] if col_size-1 < len(row) else ""
-        index[f"{sku.strip()}{size.strip()}"] = i
+    data = ws.get_all_records()
+    rows = len(data)
+    if rows == 0:
+        return 0
 
-    written = 0
-    for item in rows_to_write:
-        key = f"{(item.get('sku','') or '').strip()}{(item.get('size','') or '').strip()}"
-        row_n = index.get(key)
-        if not row_n:
-            logger.warning(f"Row non trovata su GSheet per key={key}")
-            continue
-        ws.update_cell(row_n, col_pid, str(item.get("new_product_id","")))
-        written += 1
+    import pandas as pd
+    df_g = pd.DataFrame(data)
+    updated = 0
+    df_idx = df_processed.set_index(list(key_cols))
 
-    logger.info(f"Scritte {written} celle Product_id su GSheet.")
-    return written
+    if "Product_Id" not in df_g.columns:
+        df_g["Product_Id"] = ""
+
+    for i, row in df_g.iterrows():
+        key = tuple(str(row[c]) for c in key_cols)
+        if key in df_idx.index:
+            pid = df_idx.loc[key, product_id_col]
+            if pid and str(row.get("Product_Id", "")).strip() == "":
+                row_num = i + 2
+                col_num = list(df_g.columns).index("Product_Id") + 1
+                ws.update_cell(row_num, col_num, pid)
+                updated += 1
+
+    log.info("Write-back Product_id completato: %d righe aggiornate.", updated)
+    return updated
