@@ -1,200 +1,105 @@
-# src/shopify_client.py
 import os
 import time
 import json
 import logging
-import random
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
+
 import requests
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-log = logging.getLogger("sync.shopify")
-
-DEFAULT_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-01")
-
-
-def _jitter(base: float) -> float:
-    return base * (0.75 + random.random() * 0.5)
+LOG = logging.getLogger("sync.shopify")
 
 
 class ShopifyClient:
-    def __init__(self, store: str, access_token: str, api_version: str = DEFAULT_API_VERSION):
-        self.store = store.rstrip("/")
+    def __init__(self, store: str, token: str, api_version: str = "2025-01") -> None:
+        self.store = store
+        self.token = token
         self.api_version = api_version
-        self.base_rest = f"https://{self.store}/admin/api/{self.api_version}"
-        self.base_graphql = f"https://{self.store}/admin/api/{self.api_version}/graphql.json"
-        self.session = requests.Session()
-        self.session.headers.update({
-            "X-Shopify-Access-Token": access_token,
+
+        self.rest_min_interval = int(os.getenv("SHOPIFY_REST_MIN_INTERVAL_MS", "120")) / 1000.0
+        self.gql_min_interval = int(os.getenv("SHOPIFY_GQL_MIN_INTERVAL_MS", "120")) / 1000.0
+        self._last_rest = 0.0
+        self._last_gql = 0.0
+
+    # --------------------------- Helpers ---------------------------
+    def _rest_sleep(self):
+        dt = time.time() - self._last_rest
+        if dt < self.rest_min_interval:
+            time.sleep(self.rest_min_interval - dt)
+        self._last_rest = time.time()
+
+    def _gql_sleep(self):
+        dt = time.time() - self._last_gql
+        if dt < self.gql_min_interval:
+            time.sleep(self.gql_min_interval - dt)
+        self._last_gql = time.time()
+
+    # --------------------------- REST ---------------------------
+    @retry(stop=stop_after_attempt(int(os.getenv("SHOPIFY_MAX_RETRIES", "8"))),
+           wait=wait_exponential(multiplier=0.5, min=0.5, max=10),
+           retry=retry_if_exception_type(requests.RequestException))
+    def rest(self, method: str, path: str, params: Dict[str, Any] = None, payload: Dict[str, Any] = None) -> Dict[str, Any]:
+        self._rest_sleep()
+        url = f"https://{self.store}/admin/api/{self.api_version}{path}"
+        headers = {
+            "X-Shopify-Access-Token": self.token,
             "Content-Type": "application/json",
-        })
-
-        # Rate-limit spacing + retry/backoff
-        self._min_rest_interval = float(os.getenv("SHOPIFY_REST_MIN_INTERVAL_MS", "120")) / 1000.0
-        self._min_gql_interval  = float(os.getenv("SHOPIFY_GQL_MIN_INTERVAL_MS",  "120")) / 1000.0
-        self._last_rest_ts = 0.0
-        self._last_gql_ts = 0.0
-        self._max_retries = int(os.getenv("SHOPIFY_MAX_RETRIES", "8"))
-
-    def _respect_min_interval(self, is_graphql: bool):
-        now = time.time()
-        if is_graphql:
-            dt = now - self._last_gql_ts
-            wait = self._min_gql_interval - dt
-            if wait > 0:
-                time.sleep(wait)
-        else:
-            dt = now - self._last_rest_ts
-            wait = self._min_rest_interval - dt
-            if wait > 0:
-                time.sleep(wait)
-
-    def _update_last_ts(self, is_graphql: bool):
-        if is_graphql:
-            self._last_gql_ts = time.time()
-        else:
-            self._last_rest_ts = time.time()
-
-    def _handle_rate_headers(self, r: requests.Response):
-        limit = r.headers.get("X-Shopify-Shop-Api-Call-Limit")
-        if limit:
-            try:
-                used, cap = [int(x) for x in limit.split("/")]
-                if cap > 0 and used / cap > 0.85:
-                    time.sleep(_jitter(0.4))
-            except Exception:
-                pass
-
-    def _rest(self, method: str, path: str, *, params: Dict[str, Any] = None,
-              json_body: Dict[str, Any] = None, ok_codes=(200, 201, 202, 204)) -> Dict[str, Any]:
-        url = f"{self.base_rest}{path}"
-        self._respect_min_interval(is_graphql=False)
-
-        backoff = 1.0
-        for attempt in range(self._max_retries + 1):
-            try:
-                if method == "GET":
-                    log.debug("[REST] GET %s params=%s", url, params)
-                    r = self.session.get(url, params=params, timeout=60)
-                elif method == "POST":
-                    log.debug("[REST] POST %s payload_keys=%s", url, list((json_body or {}).keys()))
-                    r = self.session.post(url, json=json_body, timeout=60)
-                elif method == "DELETE":
-                    log.debug("[REST] DELETE %s params=%s", url, params or {})
-                    r = self.session.delete(url, params=params or {}, timeout=60)
-                else:
-                    raise RuntimeError(f"Unsupported method {method}")
-
-                self._update_last_ts(is_graphql=False)
-                self._handle_rate_headers(r)
-
-                if r.status_code in ok_codes:
-                    return r.json() if r.content else {}
-                if r.status_code in (429, 430):
-                    ra = r.headers.get("Retry-After")
-                    if ra:
-                        sleep_s = float(ra)
-                    else:
-                        sleep_s = _jitter(backoff)
-                        backoff = min(backoff * 2, 20)
-                    log.warning("REST %s rate-limited (%s). Sleeping %.2fs", url, r.status_code, sleep_s)
-                    time.sleep(sleep_s)
-                    continue
-                if 500 <= r.status_code < 600:
-                    sleep_s = _jitter(backoff)
-                    backoff = min(backoff * 2, 20)
-                    log.warning("REST %s 5xx (%s). Retry in %.2fs", url, r.status_code, sleep_s)
-                    time.sleep(sleep_s)
-                    continue
-
-                r.raise_for_status()
-
-            except requests.RequestException as e:
-                if attempt >= self._max_retries:
-                    raise
-                sleep_s = _jitter(backoff)
-                backoff = min(backoff * 2, 20)
-                log.warning("REST exception %s. Retry in %.2fs", e, sleep_s)
-                time.sleep(sleep_s)
-
-        raise RuntimeError("REST exhausted retries")
-
-    def rest_get(self, path: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        return self._rest("GET", path, params=params)
-
-    def rest_post(self, path: str, json_body: Dict[str, Any]) -> Dict[str, Any]:
-        return self._rest("POST", path, json_body=json_body)
-
-    def rest_delete(self, path: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        return self._rest("DELETE", path, params=params)
-
-    def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        self._respect_min_interval(is_graphql=True)
-        payload = {"query": query, "variables": variables or {}}
-        log.debug("[GraphQL] POST %s vars=%s", self.base_graphql, list((variables or {}).keys()))
-        backoff = 1.0
-        for attempt in range(self._max_retries + 1):
-            r = self.session.post(self.base_graphql, data=json.dumps(payload), timeout=90)
-            self._update_last_ts(is_graphql=True)
-
-            try:
-                body = r.json()
-            except Exception:
-                body = {}
-
-            if "extensions" in body:
-                ext = body["extensions"]
-                cost = ext.get("cost") or {}
-                throttle = cost.get("throttleStatus") or {}
-                if throttle:
-                    currently = throttle.get("currentlyAvailable", 0)
-                    restore = throttle.get("restoreRate", 50)
-                    if currently < max(10, restore // 2):
-                        time.sleep(_jitter(0.3))
-
-            if r.status_code == 200:
-                if "errors" in body and body["errors"]:
-                    raise RuntimeError(f"GraphQL errors: {body['errors']}")
-                return body.get("data", {})
-
-            if r.status_code in (429, 430) or r.status_code >= 500:
-                ra = r.headers.get("Retry-After")
-                if ra:
-                    sleep_s = float(ra)
-                else:
-                    sleep_s = _jitter(backoff)
-                    backoff = min(backoff * 2, 20)
-                time.sleep(sleep_s)
-                continue
-
+        }
+        LOG.debug("[REST] %s %s params=%s", method, url, params or {})
+        r = requests.request(method, url, headers=headers, params=params, json=payload, timeout=60)
+        if r.status_code >= 400:
+            LOG.error("REST %s %s → %s %s", method, path, r.status_code, r.text[:200])
             r.raise_for_status()
+        return r.json() if r.text else {}
 
-        raise RuntimeError("GraphQL exhausted retries")
+    # --------------------------- GraphQL ---------------------------
+    @retry(stop=stop_after_attempt(int(os.getenv("SHOPIFY_MAX_RETRIES", "8"))),
+           wait=wait_exponential(multiplier=0.5, min=0.5, max=10),
+           retry=retry_if_exception_type(requests.RequestException))
+    def graphql(self, query: str, variables: Dict[str, Any] = None) -> Dict[str, Any]:
+        self._gql_sleep()
+        url = f"https://{self.store}/admin/api/{self.api_version}/graphql.json"
+        headers = {
+            "X-Shopify-Access-Token": self.token,
+            "Content-Type": "application/json",
+        }
+        LOG.debug("[GraphQL] POST %s vars=%s", url, list(variables.keys()) if variables else [])
+        r = requests.post(url, headers=headers, json={"query": query, "variables": variables or {}}, timeout=60)
+        if r.status_code >= 400:
+            LOG.error("GraphQL HTTP %s %s", r.status_code, r.text[:200])
+            r.raise_for_status()
+        data = r.json()
+        if "errors" in data:
+            LOG.error("GraphQL errors: %s", data["errors"])
+            raise RuntimeError(f"GraphQL errors: {data['errors']}")
+        return data["data"]
 
-    # -------- Products / queries
-
+    # --------------------------- Queries/Mutations ---------------------------
     def products_search_by_title_active(self, title: str) -> List[Dict[str, Any]]:
-        q = f'title:"{title}" status:active'
-        query = """
+        q = """
         query($q: String!) {
           products(first: 10, query: $q) {
             nodes { id title status handle }
           }
         }
         """
-        data = self.graphql(query, {"q": q})
-        return data["products"]["nodes"]
+        data = self.graphql(q, {"q": f'title:"{title}" status:active'})
+        nodes = data["products"]["nodes"]
+        LOG.debug("products_search_by_title_active('%s') → %d match esatti", title, len(nodes))
+        return nodes
 
     def products_search_by_title_any(self, title: str) -> List[Dict[str, Any]]:
-        q = f'title:"{title}"'
-        query = """
+        q = """
         query($q: String!) {
           products(first: 10, query: $q) {
             nodes { id title status handle }
           }
         }
         """
-        data = self.graphql(query, {"q": q})
-        return data["products"]["nodes"]
+        data = self.graphql(q, {"q": f'title:"{title}"'})
+        nodes = data["products"]["nodes"]
+        LOG.debug("products_search_by_title_any('%s') → %d", title, len(nodes))
+        return nodes
 
     def product_duplicate(self, product_id: str, new_title: str) -> Dict[str, Any]:
         q = """
@@ -206,81 +111,56 @@ class ShopifyClient:
         }
         """
         data = self.graphql(q, {"productId": product_id, "newTitle": new_title})
-        errs = data["productDuplicate"]["userErrors"]
-        if errs:
-            raise RuntimeError(f"productDuplicate errors: {errs}")
-        return data["productDuplicate"]["newProduct"]
+        res = data["productDuplicate"]
+        if res["userErrors"]:
+            raise RuntimeError(f"productDuplicate errors: {res['userErrors']}")
+        newp = res["newProduct"]
+        LOG.debug("product_duplicate(%s) → %s", product_id, newp)
+        return newp
 
-    def product_update(self, product_id: str, *, title: Optional[str] = None,
-                       handle: Optional[str] = None, status: Optional[str] = None,
-                       tags: Optional[List[str]] = None) -> Dict[str, Any]:
-        inp: Dict[str, Any] = {"id": product_id}
-        if title is not None:  inp["title"]  = title
-        if handle is not None: inp["handle"] = handle
-        if status is not None: inp["status"] = status
-        if tags is not None:   inp["tags"]   = tags
-
+    def product_update(self, product_id: str, **fields) -> Dict[str, Any]:
         q = """
         mutation($input: ProductInput!) {
           productUpdate(input: $input) {
-            product { id title handle status }
+            product { id title handle status tags }
             userErrors { field message }
           }
         }
         """
-        data = self.graphql(q, {"input": inp})
+        input_obj = {"id": product_id}
+        input_obj.update(fields)
+        data = self.graphql(q, {"input": input_obj})
         errs = data["productUpdate"]["userErrors"]
         if errs:
+            LOG.error("productUpdate userErrors: %s", errs)
             raise RuntimeError(f"productUpdate errors: {errs}")
+        LOG.debug("product_update(%s, fields=%s)", product_id, list(fields.keys()))
         return data["productUpdate"]["product"]
 
-    def get_product_variants(self, product_id: str) -> List[Dict[str, Any]]:
+    def get_product(self, product_id: str) -> Dict[str, Any]:
         q = """
         query($id: ID!) {
-          product(id: $id) {
-            variants(first: 100) {
-              nodes {
-                id
-                sku
-                title
-                inventoryItem { id }
-              }
-            }
-          }
+          product(id: $id) { id title handle status tags }
         }
         """
-        data = self.graphql(q, {"id": product_id})
-        return data["product"]["variants"]["nodes"]
-
-    def product_variants_bulk_update(self, product_id: str,
-                                     variants_updates: List[Tuple[str, float, Optional[float]] ]):
-        q = """
-        mutation($pid: ID!, $variants: [ProductVariantsBulkInput!]!) {
-          productVariantsBulkUpdate(productId: $pid, variants: $variants) {
-            product { id }
-            productVariants { id price compareAtPrice }
-            userErrors { field message }
-          }
-        }
-        """
-        payload = [{"id": vid, "price": price, "compareAtPrice": cmp} for vid, price, cmp in variants_updates]
-        data = self.graphql(q, {"pid": product_id, "variants": payload})
-        errs = data["productVariantsBulkUpdate"]["userErrors"]
-        if errs:
-            raise RuntimeError(f"productVariantsBulkUpdate userErrors: {errs}")
-        return data["productVariantsBulkUpdate"]
+        return self.graphql(q, {"id": product_id})["product"]
 
     def get_product_media(self, product_id: str) -> List[Dict[str, Any]]:
         q = """
         query($id: ID!) {
           product(id: $id) {
-            media(first: 100) {
+            media(first: 50) {
               nodes {
-                mediaContentType
-                alt
                 ... on MediaImage {
                   id
-                  image { url }
+                  image {
+                    url
+                    altText
+                    id
+                    width
+                    height
+                    originalSrc
+                  }
                 }
               }
             }
@@ -288,46 +168,9 @@ class ShopifyClient:
         }
         """
         data = self.graphql(q, {"id": product_id})
-        return data["product"]["media"]["nodes"]
-
-    def product_create_media_from_urls(self, product_id: str, images: List[tuple]) -> List[str]:
-        created_ids: List[str] = []
-        for url, filename_wo_ext in images:
-            q = """
-            mutation($productId: ID!, $media: [CreateMediaInput!]!) {
-              productCreateMedia(productId: $productId, media: $media) {
-                media { id alt }
-                mediaUserErrors { field message }
-                userErrors { field message }
-              }
-            }
-            """
-            media = [{
-                "originalSource": url,
-                "mediaContentType": "IMAGE",
-                "alt": ""
-            }]
-            data = self.graphql(q, {"productId": product_id, "media": media})
-            errs = data["productCreateMedia"]["userErrors"] + data["productCreateMedia"]["mediaUserErrors"]
-            if errs:
-                raise RuntimeError(f"productCreateMedia errors: {errs}")
-            mid = data["productCreateMedia"]["media"][0]["id"]
-            created_ids.append(mid)
-            # Rinominare filename per includere 'Outlet' (solo parte visibile nel file object)
-            self.file_update_filename(mid, filename_wo_ext)
-        return created_ids
-
-    def file_update_filename(self, media_id: str, filename_wo_ext: str):
-        q = """
-        mutation($files: [FileUpdateInput!]!) {
-          fileUpdate(files: $files) {
-            files { id fileStatus }
-            userErrors { field message code }
-          }
-        }
-        """
-        files = [{"id": media_id, "filename": f"{filename_wo_ext}-Outlet"}]
-        self.graphql(q, {"files": files})
+        nodes = data["product"]["media"]["nodes"]
+        LOG.debug("get_product_media(%s) → %d media", product_id, len(nodes))
+        return nodes
 
     def get_product_metafields(self, product_id: str) -> List[Dict[str, Any]]:
         q = """
@@ -340,13 +183,15 @@ class ShopifyClient:
         }
         """
         data = self.graphql(q, {"id": product_id})
-        return data["product"]["metafields"]["nodes"]
+        nodes = data["product"]["metafields"]["nodes"]
+        LOG.debug("get_product_metafields(%s) → %d", product_id, len(nodes))
+        return nodes
 
-    def set_product_metafields(self, owner_id: str, metafields: List[Dict[str, Any]]):
+    def metafields_set(self, owner_id: str, metafields: List[Dict[str, Any]]):
         q = """
         mutation($metafields: [MetafieldsSetInput!]!) {
           metafieldsSet(metafields: $metafields) {
-            metafields { key namespace }
+            metafields { id key namespace }
             userErrors { field message }
           }
         }
@@ -363,57 +208,118 @@ class ShopifyClient:
         data = self.graphql(q, {"metafields": payload})
         errs = data["metafieldsSet"]["userErrors"]
         if errs:
-            raise RuntimeError(f"metafieldsSet errors: {errs}")
+            LOG.warning("metafieldsSet userErrors: %s", errs)
+        return data
 
-    # -------- Locations / Inventory (REST)
+    def get_product_variants(self, product_id: str) -> List[Dict[str, Any]]:
+        q = """
+        query($id: ID!) {
+          product(id: $id) {
+            variants(first: 100) {
+              nodes {
+                id title sku
+                price
+                compareAtPrice
+                inventoryItem { id }
+                selectedOptions { name value }
+              }
+            }
+          }
+        }
+        """
+        data = self.graphql(q, {"id": product_id})
+        nodes = data["product"]["variants"]["nodes"]
+        LOG.debug("get_product_variants(%s) → %d varianti", product_id, len(nodes))
+        return nodes
 
+    def product_variants_bulk_update(self, product_id: str, variants_updates: List[Dict[str, Any]]):
+        q = """
+        mutation($pid: ID!, $variants: [ProductVariantsBulkInput!]!) {
+          productVariantsBulkUpdate(productId: $pid, variants: $variants) {
+            product { id }
+            userErrors { field message }
+          }
+        }
+        """
+        data = self.graphql(q, {"pid": product_id, "variants": variants_updates})
+        errs = data["productVariantsBulkUpdate"]["userErrors"]
+        if errs:
+            LOG.error("productVariantsBulkUpdate userErrors: %s", errs)
+            raise RuntimeError(f"productVariantsBulkUpdate errors: {errs}")
+        return data
+
+    # --------- Variant search by SKU ---------
+    def find_variants_by_sku(self, sku: str) -> List[Dict[str, Any]]:
+        q = """
+        query($q: String!) {
+          productVariants(first: 50, query: $q) {
+            nodes {
+              id sku title
+              product { id title handle status }
+              inventoryItem { id }
+              selectedOptions { name value }
+            }
+          }
+        }
+        """
+        data = self.graphql(q, {"q": f"sku:{sku}"})
+        nodes = data["productVariants"]["nodes"]
+        LOG.debug("find_variants_by_sku(%s) → %d varianti", sku, len(nodes))
+        return nodes
+
+    # --------- Inventory / Locations ---------
     def get_locations(self) -> List[Dict[str, Any]]:
-        data = self.rest_get("/locations.json")
+        data = self.rest("GET", "/locations.json")
+        LOG.debug("get_locations() → %d", len(data.get("locations", [])))
         return data.get("locations", [])
 
-    def inventory_levels_for_item(self, inventory_item_id: int) -> List[Dict[str, Any]]:
-        data = self.rest_get("/inventory_levels.json", params={"inventory_item_ids": str(inventory_item_id)})
-        return data.get("inventory_levels", [])
-
     def inventory_connect(self, inventory_item_id: int, location_id: int):
-        self.rest_post("/inventory_levels/connect.json", {
+        LOG.debug("inventory_connect(item=%s, loc=%s)", inventory_item_id, location_id)
+        return self.rest("POST", "/inventory_levels/connect.json", payload={
             "location_id": location_id,
-            "inventory_item_id": inventory_item_id
+            "inventory_item_id": inventory_item_id,
         })
 
     def inventory_set(self, inventory_item_id: int, location_id: int, qty: int):
-        self.rest_post("/inventory_levels/set.json", {
+        LOG.debug("inventory_set(item=%s, loc=%s, qty=%s)", inventory_item_id, location_id, qty)
+        return self.rest("POST", "/inventory_levels/set.json", payload={
             "location_id": location_id,
             "inventory_item_id": inventory_item_id,
-            "available": qty
+            "available": qty,
         })
 
     def inventory_delete(self, inventory_item_id: int, location_id: int):
+        LOG.debug("inventory_delete(item=%s, loc=%s)", inventory_item_id, location_id)
         try:
-            self.rest_delete("/inventory_levels.json", params={
+            return self.rest("DELETE", "/inventory_levels.json", params={
                 "inventory_item_id": inventory_item_id,
-                "location_id": location_id
+                "location_id": location_id,
             })
-        except requests.HTTPError as e:
-            log.warning("inventory_delete fallita item=%s loc=%s: %s", inventory_item_id, location_id, e)
+        except Exception as e:
+            LOG.warning("inventory_delete fallita item=%s loc=%s: %s", inventory_item_id, location_id, e)
+            return None
 
-    # -------- Misc REST helpers
-
-    def product_delete_rest(self, product_numeric_id: int):
-        self.rest_delete(f"/products/{product_numeric_id}.json")
-
-    def get_product_images_rest(self, product_numeric_id: int):
-        data = self.rest_get(f"/products/{product_numeric_id}/images.json")
-        return data.get("images", [])
-
-    def upload_product_image_from_url_rest(self, product_numeric_id: int, url: str, alt: str = ""):
-        body = {"image": {"src": url, "alt": alt}}
-        data = self.rest_post(f"/products/{product_numeric_id}/images.json", body)
-        return data.get("image", {})
-
-    def collects_for_product(self, product_numeric_id: int):
-        data = self.rest_get("/collects.json", params={"product_id": str(product_numeric_id), "limit": 250})
-        return data.get("collects", [])
+    # --------- Collections cleanup ---------
+    def collects_for_product(self, product_numeric_id: int) -> List[Dict[str, Any]]:
+        data = self.rest("GET", "/collects.json", params={"product_id": str(product_numeric_id), "limit": 250})
+        collects = data.get("collects", [])
+        LOG.debug("collects_for_product(%s) → %d", product_numeric_id, len(collects))
+        return collects
 
     def delete_collect(self, collect_id: int):
-        self.rest_delete(f"/collects/{collect_id}.json")
+        LOG.debug("delete_collect(%s)", collect_id)
+        return self.rest("DELETE", f"/collects/{collect_id}.json")  # params ignored
+
+    def product_delete_rest(self, product_numeric_id: int):
+        LOG.info("product_delete(%s) → OK", product_numeric_id)
+        return self.rest("DELETE", f"/products/{product_numeric_id}.json")
+
+    # --------- Images (REST) ---------
+    def product_images(self, product_numeric_id: int) -> List[Dict[str, Any]]:
+        data = self.rest("GET", f"/products/{product_numeric_id}/images.json")
+        return data.get("images", [])
+
+    def product_image_create(self, product_numeric_id: int, src_url: str, alt: str = "") -> Dict[str, Any]:
+        payload = {"image": {"src": src_url, "alt": alt}}
+        LOG.debug("[REST] POST /products/%s/images.json payload_keys=%s", product_numeric_id, list(payload.keys()))
+        return self.rest("POST", f"/products/{product_numeric_id}/images.json", payload=payload)

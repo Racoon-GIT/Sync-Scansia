@@ -1,265 +1,249 @@
-# src/sync.py
 import os
-import time
+import sys
+import argparse
 import logging
-from typing import List, Optional, Tuple
+from typing import Dict, Any, List, Tuple
 
-import pandas as pd
-
+from .utils import setup_logging, download_gsheet_csv, normalize_columns, filter_rows, build_outlet_title, build_outlet_handle, gid_to_id
 from .shopify_client import ShopifyClient
-from . import utils
-from . import gsheets
+from . import gsheets as gs
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
-log = logging.getLogger("sync")
-
-STORE = os.getenv("SHOPIFY_STORE", "")
-TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN", "")
-API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-01")
-GSHEET_URL = os.getenv("GSHEET_URL", "")
-PROMO_LOCATION_NAME = os.getenv("PROMO_LOCATION_NAME", "Promo")
-MAGAZZINO_LOCATION_NAME = os.getenv("MAGAZZINO_LOCATION_NAME", "Magazzino")
-RENAME_OUTLET_SUFFIX_TITLE = " - Outlet"
-RENAME_OUTLET_SUFFIX_HANDLE = "-outlet"
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
-DELETE_EXISTING_DRAFT = os.getenv("DELETE_EXISTING_DRAFT", "true").lower() in ("1","true","yes")
+LOG = logging.getLogger("sync")
 
 
-def ensure_unique_handle(client: ShopifyClient, product_id: str, desired_title: str, desired_handle: str) -> str:
+def ensure_unique_handle(client: ShopifyClient, product_id: str, title: str, desired_handle: str) -> str:
+    # prova handle, se occupato incrementa -1, -2...
     base = desired_handle
-    for i in range(0, 50):
-        try_handle = base if i == 0 else f"{base}-{i}"
+    attempt = 0
+    while True:
+        try_handle = base if attempt == 0 else f"{base}-{attempt}"
         try:
-            prod = client.product_update(product_id, title=desired_title, handle=try_handle, status="ACTIVE", tags=[])
-            log.info("Impostato title/handle/status/tags su prodotto outlet %s (handle=%s)",
-                     product_id, prod["handle"])
-            return prod["handle"]
+            client.product_update(product_id, title=title, handle=try_handle, status="ACTIVE", tags=[])
+            LOG.info("Impostato title/handle/status/tags su prodotto outlet %s (handle=%s)", product_id, try_handle)
+            return try_handle
         except RuntimeError as e:
             msg = str(e)
-            if "Handle" in msg and "already in use" in msg:
+            if "already in use" in msg or "Handle '" in msg:
+                attempt += 1
                 continue
             raise
-    raise RuntimeError("Impossibile trovare un handle libero")
 
 
-def find_location_id(client: ShopifyClient, name: str) -> Optional[int]:
-    locs = client.get_locations()
-    for l in locs:
-        if l.get("name") == name:
-            return int(l["id"])
-    return None
+def update_all_prices(client: ShopifyClient, product_id: str, price: float, compare_at: float) -> None:
+    variants = client.get_product_variants(product_id)
+    updates = []
+    # price and compareAtPrice expect strings (Decimal) in GraphQL
+    price_s = f"{price:.2f}" if price is not None else None
+    compare_s = f"{compare_at:.2f}" if compare_at is not None else None
+    for v in variants:
+        updates.append({
+            "id": v["id"],
+            "price": price_s,
+            "compareAtPrice": compare_s,
+        })
+    LOG.info("Aggiorno PREZZI su tutte le %d varianti di %s → price=%s compareAt=%s",
+             len(variants), product_id, price_s, compare_s)
+    LOG.debug("Payload prezzi: %s", [(u['id'], price, compare_at) for u in updates])
+    client.product_variants_bulk_update(product_id, updates)
 
 
-def prepare_rows(df: pd.DataFrame) -> pd.DataFrame:
-    df = utils.normalize_columns(df)
-    df["online_raw"] = df["online"].astype(str)
-    df["online"] = df["online"].astype(str).str.strip().str.upper().eq("SI")
-    df["Qta_raw"] = df["qta"]
-    df["qta"] = pd.to_numeric(df["qta"], errors="coerce").fillna(0).astype(int)
+def sync_inventory(client: ShopifyClient, product_id: str, target_size: str, target_qty: int, promo_loc: Dict[str, Any], mag_loc: Dict[str, Any]):
+    # Ricava inventory items
+    variants = client.get_product_variants(product_id)
+    promo_id = promo_loc["id"]
+    mag_id = mag_loc["id"]
+    # Primo: connetti a Promo tutte le varianti (se non connesse) e mettile a 0
+    for v in variants:
+        item_id = int(v["inventoryItem"]["id"].split("/")[-1])
+        try:
+            client.inventory_connect(item_id, promo_id)
+        except Exception:
+            pass
+        client.inventory_set(item_id, promo_id, 0)
 
-    initial = len(df)
-    df1 = df[df["online"]]
-    log.info("Dopo filtro online==SI: %d (scartate: %d)", len(df1), initial - len(df1))
+    # Imposta quantità corretta solo per la variante target (match su selectedOptions Size/taglia)
+    for v in variants:
+        size = None
+        for opt in v.get("selectedOptions", []):
+            if opt.get("name", "").lower() in ("size", "taglia"):
+                size = opt.get("value")
+                break
+        if (size or "").strip() == (target_size or "").strip():
+            item_id = int(v["inventoryItem"]["id"].split("/")[-1])
+            client.inventory_set(item_id, promo_id, int(target_qty))
+            break
 
-    df2 = df1[df1["qta"] > 0]
-    log.info("Dopo filtro Qta>0 (tra quelle online): %d (scartate per Qta<=0: %d)", len(df2), len(df1) - len(df2))
-
-    if log.isEnabledFor(logging.DEBUG):
-        log.debug("Esempi scartati per online!=SI:")
-        for _, r in df[~df["online"]].head(10).iterrows():
-            log.debug("- SKU=%s Size=%s online_raw=%s", r["sku"], r["taglia"], r["online_raw"])
-        log.debug("Esempi scartati per Qta<=0:")
-        for _, r in df1[df1["qta"] <= 0].head(10).iterrows():
-            log.debug("- SKU=%s Size=%s Qta_raw=%s Qta=%s", r["sku"], r["taglia"], r["Qta_raw"], r["qta"])
-
-    df2["prezzo_pieno"] = df2["prezzo pieno"].apply(utils.parse_price)
-    df2["prezzo_scontato"] = df2["prezzo scontato"].apply(utils.parse_price)
-
-    if "product_id" not in df2.columns:
-        df2["product_id"] = ""
-
-    log.info("Totale righe pronte all'elaborazione: %d", len(df2))
-    return df2
-
-
-def build_outlet_title(base_title: str) -> str:
-    if base_title.endswith(RENAME_OUTLET_SUFFIX_TITLE):
-        return base_title
-    return f"{base_title}{RENAME_OUTLET_SUFFIX_TITLE}"
+    # Secondo: de-stocca tutte le varianti da Magazzino
+    for v in variants:
+        item_id = int(v["inventoryItem"]["id"].split("/")[-1])
+        client.inventory_set(item_id, mag_id, 0)  # garantisce 0
+        client.inventory_delete(item_id, mag_id)  # poi prova a disconnettere
 
 
-def build_outlet_handle_from_title(base_title: str) -> str:
-    handle = utils.slugify_handle(base_title)
-    if not handle.endswith(RENAME_OUTLET_SUFFIX_HANDLE):
-        handle = f"{handle}{RENAME_OUTLET_SUFFIX_HANDLE}"
-    return handle
+def remove_collections(client: ShopifyClient, product_id: str):
+    num_id = gid_to_id(product_id)
+    collects = client.collects_for_product(num_id)
+    for c in collects:
+        client.delete_collect(c["id"])
 
 
-def copy_images_with_rename(client: ShopifyClient, src_pid: str, dst_pid: str, outlet_handle: str) -> int:
-    media = client.get_product_media(src_pid)
-    img_nodes = [m for m in media if m["mediaContentType"] == "IMAGE" and m.get("image")]
-    if not img_nodes:
-        log.debug("Nessuna immagine da copiare.")
-        return 0
-
+def copy_media_and_alt(client: ShopifyClient, src_product_id: str, dst_product_id: str) -> int:
+    # Copia immagini: alt vuoto, filename con 'Outlet' nel nome (nota: REST non consente rename filename reale, ma alt viene pulito)
+    media = client.get_product_media(src_product_id)
     created = 0
-    for idx, m in enumerate(img_nodes, start=1):
-        url = m["image"]["url"]
-        desired = f"{outlet_handle}-{idx}"
-        client.product_create_media_from_urls(dst_pid, [(url, desired)])
-        time.sleep(0.2)
+    dst_num = gid_to_id(dst_product_id)
+    for m in media:
+        img = m.get("image") or {}
+        src_url = img.get("url") or img.get("originalSrc")
+        if not src_url:
+            continue
+        # piccola forzatura di filename aggiungendo query param per caching (non cambia filename sul CDN)
+        client.product_image_create(dst_num, src_url, alt="")
         created += 1
-
-    log.info("Copiate %d immagini sul prodotto outlet.", created)
     return created
 
 
 def main():
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--apply", action="store_true", help="esegue davvero (di default dry-run)")
-    args = ap.parse_args()
+    setup_logging()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--apply", action="store_true", help="Esegue davvero le modifiche (di default dry-run)")
+    args = parser.parse_args()
+    dry_run = not args.apply
 
-    dry = DRY_RUN if not args.apply else False
+    store = os.getenv("SHOPIFY_STORE")
+    token = os.getenv("SHOPIFY_ACCESS_TOKEN")
+    api_version = os.getenv("SHOPIFY_API_VERSION", "2025-01")
+    gsheet_url = os.getenv("GSHEET_URL")
 
-    if not STORE or not TOKEN or not GSHEET_URL:
-        raise SystemExit("SHOPIFY_STORE, SHOPIFY_ACCESS_TOKEN, GSHEET_URL sono obbligatorie")
+    promo_name = os.getenv("PROMO_LOCATION_NAME", "Promo")
+    mag_name = os.getenv("MAGAZZINO_LOCATION_NAME", "Magazzino")
 
-    client = ShopifyClient(STORE, TOKEN, API_VERSION)
+    if not (store and token and gsheet_url):
+        print("Devi configurare SHOPIFY_STORE, SHOPIFY_ACCESS_TOKEN, GSHEET_URL", file=sys.stderr)
+        sys.exit(2)
 
-    promo_loc_id = find_location_id(client, PROMO_LOCATION_NAME)
-    mag_loc_id = find_location_id(client, MAGAZZINO_LOCATION_NAME)
-    log.debug("get_locations() → %s", len(client.get_locations()))
-    if promo_loc_id is None:
-        raise SystemExit(f"Location '{PROMO_LOCATION_NAME}' non trovata.")
-    if mag_loc_id is None:
-        log.warning("Location '%s' non trovata: salto de-stoccaggio.", MAGAZZINO_LOCATION_NAME)
+    LOG.info("Avvio sync | store=%s | api_version=%s | promo_location=%s | magazzino_location=%s | dry_run=%s",
+             store, api_version, promo_name, mag_name, dry_run)
+    LOG.info("Sorgente dati: %s", gsheet_url)
 
-    log.info("Sorgente dati: %s", GSHEET_URL)
-    df_raw = gsheets.load_table(GSHEET_URL)
-    df = prepare_rows(df_raw)
+    # Carica dati
+    df = download_gsheet_csv(gsheet_url)
+    df = normalize_columns(df)
+    ready = filter_rows(df)
 
-    prodotti_creati = 0
-    updates_prezzi = 0
-    updates_inventario = 0
-    updates_media = 0
-    metafield_copiati = 0
+    client = ShopifyClient(store, token, api_version)
 
-    log.info("Processing %d prodotti", len(df))
-    rows_for_writeback = []
+    # Prepara map location
+    locs = client.get_locations()
+    promo_loc = next((l for l in locs if l.get("name") == promo_name), None)
+    mag_loc = next((l for l in locs if l.get("name") == mag_name), None)
+    if not promo_loc or not mag_loc:
+        raise RuntimeError("Location Promo/Magazzino non trovate" )
 
-    for _, r in df.iterrows():
-        sku = str(r["sku"]).strip()
-        size = str(r["taglia"]).strip()
-        qty  = int(r["qta"])
-        titolo_base = str(r["titolo"]).strip()
-        outlet_title = build_outlet_title(titolo_base)
-        outlet_handle = build_outlet_handle_from_title(outlet_title)
+    total = 0
+    created = 0
+    skipped = 0
+    price_updates = 0
+    inv_updates = 0
+    media_updates = 0
+    metafields_copied = 0
+    write_back_items: List[Dict[str, Any]] = []
 
-        # Prodotto sorgente (già online) da duplicare
-        src_candidates = client.products_search_by_title_any(titolo_base)
-        if not src_candidates:
-            log.warning("Titolo sorgente non trovato su Shopify: %r (SKU=%s)", titolo_base, sku)
+    LOG.info("Righe candidate dopo filtro: %d | con SKU validi: %d | SKU non trovati: %d",
+             len(ready), ready['sku'].notna().sum(), 0)
+
+    for _, row in ready.iterrows():
+        total += 1
+        sku = str(row.get("sku"))
+        size = str(row.get("taglia"))
+        qta = int(row.get("qta_norm", row.get("qta", 0)))
+        price_full = row.get("prezzo pieno") or None
+        price_sale = row.get("prezzo scontato") or None
+
+        # Trova prodotto sorgente da SKU (prende una delle varianti)
+        variants = client.find_variants_by_sku(sku)
+        if not variants:
+            LOG.warning("SKU non trovato su Shopify: %s", sku)
             continue
-        src_prod = src_candidates[0]
-        src_pid = src_prod["id"]
+        src_variant = variants[0]
+        src_product_id = src_variant["product"]["id"]
+        src_title = src_variant["product"]["title"]
+        src_handle = src_variant["product"]["handle"]
 
-        # Se esiste già un OUTLET attivo, saltiamo
-        if client.products_search_by_title_active(outlet_title):
-            log.info("OUTLET attivo già esistente per %r → skip", outlet_title)
+        outlet_title = build_outlet_title(src_title)
+        # Skip se esiste già attivo
+        active = client.products_search_by_title_active(outlet_title)
+        if active:
+            skipped += 1
             continue
 
-        # Se esiste un OUTLET in draft ed è abilitata la pulizia, eliminiamolo e ripartiamo puliti
-        if DELETE_EXISTING_DRAFT:
-            any_candidates = client.products_search_by_title_any(outlet_title)
-            for c in any_candidates:
-                if c["status"] == "DRAFT":
-                    numeric_id = int(c["id"].split("/")[-1])
-                    log.info("Elimino OUTLET DRAFT pre-esistente prima della duplicazione → %s (%s)",
-                             c["id"], c["handle"])
-                    client.product_delete_rest(numeric_id)
-
-        if dry:
-            log.info("[dry-run] Duplicazione di %r", outlet_title)
-            continue
+        # Se esistono DRAFT con stesso titolo, cancellali
+        any_state = client.products_search_by_title_any(outlet_title)
+        for p in any_state:
+            if p.get("status") == "DRAFT" or p.get("status") == "ARCHIVED":
+                pid_num = gid_to_id(p["id"])
+                LOG.info("Elimino OUTLET DRAFT pre-esistente prima della duplicazione → %s (%s)", p["id"], p["handle"])
+                if not dry_run:
+                    client.product_delete_rest(pid_num)
 
         # Duplica
-        dup = client.product_duplicate(src_pid, outlet_title)
-        new_pid = dup["id"]
-        new_numeric_id = int(new_pid.split("/")[-1])
+        if dry_run:
+            LOG.info("[dry-run] Duplicazione %s → %s", src_product_id, outlet_title)
+            new_pid = src_product_id  # placeholder per simulare
+        else:
+            dup = client.product_duplicate(src_product_id, outlet_title)
+            new_pid = dup["id"]
 
-        # Assicura handle univoco + setta anche status ACTIVE e svuota tags
-        ensure_unique_handle(client, new_pid, outlet_title, outlet_handle)
+        # Imposta title/handle e pulisci tag
+        outlet_handle = build_outlet_handle(src_handle)
+        if not dry_run:
+            try_handle = ensure_unique_handle(client, new_pid, outlet_title, outlet_handle)
+        else:
+            try_handle = outlet_handle
+            LOG.info("[dry-run] Imposterei handle=%s", try_handle)
 
-        # Copia immagini, rinominando filename e azzerando alt
-        updates_media += copy_images_with_rename(client, src_pid, new_pid, outlet_handle)
+        # Rimuovi da collezioni (come da log operativi approvati)
+        if not dry_run:
+            remove_collections(client, new_pid)
 
-        # Copia metafield
-        src_mf = client.get_product_metafields(src_pid)
-        if src_mf:
-            client.set_product_metafields(new_pid, src_mf)
-            metafield_copiati += len(src_mf)
+        # Copia media (alt vuoto)
+        if not dry_run:
+            created_media = copy_media_and_alt(client, src_product_id, new_pid)
+            media_updates += created_media
 
-        # Prezzi su TUTTE le varianti
-        variants = client.get_product_variants(new_pid)
-        price = float(r["prezzo_scontato"])
-        compare_at = float(r["prezzo_pieno"]) if float(r["prezzo_pieno"]) > 0 else None
-        updates_payload = [(v["id"], price, compare_at) for v in variants]
-        if updates_payload:
-            log.info("Aggiorno PREZZI su tutte le %d varianti di %s → price=%.2f compareAt=%s",
-                     len(updates_payload), new_pid, price, compare_at if compare_at is not None else "None")
-            client.product_variants_bulk_update(new_pid, updates_payload)
-            updates_prezzi += len(updates_payload)
+        # Copia metafields
+        if not dry_run:
+            meta = client.get_product_metafields(src_product_id)
+            if meta:
+                client.metafields_set(new_pid, meta)
+                metafields_copied += len(meta)
 
-        # INVENTARIO: prima assegno tutte le varianti alla location Promo con qty 0
-        for v in variants:
-            inv_item_id = int(v["inventoryItem"]["id"].split("/")[-1])
-            client.inventory_connect(inv_item_id, promo_loc_id)
-            client.inventory_set(inv_item_id, promo_loc_id, 0)
+        # Prezzi su tutte le varianti
+        if not dry_run:
+            p = price_sale if price_sale is not None else price_full
+            c = price_full if price_full is not None else None
+            if p is not None:
+                update_all_prices(client, new_pid, float(p), float(c) if c is not None else None)
+                price_updates += 1
 
-        # poi imposto la variante corretta con la quantità indicata
-        target_variant = None
-        for v in variants:
-            if size and size in v["title"]:
-                target_variant = v
-                break
-        if target_variant is None and variants:
-            target_variant = variants[0]
-        if target_variant:
-            inv_item_id = int(target_variant["inventoryItem"]["id"].split("/")[-1])
-            client.inventory_set(inv_item_id, promo_loc_id, int(qty))
+        # Inventario: prima Promo poi de-stocca Magazzino
+        if not dry_run:
+            sync_inventory(client, new_pid, size, qta, promo_loc, mag_loc)
+            inv_updates += 1
 
-        # infine de-stocco tutte le varianti dalla location Magazzino
-        if mag_loc_id is not None:
-            for v in variants:
-                inv_item_id = int(v["inventoryItem"]["id"].split("/")[-1])
-                client.inventory_set(inv_item_id, mag_loc_id, 0)
-                client.inventory_delete(inv_item_id, mag_loc_id)
+        # Write-back Product_Id
+        if not dry_run:
+            write_back_items.append({"sku": sku, "taglia": size, "product_id": gid_to_id(new_pid)})
 
-        prodotti_creati += 1
+        created += 1
 
-        # Write-back per Product_Id
-        this_row = r.copy()
-        this_row["product_id"] = str(new_numeric_id)
-        rows_for_writeback.append(this_row)
+    # Write-back su GSheet
+    if write_back_items:
+        updated = gs.write_back_product_ids(gsheet_url, write_back_items)
+        LOG.info("Write-back Product_id completato: %d righe aggiornate.", updated)
 
-        # Piccolo spacing anti-rate-limit
-        time.sleep(0.35)
-
-    # GSheet write-back (se configurato)
-    if rows_for_writeback:
-        df_wb = pd.DataFrame(rows_for_writeback)
-        try:
-            gsheets.writeback_product_id(GSHEET_URL, df_raw, df_wb,
-                                         key_cols=("SKU","TAGLIA"), product_id_col="product_id")
-        except Exception as e:
-            log.info("Write-back GSheet saltato: %s", e)
-
-    log.info("FINITO | prodotti analizzati=%d | creati=%d | già esistenti (skip)=%d | updates_prezzi=%d | updates_inventario=%d | updates_media=%d | metafield_copiati=%d",
-             len(df), prodotti_creati, len(df) - prodotti_creati, updates_prezzi, updates_inventario, updates_media, metafield_copiati)
+    LOG.info("FINITO | prodotti analizzati=%d | creati=%d | già esistenti (skip)=%d | updates_prezzi=%d | updates_inventario=%d | updates_media=%d | metafield_copiati=%d",
+             total, created, skipped, price_updates, inv_updates, media_updates, metafields_copied)
 
 
 if __name__ == "__main__":

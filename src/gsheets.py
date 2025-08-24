@@ -1,81 +1,111 @@
-# src/gsheets.py
 import os
-import io
 import json
 import logging
+from typing import Optional, List, Dict
+
+import gspread
 import pandas as pd
-import requests
-from typing import Optional
+from google.oauth2.service_account import Credentials
 
-log = logging.getLogger("sync.gsheets")
-
-
-def public_csv_url(sheet_url: str) -> str:
-    base = sheet_url.split("/edit")[0]
-    return f"{base}/export?format=csv"
+LOG = logging.getLogger("sync.gsheets")
 
 
-def load_table(sheet_url: str) -> pd.DataFrame:
-    log.info("Scarico sorgente dati da URL")
-    csv_url = public_csv_url(sheet_url)
-    log.debug("URL di download: %s", csv_url)
-    r = requests.get(csv_url, timeout=60)
+def read_public_csv(url: str) -> pd.DataFrame:
+    import requests, io
+    if "/edit" in url:
+        url = url.split("/edit")[0] + "/export?format=csv"
+    elif "/view" in url:
+        url = url.split("/view")[0] + "/export?format=csv"
+    r = requests.get(url, timeout=60)
     r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    log.info("Tabella caricata da URL: %d righe, %d colonne", len(df), len(df.columns))
-    log.debug("Colonne: %s", list(df.columns))
-    return df
+    return pd.read_csv(io.BytesIO(r.content))
 
 
-def writeback_product_id(sheet_url: str, df_original: pd.DataFrame, df_processed: pd.DataFrame,
-                         key_cols=("SKU", "TAGLIA"), product_id_col="product_id") -> int:
-    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not sa_json:
-        log.info("GOOGLE_SERVICE_ACCOUNT_JSON non configurato: write-back disabilitato.")
-        log.info("Write-back GSheet saltato (no credenziali).");
-        return 0
-
+def _get_client_from_env() -> Optional[gspread.Client]:
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw:
+        LOG.info("GOOGLE_SERVICE_ACCOUNT_JSON non configurato: write-back disabilitato.")
+        return None
     try:
-        import gspread
-        from google.oauth2.service_account import Credentials
-    except Exception:
-        log.warning("Librerie Google non presenti. Aggiungi gspread + google-auth.")
+        data = json.loads(raw)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(data, scopes=scopes)
+        return gspread.authorize(creds)
+    except Exception as e:
+        LOG.error("Errore creazione client service account: %s", e)
+        return None
+
+
+def write_back_product_ids(sheet_url: str, updates: List[Dict]):
+    """Aggiorna la colonna Product_Id per le righe (sku, taglia) passate.
+    updates: list di dict { 'sku':..., 'taglia':..., 'product_id': int }
+    """
+    client = _get_client_from_env()
+    if not client:
+        LOG.info("Write-back GSheet saltato (no credenziali)." )
         return 0
 
-    creds_info = json.loads(sa_json)
-    creds = Credentials.from_service_account_info(
-        creds_info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive"]
-    )
-    gc = gspread.authorize(creds)
-
-    spreadsheet_id = sheet_url.split("/d/")[1].split("/")[0]
-    sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.sheet1
-
-    data = ws.get_all_records()
-    rows = len(data)
-    if rows == 0:
+    # Apri lo sheet e prima worksheet
+    try:
+        sh = client.open_by_url(sheet_url)
+        ws = sh.sheet1
+    except Exception as e:
+        LOG.error("Errore apertura sheet: %s", e)
         return 0
 
-    import pandas as pd
-    df_g = pd.DataFrame(data)
+    # Leggi tutte le righe
+    values = ws.get_all_records()
+    if not values:
+        return 0
+
+    # Trova indici colonne
+    header = [h.strip() for h in ws.row_values(1)]
+    try:
+        col_sku = header.index("SKU") + 1
+    except ValueError:
+        try:
+            col_sku = header.index("sku") + 1
+        except ValueError:
+            LOG.error("Colonna SKU non trovata per write-back")
+            return 0
+
+    def _find_col(names):
+        for n in names:
+            if n in header:
+                return header.index(n) + 1
+        return None
+
+    col_taglia = _find_col(["TAGLIA", "taglia", "Size"])
+    col_pid = _find_col(["Product_Id", "product_id", "Product ID"]) or len(header) + 1
+    if col_pid > len(header):
+        # aggiungi intestazione se manca
+        ws.update_cell(1, col_pid, "Product_Id")
+
+    # Mappa per ricerca rapida
+    updates_map = {(u["sku"], u.get("taglia", ""): u["product_id"]) for u in updates}
+
+    # Aggiorna celle
     updated = 0
-    df_idx = df_processed.set_index(list(key_cols))
-
-    if "Product_Id" not in df_g.columns:
-        df_g["Product_Id"] = ""
-
-    for i, row in df_g.iterrows():
-        key = tuple(str(row[c]) for c in key_cols)
-        if key in df_idx.index:
-            pid = df_idx.loc[key, product_id_col]
-            if pid and str(row.get("Product_Id", "")).strip() == "":
-                row_num = i + 2
-                col_num = list(df_g.columns).index("Product_Id") + 1
-                ws.update_cell(row_num, col_num, pid)
+    rng_updates = []
+    for i, row in enumerate(values, start=2):  # partendo dalla riga 2
+        sku = str(row.get("SKU", row.get("sku", ""))).strip()
+        taglia = str(row.get("TAGLIA", row.get("taglia", row.get("Size", "")))).strip()
+        key = (sku, taglia)
+        if key in updates_map:
+            pid = list(filter(lambda x: (x[0], x[1]) == key, updates_map))[0][2] if isinstance(updates_map, list) else None
+        # simpler
+    updated = 0
+    # seconda passata più semplice
+    for i, row in enumerate(values, start=2):
+        sku = str(row.get("SKU", row.get("sku", ""))).strip()
+        taglia = str(row.get("TAGLIA", row.get("taglia", row.get("Size", "")))).strip()
+        for u in updates:
+            if sku == u.get("sku") and (not col_taglia or taglia == u.get("taglia", taglia)):
+                ws.update_cell(i, col_pid, u["product_id"])
                 updated += 1
-
-    log.info("Write-back Product_id completato: %d righe aggiornate.", updated)
+                break
+    LOG.info("Write-back Product_id completato: %d righe aggiornate.", updated)
     return updated
