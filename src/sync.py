@@ -2,6 +2,7 @@
 """
 sync.py — Esegui con:
     python -m src.sync --apply
+
 Env richieste:
   SHOPIFY_ADMIN_TOKEN
   SHOPIFY_STORE                es: racoon-lab.myshopify.com
@@ -9,15 +10,16 @@ Env richieste:
   PROMO_LOCATION_NAME          es: Promo  (per inventario)
   DRY_RUN                      "true"/"false" (opzionale; --apply ha priorità)
 
-Agisce così:
-- Se product_id è presente -> PUT /products/{id}.json status=active
-- Se product_id assente -> POST /products.json con 1 variante (sku, taglia, price) + set inventario sulla location
+Rate limiting / retry:
+  SHOPIFY_MIN_INTERVAL_SEC     es: 0.7  (pausa minima tra REST calls)
+  SHOPIFY_MAX_RETRIES          es: 5    (tentativi su 429/5xx)
 """
 
 import argparse
 import logging
 import os
 import re
+import time
 from collections import Counter, defaultdict
 from typing import Dict, List, Any, Tuple, Optional
 
@@ -62,11 +64,9 @@ def _price_to_str_num(v: Any) -> Optional[str]:
     if v is None: return None
     s = str(v).strip()
     if not s: return None
-    # prendi numeri, virgole e punti
     s2 = re.sub(r"[^\d,\.]", "", s)
     if s2.count(",") == 1 and s2.count(".") == 0:
         s2 = s2.replace(",", ".")
-    # se ci sono migliaia tipo 1.299,90 -> togli i separatori migliaia
     if s2.count(".") > 1:
         s2 = s2.replace(".", "")
     if s2 == "": return None
@@ -95,27 +95,82 @@ class Shopify:
             "Content-Type": "application/json",
             "Accept": "application/json",
         })
+        # throttle / retry
+        try:
+            self.min_interval = float(os.environ.get("SHOPIFY_MIN_INTERVAL_SEC", "0.7"))
+        except Exception:
+            self.min_interval = 0.7
+        try:
+            self.max_retries = int(os.environ.get("SHOPIFY_MAX_RETRIES", "5"))
+        except Exception:
+            self.max_retries = 5
+        self._last_call_ts = 0.0
         self._location_cache: Optional[Dict[str, Any]] = None
 
+    # ----------- low-level with throttle + retry -----------
+
+    def _throttle(self):
+        now = time.time()
+        elapsed = now - self._last_call_ts
+        if elapsed < self.min_interval:
+            time.sleep(self.min_interval - elapsed)
+
+    def _request(self, method: str, path: str, **kw) -> requests.Response:
+        url = self.base + path
+        for attempt in range(1, self.max_retries + 1):
+            self._throttle()
+            r = self.sess.request(method, url, **kw)
+            self._last_call_ts = time.time()
+
+            # Rate limit
+            if r.status_code == 429:
+                retry_after_hdr = r.headers.get("Retry-After")
+                try:
+                    retry_after = float(retry_after_hdr) if retry_after_hdr else 1.0
+                except Exception:
+                    retry_after = 1.0
+                logger.warning("429 Too Many Requests su %s %s. Retry fra %.2fs (tentativo %d/%d).",
+                               method, path, retry_after, attempt, self.max_retries)
+                time.sleep(retry_after)
+                continue
+
+            # Server errors -> backoff
+            if 500 <= r.status_code < 600:
+                backoff = min(2 ** (attempt - 1), 8)
+                logger.warning("%s %s -> %d. Backoff %ss (tentativo %d/%d). Body: %s",
+                               method, path, r.status_code, backoff, attempt, self.max_retries, r.text[:300])
+                time.sleep(backoff)
+                continue
+
+            return r  # include success (2xx) e client error 4xx (non-429) che gestiamo sopra
+
+        return r  # ultimo response
+
+    def _json_or_raise(self, method: str, path: str, r: requests.Response) -> dict:
+        if r.status_code >= 400:
+            raise RuntimeError(f"{method} {path} -> {r.status_code} {r.text}")
+        try:
+            return r.json()
+        except Exception:
+            return {}
+
     def _get(self, path: str, **kw):
-        r = self.sess.get(self.base + path, **kw)
-        if r.status_code >= 400:
-            raise RuntimeError(f"GET {path} -> {r.status_code} {r.text}")
-        return r.json()
+        r = self._request("GET", path, **kw)
+        return self._json_or_raise("GET", path, r)
 
-    def _post(self, path: str, json: Dict[str, Any], **kw):
-        r = self.sess.post(self.base + path, json=json, **kw)
-        if r.status_code >= 400:
-            raise RuntimeError(f"POST {path} -> {r.status_code} {r.text}")
-        return r.json()
+    def _post(self, path: str, json: Dict[str, Any] | None = None, **kw):
+        r = self._request("POST", path, json=json, **kw)
+        return self._json_or_raise("POST", path, r)
 
-    def _put(self, path: str, json: Dict[str, Any], **kw):
-        r = self.sess.put(self.base + path, json=json, **kw)
-        if r.status_code >= 400:
-            raise RuntimeError(f"PUT {path} -> {r.status_code} {r.text}")
-        return r.json()
+    def _put(self, path: str, json: Dict[str, Any] | None = None, **kw):
+        r = self._request("PUT", path, json=json, **kw)
+        return self._json_or_raise("PUT", path, r)
 
-    # ---- operations
+    def _delete(self, path: str, **kw):
+        r = self._request("DELETE", path, **kw)
+        return self._json_or_raise("DELETE", path, r)
+
+    # ----------- high-level operations -----------
 
     def ensure_active(self, product_id_numeric: str) -> None:
         payload = {"product": {"id": int(product_id_numeric), "status": "active"}}
@@ -154,15 +209,15 @@ class Shopify:
                 }],
             }
         }
-        # pulisci None ricorrenti
+
         def _purge_none(obj):
             if isinstance(obj, dict):
                 return {k: _purge_none(v) for k, v in obj.items() if v is not None}
             if isinstance(obj, list):
                 return [_purge_none(x) for x in obj if x is not None]
             return obj
-        product = _purge_none(product)
 
+        product = _purge_none(product)
         created = self._post("/products.json", json=product)
         return created["product"]
 
