@@ -9,7 +9,7 @@ ENV richieste (nomi NON cambiati):
   # Google Sheets
   GSPREAD_SHEET_ID
   GSPREAD_WORKSHEET_TITLE
-  GOOGLE_CREDENTIALS_JSON  (oppure GOOGLE_APPLICATION_CREDENTIALS -> file)
+  GOOGLE_CREDENTIALS_JSON  (oppure GOOGLE_APPLICATION_CREDENTIALS -> path file)
 
   # Shopify
   SHOPIFY_STORE                 es: racoon-lab.myshopify.com
@@ -94,7 +94,6 @@ def _gs_creds() -> Credentials:
         raise RuntimeError("Credenziali GSheets mancanti: imposta GOOGLE_CREDENTIALS_JSON o GOOGLE_APPLICATION_CREDENTIALS")
     return Credentials.from_service_account_file(path, scopes=["https://www.googleapis.com/auth/spreadsheets"])
 
-
 def _get_env(name: str, *aliases: str, required: bool = False) -> str | None:
     """
     Restituisce la prima env non vuota tra name e aliases.
@@ -108,26 +107,11 @@ def _get_env(name: str, *aliases: str, required: bool = False) -> str | None:
         raise RuntimeError(f"Variabile mancante: {name} (provati anche alias: {', '.join(aliases)})")
     return None
 
-
-def _gs_open():def _get_env(name: str, *aliases: str, required: bool = False) -> str | None:
-    """
-    Restituisce la prima env non vuota tra name e aliases.
-    Esempio: _get_env("GSPREAD_SHEET_ID", "SPREADSHEET_ID", required=True)
-    """
-    for key in (name, *aliases):
-        val = os.environ.get(key)
-        if val is not None and str(val).strip() != "":
-            return val
-    if required:
-        raise RuntimeError(f"Variabile mancante: {name} (provati anche alias: {', '.join(aliases)})")
-    return None
-
-
 def _gs_open():
+    # Legge i tuoi nomi standard, con fallback ai vecchi
     sheet_id = _get_env("GSPREAD_SHEET_ID", "SPREADSHEET_ID", required=True)
     title    = _get_env("GSPREAD_WORKSHEET_TITLE", "WORKSHEET_NAME", required=True)
 
-    # chi è l’account che sta chiamando?
     creds = _gs_creds()
     try:
         sa_email = getattr(creds, "service_account_email", None) or getattr(creds, "_service_account_email", None)
@@ -135,42 +119,21 @@ def _gs_open():
         sa_email = None
 
     client = gspread.authorize(creds)
-    logger.info("Google Sheet sorgente: id=%s | worksheet=%s | service_account=%s",
-                sheet_id, title, sa_email or "N/D")
+    logger.info(
+        "Google Sheet sorgente: id=%s | worksheet=%s | service_account=%s",
+        sheet_id, title, sa_email or "N/D"
+    )
 
     try:
         sh = client.open_by_key(sheet_id)
-    except gspread.SpreadsheetNotFound as e:
-        logger.error("Spreadsheet non trovato (404). Controlla che:\n"
-                     "- GSPREAD_SHEET_ID sia l'ID giusto (non l'URL intero)\n"
-                     "- Il foglio sia condiviso con: %s\n"
-                     "- Se è in uno Shared Drive, che il service account sia membro del drive.",
-                     sa_email or "(service account)")
-        raise
-    ws = sh.worksheet(title)
-    return wsdef _gs_open():
-    sheet_id = _get_env("GSPREAD_SHEET_ID", "SPREADSHEET_ID", required=True)
-    title    = _get_env("GSPREAD_WORKSHEET_TITLE", "WORKSHEET_NAME", required=True)
-
-    # chi è l’account che sta chiamando?
-    creds = _gs_creds()
-    try:
-        sa_email = getattr(creds, "service_account_email", None) or getattr(creds, "_service_account_email", None)
-    except Exception:
-        sa_email = None
-
-    client = gspread.authorize(creds)
-    logger.info("Google Sheet sorgente: id=%s | worksheet=%s | service_account=%s",
-                sheet_id, title, sa_email or "N/D")
-
-    try:
-        sh = client.open_by_key(sheet_id)
-    except gspread.SpreadsheetNotFound as e:
-        logger.error("Spreadsheet non trovato (404). Controlla che:\n"
-                     "- GSPREAD_SHEET_ID sia l'ID giusto (non l'URL intero)\n"
-                     "- Il foglio sia condiviso con: %s\n"
-                     "- Se è in uno Shared Drive, che il service account sia membro del drive.",
-                     sa_email or "(service account)")
+    except gspread.SpreadsheetNotFound:
+        logger.error(
+            "Spreadsheet non trovato (404). Controlla che:\n"
+            "- GSPREAD_SHEET_ID sia l'ID giusto (non l'URL intero)\n"
+            "- Il foglio sia condiviso con: %s\n"
+            "- Se è in uno Shared Drive, che il service account sia membro del drive.",
+            sa_email or "(service account)",
+        )
         raise
     ws = sh.worksheet(title)
     return ws
@@ -199,7 +162,7 @@ def gs_read_rows() -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         return m
 
     rows = [norm_row(v) for v in values[1:]]
-    logger.info("Caricate %d righe da Google Sheets (worksheet=%s)", len(rows), os.environ["GSPREAD_WORKSHEET_TITLE"])
+    logger.info("Caricate %d righe da Google Sheets (worksheet=%s)", len(rows), ws.title)
     logger.debug("Header normalizzati: %s", list(col_index.keys()))
     return rows, col_index
 
@@ -209,6 +172,8 @@ def gs_write_product_id(sku: str, taglia: str, new_gid: str, col_index: Dict[str
     """
     ws = _gs_open()
     all_vals = ws.get_all_values()
+    if not all_vals:
+        return False
     header = all_vals[0]
     # trova colonne
     idx_sku = col_index.get("sku") or (header.index("SKU")+1 if "SKU" in header else None)
@@ -393,10 +358,8 @@ class Shopify:
         dup = data["productDuplicate"]
         if dup["userErrors"]:
             raise RuntimeError(f"productDuplicate errors: {dup['userErrors']}")
-        job_id = dup["job"]["id"] if dup["job"] else None
-
-        # Polling: cerco per handle finché appare (è più robusto del polling Job)
-        for i in range(30):  # ~30*1s = 30s max
+        # Polling: cerco per handle finché appare (più robusto del polling Job)
+        for _ in range(40):  # ~40s max
             time.sleep(1.0)
             p = self.find_product_by_handle_any(new_handle)
             if p:
@@ -513,9 +476,8 @@ class Shopify:
         })
 
     def inventory_delete_level(self, inventory_item_id: int, location_id: int) -> None:
-        # disconnette livello
-        self._request("DELETE", "/admin/api/{}/inventory_levels.json".format(self.api_version),
-                      params={"inventory_item_id": inventory_item_id, "location_id": location_id})
+        # disconnette livello (endpoint: DELETE /inventory_levels.json?inventory_item_id=&location_id=)
+        self._request("DELETE", f"/inventory_levels.json?inventory_item_id={inventory_item_id}&location_id={location_id}")
 
 # =============================================================================
 # Workflow per UNA riga (SKU/TAGLIA/QTA/PREZZI/ONLINE)
@@ -595,10 +557,8 @@ def process_row_outlet(shop: Shopify,
     # 7) Metafield: copia
     try:
         mfs = shop.list_product_metafields(source_gid)
-        # filtra eventuali namespace/keys che spesso danno errori (opzionale)
         transferable = []
         for m in mfs:
-            # Evita namespace strettamente legati a inventory/SEO generato automatico ecc. se vuoi
             transferable.append({
                 "namespace": m["namespace"],
                 "key": m["key"],
@@ -638,7 +598,6 @@ def process_row_outlet(shop: Shopify,
     target_variant = None
     for v in outlet_variants:
         if (v.get("sku") or "").strip() == sku:
-            # se ho la taglia, verifico SelectedOptions
             if taglia:
                 ok = False
                 for opt in v.get("selectedOptions", []):
@@ -655,7 +614,7 @@ def process_row_outlet(shop: Shopify,
         inv_item = int(_gid_numeric(target_variant["inventoryItem"]["id"]))
         shop.inventory_set(inv_item, promo["id"], qta)
 
-    # Magazzino: porta a 0 tutte le varianti e, se vuoi, disconnetti
+    # Magazzino: porta a 0 tutte le varianti e disconnette
     if mag:
         for v in outlet_variants:
             inv_num = int(_gid_numeric(v["inventoryItem"]["id"]))
@@ -663,7 +622,6 @@ def process_row_outlet(shop: Shopify,
                 shop.inventory_set(inv_num, mag["id"], 0)
             except Exception:
                 pass
-            # opzionale: disconnessione (alcuni usi preferiscono tenerle collegate ma a 0)
             try:
                 shop.inventory_delete_level(inv_num, mag["id"])
             except Exception:
@@ -711,7 +669,6 @@ def run(do_apply: bool) -> None:
     created = 0
     skipped_active = 0
     skipped_source = 0
-    deleted_draft = 0  # solo informativo (non triviale contare: lo logghiamo in process)
 
     for r in usable:
         try:
