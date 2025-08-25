@@ -94,6 +94,35 @@ def _gs_creds() -> Credentials:
         raise RuntimeError("Credenziali GSheets mancanti: imposta GOOGLE_CREDENTIALS_JSON o GOOGLE_APPLICATION_CREDENTIALS")
     return Credentials.from_service_account_file(path, scopes=["https://www.googleapis.com/auth/spreadsheets"])
 
+
+def _get_env(name: str, *aliases: str, required: bool = False) -> str | None:
+    """
+    Restituisce la prima env non vuota tra name e aliases.
+    Esempio: _get_env("GSPREAD_SHEET_ID", "SPREADSHEET_ID", required=True)
+    """
+    for key in (name, *aliases):
+        val = os.environ.get(key)
+        if val is not None and str(val).strip() != "":
+            return val
+    if required:
+        raise RuntimeError(f"Variabile mancante: {name} (provati anche alias: {', '.join(aliases)})")
+    return None
+
+
+def _gs_open():def _get_env(name: str, *aliases: str, required: bool = False) -> str | None:
+    """
+    Restituisce la prima env non vuota tra name e aliases.
+    Esempio: _get_env("GSPREAD_SHEET_ID", "SPREADSHEET_ID", required=True)
+    """
+    for key in (name, *aliases):
+        val = os.environ.get(key)
+        if val is not None and str(val).strip() != "":
+            return val
+    if required:
+        raise RuntimeError(f"Variabile mancante: {name} (provati anche alias: {', '.join(aliases)})")
+    return None
+
+
 def _gs_open():
     sheet_id = _get_env("GSPREAD_SHEET_ID", "SPREADSHEET_ID", required=True)
     title    = _get_env("GSPREAD_WORKSHEET_TITLE", "WORKSHEET_NAME", required=True)
