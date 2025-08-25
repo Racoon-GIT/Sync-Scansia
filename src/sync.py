@@ -1,87 +1,90 @@
 # -*- coding: utf-8 -*-
 """
-sync.py — Esegui con:
-    python -m src.sync --apply
+sync.py — Workflow Outlet (duplica sorgente, copia metafield/immagini, prezzi, inventario, write-back)
+
+Esegui:
+  python -m src.sync --apply
 
 Env richieste:
+  SHOPIFY_STORE               es: racoon-lab.myshopify.com
   SHOPIFY_ADMIN_TOKEN
-  SHOPIFY_STORE                es: racoon-lab.myshopify.com
-  SHOPIFY_API_VERSION          es: 2025-01
-  PROMO_LOCATION_NAME          es: Promo  (per inventario)
-  DRY_RUN                      "true"/"false" (opzionale; --apply ha priorità)
+  SHOPIFY_API_VERSION         es: 2025-01 (default)
+  PROMO_LOCATION_NAME         es: Promo
+  MAGAZZINO_LOCATION_NAME     es: Magazzino
 
-Rate limiting / retry:
-  SHOPIFY_MIN_INTERVAL_SEC     es: 0.7  (pausa minima tra REST calls)
-  SHOPIFY_MAX_RETRIES          es: 5    (tentativi su 429/5xx)
+  GSPREAD_SHEET_ID
+  GSPREAD_WORKSHEET_TITLE
+  GOOGLE_CREDENTIALS_JSON / GOOGLE_APPLICATION_CREDENTIALS
+
+Rate limit:
+  SHOPIFY_MIN_INTERVAL_SEC    default 0.7
+  SHOPIFY_MAX_RETRIES         default 5
 """
 
 import argparse
+import json
 import logging
 import os
 import re
 import time
-from collections import Counter, defaultdict
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from .gsheets import load_rows
+from .gsheets import load_rows, write_product_id
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("sync")
 
-# --------------------- util --------------------------------------------------
+# -------------------- helpers ------------------------------------------------
 
-def _is_selected(v: Any) -> bool:
-    if v is True: return True
+def _to_float_price(s: Any) -> Optional[float]:
+    if s is None:
+        return None
+    st = str(s).strip()
+    if not st:
+        return None
+    st = re.sub(r"[^\d,\.]", "", st)
+    if st.count(",") == 1 and st.count(".") == 0:
+        st = st.replace(",", ".")
+    if st.count(".") > 1:
+        st = st.replace(".", "")
     try:
-        if isinstance(v, (int, float)) and int(v) == 1: return True
-    except Exception:
-        pass
-    if isinstance(v, str):
-        return v.strip().lower() in {"1","true","yes","si","sì","x","ok"}
-    return False
-
-def _make_key(row: Dict[str, Any]) -> str:
-    pid = (row.get("product_id") or "").strip()
-    if pid: return pid
-    sku = (row.get("sku") or "").strip()
-    taglia = (row.get("taglia") or "").strip()
-    if sku and taglia: return f"{sku}::{taglia}"
-    return sku
-
-def _group_updates(selected_rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    bucket: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for r in selected_rows:
-        bucket[_make_key(r)].append(r)
-    return bucket
-
-def _price_to_str_num(v: Any) -> Optional[str]:
-    """
-    Converte '€ 129', '129€', '129,90', '129.90' in '129.90' (string).
-    Ritorna None se non interpretabile.
-    """
-    if v is None: return None
-    s = str(v).strip()
-    if not s: return None
-    s2 = re.sub(r"[^\d,\.]", "", s)
-    if s2.count(",") == 1 and s2.count(".") == 0:
-        s2 = s2.replace(",", ".")
-    if s2.count(".") > 1:
-        s2 = s2.replace(".", "")
-    if s2 == "": return None
-    try:
-        f = float(s2)
-        return f"{f:.2f}"
+        return float(st)
     except Exception:
         return None
 
+def _price_str(s: Any, fallback: str = "0.00") -> str:
+    v = _to_float_price(s)
+    return f"{v:.2f}" if v is not None else fallback
+
+def _is_online_si(v: Any) -> bool:
+    # strettamente "SI" (case-insensitive) come da richiesta
+    return isinstance(v, str) and v.strip().upper() == "SI"
+
+def _qta_gt_zero(v: Any) -> bool:
+    try:
+        q = float(str(v).replace(",", "."))
+        return q > 0
+    except Exception:
+        return False
+
 def _gid_to_numeric(gid: str) -> Optional[str]:
-    # gid://shopify/Product/123456789 -> 123456789
-    if not gid: return None
+    if not gid:
+        return None
     return gid.strip().split("/")[-1]
 
-# --------------------- Shopify client ---------------------------------------
+def _make_outlet_title(base_title: str) -> str:
+    if base_title.endswith(" - Outlet"):
+        return base_title
+    return f"{base_title} - Outlet"
+
+def _make_outlet_handle(base_handle: str) -> str:
+    if base_handle.endswith("-outlet"):
+        return base_handle
+    return f"{base_handle}-outlet"
+
+# -------------------- Shopify client ----------------------------------------
 
 class Shopify:
     def __init__(self):
@@ -89,6 +92,7 @@ class Shopify:
         self.token = os.environ["SHOPIFY_ADMIN_TOKEN"]
         self.api_version = os.environ.get("SHOPIFY_API_VERSION", "2025-01")
         self.base = f"https://{self.store}/admin/api/{self.api_version}"
+        self.gql_url = f"https://{self.store}/admin/api/{self.api_version}/graphql.json"
         self.sess = requests.Session()
         self.sess.headers.update({
             "X-Shopify-Access-Token": self.token,
@@ -105,10 +109,9 @@ class Shopify:
         except Exception:
             self.max_retries = 5
         self._last_call_ts = 0.0
-        self._location_cache: Optional[Dict[str, Any]] = None
+        self._locations_cache: Optional[Dict[str, Any]] = None
 
-    # ----------- low-level with throttle + retry -----------
-
+    # ---------- low-level REST with throttle/retry ----------
     def _throttle(self):
         now = time.time()
         elapsed = now - self._last_call_ts
@@ -121,30 +124,22 @@ class Shopify:
             self._throttle()
             r = self.sess.request(method, url, **kw)
             self._last_call_ts = time.time()
-
-            # Rate limit
+            # 429
             if r.status_code == 429:
-                retry_after_hdr = r.headers.get("Retry-After")
-                try:
-                    retry_after = float(retry_after_hdr) if retry_after_hdr else 1.0
-                except Exception:
-                    retry_after = 1.0
-                logger.warning("429 Too Many Requests su %s %s. Retry fra %.2fs (tentativo %d/%d).",
-                               method, path, retry_after, attempt, self.max_retries)
-                time.sleep(retry_after)
+                ra = r.headers.get("Retry-After")
+                delay = float(ra) if ra else 1.0
+                logger.warning("429 %s %s. Retry fra %.2fs (%d/%d).", method, path, delay, attempt, self.max_retries)
+                time.sleep(delay)
                 continue
-
-            # Server errors -> backoff
+            # 5xx
             if 500 <= r.status_code < 600:
                 backoff = min(2 ** (attempt - 1), 8)
-                logger.warning("%s %s -> %d. Backoff %ss (tentativo %d/%d). Body: %s",
+                logger.warning("%s %s -> %d. Backoff %ss (%d/%d). Body: %s",
                                method, path, r.status_code, backoff, attempt, self.max_retries, r.text[:300])
                 time.sleep(backoff)
                 continue
-
-            return r  # include success (2xx) e client error 4xx (non-429) che gestiamo sopra
-
-        return r  # ultimo response
+            return r
+        return r
 
     def _json_or_raise(self, method: str, path: str, r: requests.Response) -> dict:
         if r.status_code >= 400:
@@ -170,155 +165,290 @@ class Shopify:
         r = self._request("DELETE", path, **kw)
         return self._json_or_raise("DELETE", path, r)
 
-    # ----------- high-level operations -----------
+    # ---------- GraphQL ----------
+    def gql(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+        for attempt in range(1, self.max_retries + 1):
+            self._throttle()
+            r = self.sess.post(self.gql_url, json={"query": query, "variables": variables})
+            self._last_call_ts = time.time()
+            if r.status_code == 429:
+                ra = r.headers.get("Retry-After")
+                delay = float(ra) if ra else 1.0
+                logger.warning("429 GraphQL. Retry fra %.2fs (%d/%d).", delay, attempt, self.max_retries)
+                time.sleep(delay)
+                continue
+            if 500 <= r.status_code < 600:
+                backoff = min(2 ** (attempt - 1), 8)
+                logger.warning("GraphQL %d. Backoff %ss (%d/%d). Body: %s",
+                               r.status_code, backoff, attempt, self.max_retries, r.text[:300])
+                time.sleep(backoff)
+                continue
+            if r.status_code >= 400:
+                raise RuntimeError(f"GraphQL -> {r.status_code} {r.text}")
+            data = r.json()
+            if "errors" in data:
+                raise RuntimeError(f"GraphQL errors: {data['errors']}")
+            return data["data"]
+        raise RuntimeError("GraphQL fallita dopo retry")
 
-    def ensure_active(self, product_id_numeric: str) -> None:
-        payload = {"product": {"id": int(product_id_numeric), "status": "active"}}
-        self._put(f"/products/{product_id_numeric}.json", json=payload)
+    # ---------- high-level ops ----------
 
-    def get_location_by_name(self, name: str) -> Dict[str, Any]:
-        if self._location_cache is None:
-            data = self._get("/locations.json")
-            self._location_cache = {loc["name"]: loc for loc in data.get("locations", [])}
-        if name in self._location_cache:
-            return self._location_cache[name]
-        # fallback: prima location disponibile
-        if self._location_cache:
-            return list(self._location_cache.values())[0]
-        raise RuntimeError("Nessuna location Shopify disponibile per l'inventario.")
-
-    def create_product_with_one_variant(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        titolo = (row.get("titolo") or row.get("title") or row.get("sku") or "Untitled").strip()
-        vendor = (row.get("brand") or "").strip()
-        sku = (row.get("sku") or "").strip()
-        taglia = (row.get("taglia") or "").strip()
-
-        price = _price_to_str_num(row.get("prezzo_scontato")) or _price_to_str_num(row.get("prezzo_pieno")) or "0.00"
-
-        product = {
-            "product": {
-                "title": titolo,
-                "vendor": vendor or None,
-                "status": "active",
-                "options": [{"name": "Size"}] if taglia else None,
-                "variants": [{
-                    "sku": sku or None,
-                    "option1": taglia or None,
-                    "price": price,
-                    "inventory_management": "shopify",
-                }],
+    def find_source_product_by_sku(self, sku: str) -> Optional[Dict[str, Any]]:
+        """
+        Cerca la variante per SKU e ritorna il prodotto NON outlet (handle senza '-outlet').
+        """
+        q = f'sku:"{sku}"'
+        query = """
+        query($q:String!){
+          productVariants(first:10, query:$q){
+            edges{
+              node{
+                id
+                sku
+                selectedOptions{ name value }
+                product{ id handle title status }
+              }
             }
+          }
         }
+        """
+        data = self.gql(query, {"q": q})
+        nodes = [e["node"] for e in data.get("productVariants", {}).get("edges", [])]
+        if not nodes:
+            return None
+        # preferisci prodotto con handle non-outlet
+        for n in nodes:
+            p = n["product"]
+            if not p["handle"].endswith("-outlet"):
+                return p
+        # altrimenti prova a ricavare base handle senza -outlet
+        p0 = nodes[0]["product"]
+        handle = p0["handle"]
+        base = handle[:-7] if handle.endswith("-outlet") else handle
+        pb = self.product_by_handle(base)
+        return pb or p0
 
-        def _purge_none(obj):
-            if isinstance(obj, dict):
-                return {k: _purge_none(v) for k, v in obj.items() if v is not None}
-            if isinstance(obj, list):
-                return [_purge_none(x) for x in obj if x is not None]
-            return obj
+    def product_by_handle(self, handle: str) -> Optional[Dict[str, Any]]:
+        query = """
+        query($h:String!){
+          productByHandle(handle:$h){
+            id handle title status
+            variants(first:250){
+              edges{ node{
+                id sku
+                selectedOptions{ name value }
+                inventoryItem { id }
+              } }
+            }
+            images(first:250){ edges{ node{ src:originalSrc altText } } }
+          }
+        }
+        """
+        data = self.gql(query, {"h": handle})
+        return data.get("productByHandle")
 
-        product = _purge_none(product)
-        created = self._post("/products.json", json=product)
-        return created["product"]
+    def product_duplicate_and_wait(self, source_gid: str, new_title: str, new_handle: str) -> Dict[str, Any]:
+        # duplica
+        mutation = """
+        mutation($id:ID!, $title:String!, $handle:String!){
+          productDuplicate(productId:$id, newTitle:$title, newHandle:$handle, published:true){
+            duplicateProduct{ id handle title status }
+            job{ id status }
+            userErrors{ field message }
+          }
+        }
+        """
+        out = self.gql(mutation, {"id": source_gid, "title": new_title, "handle": new_handle})
+        dup = out["productDuplicate"]
+        if dup.get("userErrors"):
+            raise RuntimeError(f"productDuplicate errors: {dup['userErrors']}")
+        # polling semplice: attendo che productByHandle(new_handle) esista
+        for _ in range(60):  # ~ max 2 minuti
+            prod = self.product_by_handle(new_handle)
+            if prod:
+                return prod
+            time.sleep(2)
+        raise RuntimeError("Timeout in attesa della creazione del prodotto duplicato")
 
-    def set_inventory(self, variant: Dict[str, Any], location_name: str, qty: int) -> None:
-        inv_item_id = variant["inventory_item_id"]
-        loc = self.get_location_by_name(location_name)
-        payload = {
-            "location_id": loc["id"],
-            "inventory_item_id": inv_item_id,
+    def get_locations_map(self) -> Dict[str, Dict[str, Any]]:
+        if self._locations_cache is None:
+            data = self._get("/locations.json")
+            self._locations_cache = {loc["name"]: loc for loc in data.get("locations", [])}
+        return self._locations_cache
+
+    def product_images(self, product_id_num: str) -> List[Dict[str, Any]]:
+        data = self._get(f"/products/{product_id_num}/images.json")
+        return data.get("images", [])
+
+    def product_create_image(self, product_id_num: str, src_url: str, alt: Optional[str]) -> None:
+        payload = {"image": {"src": src_url}}
+        if alt:
+            payload["image"]["alt"] = alt
+        self._post(f"/products/{product_id_num}/images.json", json=payload)
+
+    def get_product_metafields(self, product_gid: str) -> List[Dict[str, Any]]:
+        query = """
+        query($id:ID!){
+          product(id:$id){
+            metafields(first:250){
+              edges{ node{ namespace key type value } }
+            }
+          }
+        }
+        """
+        data = self.gql(query, {"id": product_gid})
+        edges = data["product"]["metafields"]["edges"]
+        return [e["node"] for e in edges]
+
+    def set_product_metafields(self, owner_gid: str, metafields: List[Dict[str, Any]]) -> None:
+        if not metafields:
+            return
+        m_inputs = []
+        for m in metafields:
+            # alcuni type potrebbero non essere più validi; se serve si può filtrare
+            m_inputs.append({
+                "ownerId": owner_gid,
+                "namespace": m["namespace"],
+                "key": m["key"],
+                "type": m["type"],
+                "value": m["value"],
+            })
+        mutation = """
+        mutation($m:[MetafieldsSetInput!]!){
+          metafieldsSet(metafields:$m){
+            metafields{ namespace key }
+            userErrors{ field message }
+          }
+        }
+        """
+        out = self.gql(mutation, {"m": m_inputs})
+        errs = out["metafieldsSet"].get("userErrors")
+        if errs:
+            logger.warning("metafieldsSet userErrors: %s", errs)
+
+    def remove_manual_collections(self, product_id_num: str) -> None:
+        # trova tutti i collects del prodotto e rimuove quelli riferiti a custom_collections
+        collects = self._get(f"/collects.json?product_id={product_id_num}").get("collects", [])
+        for c in collects:
+            cid = c["collection_id"]
+            # è custom?
+            try:
+                self._get(f"/custom_collections/{cid}.json")  # 200 se è manuale
+                # è manuale: rimuovi il collect
+                self._delete(f"/collects/{c['id']}.json")
+            except Exception:
+                # se non è custom, potrebbe essere smart; ignora
+                pass
+
+    def update_all_variant_prices(self, product_id_num: str, price: str, compare_at: str) -> None:
+        prod = self._get(f"/products/{product_id_num}.json").get("product", {})
+        for v in prod.get("variants", []):
+            payload = {"variant": {"id": v["id"], "price": price, "compare_at_price": compare_at}}
+            self._put(f"/variants/{v['id']}.json", json=payload)
+
+    def ensure_location_connected(self, inventory_item_id: int, location_id: int) -> None:
+        try:
+            self._post("/inventory_levels/connect.json", json={
+                "location_id": location_id,
+                "inventory_item_id": inventory_item_id
+            })
+        except Exception as e:
+            # se già connesso, Shopify può rispondere errore: ignora
+            pass
+
+    def set_inventory(self, inventory_item_id: int, location_id: int, qty: int) -> None:
+        self._post("/inventory_levels/set.json", json={
+            "location_id": location_id,
+            "inventory_item_id": inventory_item_id,
             "available": int(qty),
-        }
-        self._post("/inventory_levels/set.json", json=payload)
+        })
 
-# --------------------- apply -------------------------------------------------
+    def delete_inventory_level(self, inventory_item_id: int, location_id: int) -> None:
+        # rimuove il livello (non la location)
+        self._request("DELETE", f"/inventory_levels.json?inventory_item_id={inventory_item_id}&location_id={location_id}")
 
-def _apply_updates(grouped: Dict[str, List[Dict[str, Any]]], do_apply: bool) -> Tuple[int, List[str]]:
+# -------------------- core workflow -----------------------------------------
+
+def process_row(shop: Shopify, row: Dict[str, Any], ws, header_idx) -> str:
     """
-    Applica 1 azione per RIGA:
-      - con product_id -> attiva prodotto
-      - senza product_id -> crea prodotto + set inventario
+    Esegue l'intero flusso Outlet per una singola riga sheet.
+    Ritorna azione effettuata (string).
     """
-    applied = 0
-    keys_done: List[str] = []
+    sku = row["sku"]
+    taglia = row["taglia"]
+    qta = row["qta"]
+    prezzo_pieno = _price_str(row["prezzo_pieno"], "0.00")
+    prezzo_scontato = _price_str(row["prezzo_scontato"], prezzo_pieno)
 
-    # DRY_RUN dall'env (solo se non si è passato --apply)
-    if not do_apply:
-        dry = os.environ.get("DRY_RUN", "").strip().lower() == "true"
-        if dry:
-            logger.info("DRY-RUN attivo: nessuna chiamata a Shopify verrà eseguita.")
-            return 0, []
+    # 1) trova sorgente by SKU (non-outlet)
+    src = shop.find_source_product_by_sku(sku)
+    if not src:
+        logger.warning("SORGENTE non trovato per SKU=%s → SKIP", sku)
+        return "SKIP_NO_SOURCE"
 
-    shop = Shopify()
-    promo_loc = os.environ.get("PROMO_LOCATION_NAME", "").strip() or None
+    src_gid = src["id"]
+    src_handle = src["handle"]
+    src_title = src["title"]
 
-    for key, rows in grouped.items():
-        logger.debug("Processing chiave %s (righe: %d)", key, len(rows))
-        for r in rows:
-            pid_gid = (r.get("product_id") or "").strip()
-            if pid_gid:
-                pid = _gid_to_numeric(pid_gid)
-                if not pid:
-                    logger.warning("product_id non interpretabile: %s", pid_gid)
-                    continue
-                shop.ensure_active(pid)
-                applied += 1
-            else:
-                # crea prodotto
-                product = shop.create_product_with_one_variant(r)
-                applied += 1
-                # imposta inventario se possibile
-                try:
-                    variant = product["variants"][0]
-                    qty = r.get("qta") or r.get("qty") or 0
-                    try:
-                        qty = int(float(str(qty).replace(",", ".")))
-                    except Exception:
-                        qty = 0
-                    if promo_loc is not None:
-                        shop.set_inventory(variant, promo_loc, qty)
-                except Exception as e:
-                    logger.warning("Impossibile impostare inventario per SKU %s: %s", r.get("sku"), e)
-        keys_done.append(key)
+    outlet_handle = _make_outlet_handle(src_handle)
+    outlet_title = _make_outlet_title(src_title)
 
-    return applied, keys_done
+    # 2) outlet già attivo?
+    outlet = shop.product_by_handle(outlet_handle)
+    if outlet and outlet.get("status") == "ACTIVE":
+        # write-back se manca
+        gid = outlet["id"]
+        ws_row = row["_row_index"]
+        try:
+            write_product_id(ws, header_idx, ws_row, gid)
+        except Exception as e:
+            logger.warning("Write-back fallito (già attivo): %s", e)
+        logger.info("SKIP_OUTLET_ALREADY_ACTIVE handle=%s", outlet_handle)
+        return "SKIP_OUTLET_ACTIVE"
 
-# --------------------- driver -----------------------------------------------
+    # se esiste draft con stesso handle/titolo → elimina
+    if outlet and outlet.get("status") == "DRAFT":
+        pid_num = _gid_to_numeric(outlet["id"])
+        if pid_num:
+            shop._delete(f"/products/{pid_num}.json")
+            logger.info("DELETE_DRAFT_OUTLET handle=%s id=%s", outlet_handle, pid_num)
+        outlet = None
 
-def run_sync(rows: List[Dict[str, Any]], do_apply: bool) -> None:
-    selected = [r for r in rows if _is_selected(r.get("online"))]
-    logger.info("Righe totali: %d, selezionate (online=TRUE): %d", len(rows), len(selected))
+    # 3) duplica sorgente → outlet
+    new_prod = shop.product_duplicate_and_wait(src_gid, outlet_title, outlet_handle)
+    new_gid = new_prod["id"]
+    new_id_num = _gid_to_numeric(new_gid)
+    logger.info("DUPLICATED src_handle=%s -> outlet_handle=%s id=%s", src_handle, outlet_handle, new_id_num)
 
-    keys = [_make_key(r) for r in selected]
-    cnt = Counter(keys)
-    logger.info("Chiavi uniche tra i selezionati: %d", len(cnt))
-    if cnt:
-        from itertools import islice
-        logger.debug("Esempi chiavi (max 5): %s", list(islice(cnt.keys(), 5)))
-    missing_key = sum(1 for k in keys if not k)
-    if missing_key:
-        logger.warning("Righe selezionate SENZA chiave: %d (product_id/sku/taglia vuoti)", missing_key)
+    # 4) copia metafield
+    try:
+        meta = shop.get_product_metafields(src_gid)
+        shop.set_product_metafields(new_gid, meta)
+    except Exception as e:
+        logger.warning("metafields copy warning: %s", e)
 
-    grouped = _group_updates(selected)
-    applied_count, keys_done = _apply_updates(grouped, do_apply=do_apply)
-    logger.info("APPLY: applicazione di %d aggiornamenti.", applied_count)
-    if applied_count and len(keys_done) <= 10:
-        logger.debug("Chiavi processate: %s", keys_done)
+    # 5) copia immagini (idempotente)
+    try:
+        src_images = shop.product_images(_gid_to_numeric(src_gid))
+        out_images = shop.product_images(new_id_num)
+        out_srcs = {im.get("src") for im in out_images}
+        for im in src_images:
+            src_url = im.get("src")
+            if src_url and src_url not in out_srcs:
+                shop.product_create_image(new_id_num, src_url, im.get("alt"))
+    except Exception as e:
+        logger.warning("images copy warning: %s", e)
 
-    logger.info("Riepilogo: selezionate=%d, chiavi_uniche=%d, applicazioni=%d",
-                len(selected), len(cnt), applied_count)
+    # 6) collections manuali → remove
+    try:
+        shop.remove_manual_collections(new_id_num)
+    except Exception as e:
+        logger.warning("remove collections warning: %s", e)
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Sincronizzazione Scarpe in Scansia")
-    parser.add_argument("--apply", action="store_true", help="Esegue davvero le operazioni su Shopify")
-    args = parser.parse_args()
+    # 7) prezzi su tutte le varianti
+    shop.update_all_variant_prices(new_id_num, prezzo_scontato, prezzo_pieno)
 
-    logger.info("Avvio sync")
-    logger.info("apply=%s", args.apply)
-
-    rows = load_rows()  # legge da env GSPREAD_SHEET_ID / GSPREAD_WORKSHEET_TITLE via gsheets.py
-    run_sync(rows, do_apply=args.apply)
-    logger.info("Termine sync con exit code 0")
-
-if __name__ == "__main__":
-    main()
+    # 8) inventario
+    locs = shop.get_locations_map()
+    promo_name = os.environ.get("PROMO_LOCATION_NAME", "Promo")
+    mag_name = os.environ.get("MAGAZ
