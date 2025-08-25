@@ -1,5 +1,5 @@
 # Pinned to avoid build-from-source on Render with Python 3.12 (runtime.txt provided).
-pandas==2.2.2
+pandas==2.2.3,<3.0
 requests>=2.31.0
 python-slugify>=8.0.4
 tenacity>=8.2.3
