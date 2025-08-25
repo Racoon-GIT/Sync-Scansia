@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-sync.py — Workflow OUTLET completo
+sync.py — Workflow OUTLET completo (patch GraphQL 2025)
 
 Esegui:
     python -m src.sync --apply
@@ -111,6 +111,13 @@ def _gs_open():
     # Legge i tuoi nomi standard, con fallback ai vecchi
     sheet_id = _get_env("GSPREAD_SHEET_ID", "SPREADSHEET_ID", required=True)
     title    = _get_env("GSPREAD_WORKSHEET_TITLE", "WORKSHEET_NAME", required=True)
+
+    # Auto-fix se per sbaglio invertiti
+    id_like = bool(re.fullmatch(r"[A-Za-z0-9-_]{30,}", title))
+    not_id_like = not re.fullmatch(r"[A-Za-z0-9-_]{30,}", sheet_id or "")
+    if id_like and not_id_like:
+        logger.warning("Rilevata inversione SHEET_ID/TITLE. Correggo automaticamente.")
+        sheet_id, title = title, sheet_id
 
     creds = _gs_creds()
     try:
@@ -310,7 +317,6 @@ class Shopify:
     # =============================================================================
 
     def find_product_by_sku_non_outlet(self, sku: str) -> Dict[str, Any] | None:
-        # usa products(query: "sku:...") e scarta gli handle che terminano con "-outlet"
         q = f"sku:{sku}"
         data = self.graphql("""
         query($q: String!) {
@@ -325,7 +331,6 @@ class Shopify:
             p = edge["node"]
             if p["handle"].endswith("-outlet"):
                 continue
-            # conferma che una variante abbia proprio quello SKU
             for vedge in p["variants"]["edges"]:
                 if (vedge["node"]["sku"] or "").strip() == sku:
                     return p
@@ -342,29 +347,45 @@ class Shopify:
         return None
 
     # =============================================================================
-    # Duplicazione + polling
+    # Duplicazione + update handle
     # =============================================================================
 
-    def product_duplicate(self, source_gid: str, new_title: str, new_handle: str) -> str:
-        # Avvia duplicazione
+    def product_duplicate(self, source_gid: str, new_title: str) -> str:
+        # Nuovo schema: SOLO newTitle, niente newHandle né job
         data = self.graphql("""
-        mutation($productId:ID!, $newTitle:String!, $newHandle:String!){
-          productDuplicate(productId:$productId, newTitle:$newTitle, newHandle:$newHandle) {
+        mutation($productId:ID!, $newTitle:String!){
+          productDuplicate(productId:$productId, newTitle:$newTitle) {
             newProduct { id }
-            job { id }
             userErrors { message field }
           }
-        }""", {"productId": source_gid, "newTitle": new_title, "newHandle": new_handle})
+        }""", {"productId": source_gid, "newTitle": new_title})
+
         dup = data["productDuplicate"]
         if dup["userErrors"]:
             raise RuntimeError(f"productDuplicate errors: {dup['userErrors']}")
-        # Polling: cerco per handle finché appare (più robusto del polling Job)
-        for _ in range(40):  # ~40s max
-            time.sleep(1.0)
-            p = self.find_product_by_handle_any(new_handle)
-            if p:
-                return p["id"]
-        raise RuntimeError("Timeout in duplicazione: nuovo prodotto non trovato")
+        newp = dup.get("newProduct")
+        if not newp or not newp.get("id"):
+            raise RuntimeError("productDuplicate: newProduct.id mancante")
+        return newp["id"]
+
+    def product_update_handle_status(self, product_gid: str, handle: str, status: str = "ACTIVE", tags: Optional[str] = None) -> bool:
+        variables = {"input": {"id": product_gid, "handle": handle, "status": status}}
+        if tags is not None:
+            variables["input"]["tags"] = tags
+
+        data = self.graphql("""
+        mutation($input: ProductInput!){
+          productUpdate(input: $input){
+            product { id handle status }
+            userErrors { field message }
+          }
+        }""", variables)
+
+        errs = data["productUpdate"]["userErrors"]
+        if errs:
+            logger.warning("productUpdate userErrors: %s", errs)
+            return False
+        return True
 
     # =============================================================================
     # Media / immagini
@@ -393,7 +414,6 @@ class Shopify:
         return [e["node"] for e in edges]
 
     def metafields_set(self, owner_gid: str, metafields: List[Dict[str, Any]]) -> None:
-        # chunk piccolo per evitare userErrors (es. namespace protetti)
         CHUNK = 20
         for i in range(0, len(metafields), CHUNK):
             chunk = [{"ownerId": owner_gid, **m} for m in metafields[i:i+CHUNK]]
@@ -529,11 +549,24 @@ def process_row_outlet(shop: Shopify,
                 shop._delete(f"/products/{nid}.json")
                 logger.info("DELETE_DRAFT_OUTLET ok handle=%s", outlet_handle)
             except Exception as e:
-                logger.warning("DELETE_DRAFT_OUTLET fallito: %s", e)
+                logger.warning("DELETE_DRAFT_OUTLET fallita: %s", e)
 
-    # 4) DUPLICA
-    outlet_gid = shop.product_duplicate(source_gid, outlet_title, outlet_handle)
+    # 4) DUPLICA (solo titolo, niente handle)
+    outlet_gid = shop.product_duplicate(source_gid, outlet_title)
     logger.info("DUPLICATED outlet=%s (da %s)", outlet_gid, source_gid)
+
+    # 4b) Imposta handle desiderato e stato ACTIVE (con fallback -1, -2, ...)
+    desired = outlet_handle
+    ok = shop.product_update_handle_status(outlet_gid, desired, status="ACTIVE", tags=None)
+    if not ok:
+        for i in range(1, 20):
+            cand = f"{outlet_handle}-{i}"
+            if shop.product_update_handle_status(outlet_gid, cand, status="ACTIVE", tags=None):
+                desired = cand
+                ok = True
+                break
+    if not ok:
+        raise RuntimeError("Impossibile impostare handle per il nuovo outlet")
 
     # 5) Prezzi: su TUTTE le varianti del nuovo Outlet
     outlet_variants = shop.get_product_variants(outlet_gid)
@@ -599,12 +632,12 @@ def process_row_outlet(shop: Shopify,
     for v in outlet_variants:
         if (v.get("sku") or "").strip() == sku:
             if taglia:
-                ok = False
+                okv = False
                 for opt in v.get("selectedOptions", []):
                     if (opt["name"] or "").lower() in {"size", "taglia"} and (opt["value"] or "").strip() == taglia:
-                        ok = True
+                        okv = True
                         break
-                if ok:
+                if okv:
                     target_variant = v
                     break
             else:
@@ -672,7 +705,7 @@ def run(do_apply: bool) -> None:
 
     for r in usable:
         try:
-            action, out_gid = process_row_outlet(shop, r, col_index)
+            action, _out_gid = process_row_outlet(shop, r, col_index)
             if action == "OUTLET_CREATED":
                 created += 1
             elif action == "SKIP_OUTLET_ALREADY_ACTIVE":
