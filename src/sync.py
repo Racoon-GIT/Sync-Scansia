@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-sync.py — Workflow OUTLET completo (patch GraphQL 2025)
+sync.py — Workflow OUTLET completo (patch GraphQL + fix prezzi/media/tag/magazzino)
 
 Esegui:
     python -m src.sync --apply
@@ -372,7 +372,6 @@ class Shopify:
         variables = {"input": {"id": product_gid, "handle": handle, "status": status}}
         if tags is not None:
             variables["input"]["tags"] = tags
-
         data = self.graphql("""
         mutation($input: ProductInput!){
           productUpdate(input: $input){
@@ -380,7 +379,6 @@ class Shopify:
             userErrors { field message }
           }
         }""", variables)
-
         errs = data["productUpdate"]["userErrors"]
         if errs:
             logger.warning("productUpdate userErrors: %s", errs)
@@ -394,8 +392,15 @@ class Shopify:
     def list_images(self, product_numeric_id: str) -> List[Dict[str, Any]]:
         return self._get(f"/products/{product_numeric_id}/images.json").get("images", [])
 
+    def list_image_ids(self, product_numeric_id: str) -> List[int]:
+        imgs = self._get(f"/products/{product_numeric_id}/images.json").get("images", [])
+        return [img["id"] for img in imgs if "id" in img]
+
     def add_image(self, product_numeric_id: str, src_url: str) -> None:
         self._post(f"/products/{product_numeric_id}/images.json", json={"image": {"src": src_url}})
+
+    def delete_image(self, product_numeric_id: str, image_id: int) -> None:
+        self._delete(f"/products/{product_numeric_id}/images/{image_id}.json")
 
     # =============================================================================
     # Metafield copy
@@ -460,6 +465,18 @@ class Shopify:
         edges = data["node"]["variants"]["edges"]
         return [e["node"] for e in edges]
 
+    def wait_variants_ready(self, product_gid: str, timeout_sec: int = 30) -> List[Dict[str, Any]]:
+        start = time.time()
+        last: List[Dict[str, Any]] = []
+        while time.time() - start < timeout_sec:
+            vs = self.get_product_variants(product_gid)
+            if vs:
+                if last and len(vs) == len(last):
+                    return vs
+                last = vs
+            time.sleep(1.0)
+        return last
+
     def variants_bulk_update_prices(self, product_gid: str, variant_gids: List[str], price: str, compare_at: str | None):
         variants = [{"id": gid, "price": price, "compareAtPrice": compare_at} for gid in variant_gids]
         data = self.graphql("""
@@ -496,7 +513,7 @@ class Shopify:
         })
 
     def inventory_delete_level(self, inventory_item_id: int, location_id: int) -> None:
-        # disconnette livello (endpoint: DELETE /inventory_levels.json?inventory_item_id=&location_id=)
+        # Disconnette livello (idempotente). Non parse JSON: Shopify può rispondere 200 con body vuoto.
         self._request("DELETE", f"/inventory_levels.json?inventory_item_id={inventory_item_id}&location_id={location_id}")
 
 # =============================================================================
@@ -555,37 +572,46 @@ def process_row_outlet(shop: Shopify,
     outlet_gid = shop.product_duplicate(source_gid, outlet_title)
     logger.info("DUPLICATED outlet=%s (da %s)", outlet_gid, source_gid)
 
-    # 4b) Imposta handle desiderato e stato ACTIVE (con fallback -1, -2, ...)
+    # 4b) Imposta handle desiderato, stato ACTIVE e TAGS vuoti (fallback -1,-2,...)
     desired = outlet_handle
-    ok = shop.product_update_handle_status(outlet_gid, desired, status="ACTIVE", tags=None)
+    ok = shop.product_update_handle_status(outlet_gid, desired, status="ACTIVE", tags="")
     if not ok:
         for i in range(1, 20):
             cand = f"{outlet_handle}-{i}"
-            if shop.product_update_handle_status(outlet_gid, cand, status="ACTIVE", tags=None):
+            if shop.product_update_handle_status(outlet_gid, cand, status="ACTIVE", tags=""):
                 desired = cand
                 ok = True
                 break
     if not ok:
         raise RuntimeError("Impossibile impostare handle per il nuovo outlet")
 
-    # 5) Prezzi: su TUTTE le varianti del nuovo Outlet
-    outlet_variants = shop.get_product_variants(outlet_gid)
+    # 5) Prezzi: su TUTTE le varianti del nuovo Outlet (attendi che compaiano)
+    outlet_variants = shop.wait_variants_ready(outlet_gid, timeout_sec=30)
     variant_gids = [v["id"] for v in outlet_variants]
     shop.variants_bulk_update_prices(outlet_gid, variant_gids, prezzo_scontato, prezzo_pieno)
 
-    # 6) Media: copia immagini mancanti (idempotente)
+    # 6) Media: copia immagini nell'ORDINE del sorgente (reset + ricrea → idempotente)
     try:
         src_num = _gid_numeric(source_gid)
         out_num = _gid_numeric(outlet_gid)
+
+        # prendi URLs dal source in ordine
         src_imgs = shop.list_images(src_num)
-        out_imgs = shop.list_images(out_num)
-        out_srcs = {img.get("src") for img in out_imgs}
-        for img in src_imgs:
-            src_url = img.get("src")
-            if src_url and src_url not in out_srcs:
-                shop.add_image(out_num, src_url)
+        src_urls_ordered = [img.get("src") for img in src_imgs if img.get("src")]
+
+        if src_urls_ordered:
+            # cancella tutte le immagini dell'outlet
+            for iid in shop.list_image_ids(out_num):
+                try:
+                    shop.delete_image(out_num, iid)
+                except Exception as e:
+                    logger.warning("Delete image %s fallita: %s", iid, e)
+
+            # ricrea nell'ordine del source
+            for url in src_urls_ordered:
+                shop.add_image(out_num, url)
     except Exception as e:
-        logger.warning("Copy immagini fallita (non bloccante): %s", e)
+        logger.warning("Copy immagini (ordinato) fallita (non bloccante): %s", e)
 
     # 7) Metafield: copia
     try:
@@ -647,7 +673,7 @@ def process_row_outlet(shop: Shopify,
         inv_item = int(_gid_numeric(target_variant["inventoryItem"]["id"]))
         shop.inventory_set(inv_item, promo["id"], qta)
 
-    # Magazzino: porta a 0 tutte le varianti e disconnette
+    # Magazzino: porta a 0 tutte le varianti e disconnette il livello (idempotente)
     if mag:
         for v in outlet_variants:
             inv_num = int(_gid_numeric(v["inventoryItem"]["id"]))
