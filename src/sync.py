@@ -95,10 +95,55 @@ def _gs_creds() -> Credentials:
     return Credentials.from_service_account_file(path, scopes=["https://www.googleapis.com/auth/spreadsheets"])
 
 def _gs_open():
-    sheet_id = os.environ["GSPREAD_SHEET_ID"]
-    title = os.environ["GSPREAD_WORKSHEET_TITLE"]
-    client = gspread.authorize(_gs_creds())
-    ws = client.open_by_key(sheet_id).worksheet(title)
+    sheet_id = _get_env("GSPREAD_SHEET_ID", "SPREADSHEET_ID", required=True)
+    title    = _get_env("GSPREAD_WORKSHEET_TITLE", "WORKSHEET_NAME", required=True)
+
+    # chi è l’account che sta chiamando?
+    creds = _gs_creds()
+    try:
+        sa_email = getattr(creds, "service_account_email", None) or getattr(creds, "_service_account_email", None)
+    except Exception:
+        sa_email = None
+
+    client = gspread.authorize(creds)
+    logger.info("Google Sheet sorgente: id=%s | worksheet=%s | service_account=%s",
+                sheet_id, title, sa_email or "N/D")
+
+    try:
+        sh = client.open_by_key(sheet_id)
+    except gspread.SpreadsheetNotFound as e:
+        logger.error("Spreadsheet non trovato (404). Controlla che:\n"
+                     "- GSPREAD_SHEET_ID sia l'ID giusto (non l'URL intero)\n"
+                     "- Il foglio sia condiviso con: %s\n"
+                     "- Se è in uno Shared Drive, che il service account sia membro del drive.",
+                     sa_email or "(service account)")
+        raise
+    ws = sh.worksheet(title)
+    return wsdef _gs_open():
+    sheet_id = _get_env("GSPREAD_SHEET_ID", "SPREADSHEET_ID", required=True)
+    title    = _get_env("GSPREAD_WORKSHEET_TITLE", "WORKSHEET_NAME", required=True)
+
+    # chi è l’account che sta chiamando?
+    creds = _gs_creds()
+    try:
+        sa_email = getattr(creds, "service_account_email", None) or getattr(creds, "_service_account_email", None)
+    except Exception:
+        sa_email = None
+
+    client = gspread.authorize(creds)
+    logger.info("Google Sheet sorgente: id=%s | worksheet=%s | service_account=%s",
+                sheet_id, title, sa_email or "N/D")
+
+    try:
+        sh = client.open_by_key(sheet_id)
+    except gspread.SpreadsheetNotFound as e:
+        logger.error("Spreadsheet non trovato (404). Controlla che:\n"
+                     "- GSPREAD_SHEET_ID sia l'ID giusto (non l'URL intero)\n"
+                     "- Il foglio sia condiviso con: %s\n"
+                     "- Se è in uno Shared Drive, che il service account sia membro del drive.",
+                     sa_email or "(service account)")
+        raise
+    ws = sh.worksheet(title)
     return ws
 
 def gs_read_rows() -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
