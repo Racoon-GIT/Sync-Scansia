@@ -68,18 +68,26 @@ def _load_from_csv_env() -> List[Dict]:
 # FONTE 3: Google Sheets (prod)
 # ---------------------------
 def _load_from_gsheets() -> List[Dict]:
+    import re
     creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
     sheet_id = os.getenv("GSPREAD_SHEET_ID")
+    sheet_url = os.getenv("SCANSIA_URL")  # opzionale: URL intero del foglio
     ws_title = os.getenv("GSPREAD_WORKSHEET_TITLE")
     gs_range = os.getenv("GSPREAD_RANGE")
 
-    # Diagnostica early
-    if not creds_json or not sheet_id:
-        missing = []
-        if not creds_json: missing.append("GOOGLE_CREDENTIALS_JSON")
-        if not sheet_id:   missing.append("GSPREAD_SHEET_ID")
-        if missing:
-            logger.warning("GSheets: variabili mancanti: %s", ", ".join(missing))
+    if not creds_json:
+        logger.warning("GSheets: variabile mancante GOOGLE_CREDENTIALS_JSON")
+        return []
+
+    # Estrai ID dall'URL se non fornito a parte
+    if not sheet_id and sheet_url:
+        m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_url)
+        if m:
+            sheet_id = m.group(1)
+            logger.info("GSheets: estratto ID da URL: %s", sheet_id)
+
+    if not sheet_id and not sheet_url:
+        logger.warning("GSheets: manca GSPREAD_SHEET_ID e SCANSIA_URL; impossibile aprire il file.")
         return []
 
     try:
@@ -91,6 +99,7 @@ def _load_from_gsheets() -> List[Dict]:
 
     try:
         info = json.loads(creds_json)
+        sa_email = info.get("client_email", "unknown@serviceaccount")
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets.readonly",
             "https://www.googleapis.com/auth/drive.readonly",
@@ -98,7 +107,26 @@ def _load_from_gsheets() -> List[Dict]:
         credentials = Credentials.from_service_account_info(info, scopes=scopes)
         client = gspread.authorize(credentials)
 
-        sh = client.open_by_key(sheet_id)
+        # Prova con ID (open_by_key), altrimenti con URL (open_by_url)
+        sh = None
+        try:
+            if sheet_id:
+                sh = client.open_by_key(sheet_id)
+        except gspread.SpreadsheetNotFound:
+            logger.error("GSheets 404: file non trovato per ID=%s. "
+                         "Condividi il foglio con %s o verifica l'ID.",
+                         sheet_id, sa_email)
+
+        if sh is None and sheet_url:
+            try:
+                sh = client.open_by_url(sheet_url)
+            except gspread.SpreadsheetNotFound:
+                logger.error("GSheets 404: file non trovato per URL. "
+                             "Condividi il foglio con %s o verifica l'URL.",
+                             sa_email)
+
+        if sh is None:
+            return []
 
         if gs_range:
             values = sh.values_get(gs_range).get("values", [])
@@ -110,34 +138,34 @@ def _load_from_gsheets() -> List[Dict]:
             rows = []
             for row in values[1:]:
                 rec = {headers[i]: (row[i].strip() if i < len(row) else "") for i in range(len(headers))}
-                rows.append(
-                    {
-                        "sku": rec.get("sku", ""),
-                        "taglia": rec.get("taglia", ""),
-                        "product_id": rec.get("product_id", ""),
-                    }
-                )
+                rows.append({
+                    "sku": rec.get("sku", ""),
+                    "taglia": rec.get("taglia", ""),
+                    "product_id": rec.get("product_id", ""),
+                })
             last_source_used.set(f"gsheets:range:{gs_range}")
             logger.info("Caricati %d update da Google Sheets (range=%s)", len(rows), gs_range)
             return rows
 
         ws = sh.worksheet(ws_title) if ws_title else sh.sheet1
-        data = ws.get_all_records()  # prima riga come header
-        rows = []
-        for r in data:
-            rows.append(
-                {
-                    "sku": (str(r.get("sku", ""))).strip(),
-                    "taglia": (str(r.get("taglia", ""))).strip(),
-                    "product_id": (str(r.get("product_id", ""))).strip(),
-                }
-            )
+        data = ws.get_all_records()
+        rows = [{
+            "sku": str(r.get("sku", "")).strip(),
+            "taglia": str(r.get("taglia", "")).strip(),
+            "product_id": str(r.get("product_id", "")).strip(),
+        } for r in data]
         last_source_used.set(f"gsheets:worksheet:{ws.title}")
         logger.info("Caricati %d update da Google Sheets (worksheet=%s)", len(rows), ws.title)
         return rows
 
     except Exception as e:
-        logger.error("Errore lettura Google Sheets: %s", e)
+        # gspread per 404 a volte rilancia genericamente; mostriamo hint utile
+        msg = str(e)
+        if "404" in msg or "not found" in msg.lower():
+            logger.error("Errore lettura Google Sheets (404/not found). "
+                         "Verifica ID/URL e condivisione con la service account.")
+        else:
+            logger.error("Errore lettura Google Sheets: %s", e)
         return []
 
 # ---------------------------
