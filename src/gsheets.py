@@ -1,47 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-gsheets.py — Loader Google Sheets con normalizzazione header.
-Compatibile con l'ambiente atteso dal tuo progetto.
+gsheets.py — Lettura/normalizzazione righe da Google Sheets + write-back Product_Id.
 
-Richiede credenziali Google già configurate (come prima).
-Legge:
-- SPREADSHEET_ID (env) se non passato esplicitamente
-- WORKSHEET_NAME (env) default: "Scarpe_in_Scansia"
+Env richieste:
+  GSPREAD_SHEET_ID
+  GSPREAD_WORKSHEET_TITLE
+  GOOGLE_CREDENTIALS_JSON   (oppure GOOGLE_APPLICATION_CREDENTIALS)
+
+Ritorna righe normalizzate con chiavi:
+  brand, modello, titolo, sku, taglia, qta, online,
+  prezzo_pieno, prezzo_scontato, product_id
 """
 
 import json
 import logging
 import os
-from typing import Dict, List, Any
+from typing import Any, Dict, List, Tuple
 
-# gspread è il client de-facto per Google Sheets
-# (usa le stesse credenziali che stavi già impiegando)
 import gspread
 from google.oauth2.service_account import Credentials
 
 logger = logging.getLogger(__name__)
 
-# Scope minimo per leggere Sheets
-_SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
-]
-
+_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 def _service_account_from_env() -> Credentials:
-    """
-    Costruisce le credenziali da variabile d'ambiente GOOGLE_CREDENTIALS_JSON
-    (stringa JSON). In alternativa, usa file puntato da GOOGLE_APPLICATION_CREDENTIALS.
-    """
     cred_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if cred_json:
-        try:
-            info = json.loads(cred_json)
-            return Credentials.from_service_account_info(info, scopes=_SCOPES)
-        except Exception as e:
-            logger.error("Errore parsing GOOGLE_CREDENTIALS_JSON: %s", e)
-            raise
-
-    # fallback: file su disco (standard Google)
+        info = json.loads(cred_json)
+        return Credentials.from_service_account_info(info, scopes=_SCOPES)
     path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if not path:
         raise RuntimeError(
@@ -49,93 +36,115 @@ def _service_account_from_env() -> Credentials:
         )
     return Credentials.from_service_account_file(path, scopes=_SCOPES)
 
-
 def _normalize_key(k: str) -> str:
-    """lower + trim + sostituisce spazi e '-' con '_'."""
     return (k or "").strip().lower().replace("-", "_").replace(" ", "_")
 
+# mappa sinonimi -> chiave canonica
+_CANON = {
+    "brand": "brand",
+    "modello": "modello",
+    "model": "modello",
+    "titolo": "titolo",
+    "title": "titolo",
+    "sku": "sku",
+    "taglia": "taglia",
+    "size": "taglia",
+    "qta": "qta",
+    "qty": "qta",
+    "quantita": "qta",
+    "quantità": "qta",
+    "online": "online",
+    "prezzo_pieno": "prezzo_pieno",
+    "prezzo_full": "prezzo_pieno",
+    "compare_at_price": "prezzo_pieno",
+    "prezzo_scontato": "prezzo_scontato",
+    "price": "prezzo_scontato",
+    "product_id": "product_id",
+    "productid": "product_id",
+    "product_id_": "product_id",
+    "product__id": "product_id",
+    "product_id_sheet": "product_id",
+}
 
-def _norm_row(d: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalizza le chiavi dell'intera riga (case-insensitive, alias comuni).
-    """
-    m = {_normalize_key(k): v for k, v in d.items()}
+def _canon_row(d: Dict[str, Any]) -> Dict[str, Any]:
+    n = {}
+    for k, v in d.items():
+        key = _normalize_key(k)
+        key = _CANON.get(key, key)
+        n[key] = v
+    # alias tardivi
+    if "product_id" not in n:
+        for alt in ("product-id", "product id"):
+            altn = _normalize_key(alt)
+            if altn in n:
+                n["product_id"] = n[altn]
+                break
+    return n
 
-    # alias comuni per product_id
-    if "productid" in m and "product_id" not in m:
-        m["product_id"] = m["productid"]
-
-    # Tentativi soft in caso di varianti strane
-    for alt in ("product-id", "product id", "product__id"):
-        alt_n = _normalize_key(alt)
-        if alt_n in m and "product_id" not in m:
-            m["product_id"] = m[alt_n]
-
-    return m
-
-
-def _open_worksheet(spreadsheet_id: str, worksheet_name: str):
+def _open_ws():
     creds = _service_account_from_env()
     client = gspread.authorize(creds)
-    sh = client.open_by_key(spreadsheet_id)
-    try:
-        return sh.worksheet(worksheet_name)
-    except gspread.WorksheetNotFound:
-        # In alcuni casi il nome può avere spazi o maiuscole diverse:
-        # facciamo un tentativo più tollerante
-        names = [ws.title for ws in sh.worksheets()]
-        logger.error(
-            "Worksheet '%s' non trovato. Disponibili: %s",
-            worksheet_name,
-            names,
-        )
-        raise
+    sheet_id = os.environ["GSPREAD_SHEET_ID"]
+    ws_title = os.environ["GSPREAD_WORKSHEET_TITLE"]
+    sh = client.open_by_key(sheet_id)
+    return sh, sh.worksheet(ws_title)
 
-
-def load_rows(
-    spreadsheet_id: str | None = None,
-    worksheet_name: str | None = None,
-) -> List[Dict[str, Any]]:
+def load_rows() -> Tuple[List[Dict[str, Any]], gspread.Worksheet, Dict[str, int]]:
     """
-    Carica righe dal worksheet e restituisce una lista di dict uniformati:
-    {
-      "sku": str,
-      "taglia": str,
-      "product_id": str,
-      "online": Any
-    }
+    Ritorna: (rows_normalized, worksheet, header_index)
+    header_index: mappa chiave normalizzata -> col_idx (1-based)
     """
-    spreadsheet_id = spreadsheet_id or os.environ.get("SPREADSHEET_ID")
-    worksheet_name = worksheet_name or os.environ.get("WORKSHEET_NAME", "Scarpe_in_Scansia")
+    sh, ws = _open_ws()
+    values = ws.get_all_values()
+    if not values:
+        return [], ws, {}
+    header = values[0]
+    body = values[1:]
 
-    if not spreadsheet_id:
-        raise RuntimeError("SPREADSHEET_ID non impostato (env o parametro).")
-
-    ws = _open_worksheet(spreadsheet_id, worksheet_name)
-
-    # get_all_records usa la prima riga come header
-    raw_rows = ws.get_all_records()
-    logger.info(
-        "Caricate %d righe da Google Sheets (worksheet=%s)",
-        len(raw_rows),
-        worksheet_name,
-    )
+    # mappa header normalizzati -> indice colonna (1-based)
+    header_idx: Dict[str, int] = {}
+    for i, h in enumerate(header, start=1):
+        hn = _normalize_key(h)
+        hn = _CANON.get(hn, hn)
+        header_idx[hn] = i
 
     rows: List[Dict[str, Any]] = []
-    for r in raw_rows:
-        n = _norm_row(r)
-        rows.append(
-            {
-                "sku": str(n.get("sku", "") or "").strip(),
-                "taglia": str(n.get("taglia", "") or "").strip(),
-                "product_id": str(n.get("product_id", "") or "").strip(),
-                "online": n.get("online"),
-            }
-        )
+    for ridx, row in enumerate(body, start=2):  # 2 = prima riga dopo header
+        raw = {header[i-1]: (row[i-1] if i-1 < len(row) else "") for i in range(1, len(header)+1)}
+        n = _canon_row(raw)
+        # aggiungi indice riga per write-back
+        n["_row_index"] = ridx
+        rows.append({
+            "brand": str(n.get("brand", "") or "").strip(),
+            "modello": str(n.get("modello", "") or "").strip(),
+            "titolo": str(n.get("titolo", "") or "").strip(),
+            "sku": str(n.get("sku", "") or "").strip(),
+            "taglia": str(n.get("taglia", "") or "").strip(),
+            "qta": str(n.get("qta", "") or "").strip(),
+            "online": n.get("online"),
+            "prezzo_pieno": str(n.get("prezzo_pieno", "") or "").strip(),
+            "prezzo_scontato": str(n.get("prezzo_scontato", "") or "").strip(),
+            "product_id": str(n.get("product_id", "") or "").strip(),
+            "_row_index": n["_row_index"],
+        })
 
-    # Log di controllo (primi header rilevati nella prima riga)
-    if raw_rows:
-        sample_keys = list(_norm_row(raw_rows[0]).keys())
-        logger.debug("Header normalizzati (prima riga): %s", sample_keys)
+    logger.debug("Header normalizzati: %s", list(header_idx.keys()))
+    logger.info("Caricate %d righe da Google Sheets (worksheet=%s)", len(rows), ws.title)
+    return rows, ws, header_idx
 
-    return rows
+def write_product_id(ws: gspread.Worksheet, header_idx: Dict[str, int],
+                     row_index: int, product_gid: str) -> None:
+    """
+    Scrive il gid Shopify nella colonna Product_Id (o equivalente) della riga (1-based).
+    """
+    col = header_idx.get("product_id")
+    if not col:
+        # prova a trovare una intestazione compatibile
+        for k in ("product_id", "productid", "product-id", "product id"):
+            k2 = _normalize_key(k)
+            if k2 in header_idx:
+                col = header_idx[k2]
+                break
+    if not col:
+        raise RuntimeError("Colonna Product_Id non trovata nel worksheet.")
+    ws.update_cell(row_index, col, product_gid)
