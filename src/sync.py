@@ -1,58 +1,44 @@
 # -*- coding: utf-8 -*-
 """
-sync.py — Workflow OUTLET completo e patchato
+sync.py — Workflow OUTLET (fix: media ordering robusto + destock Magazzino)
 
 Esegui:
     python -m src.sync --apply
 
-ENV richieste (nomi NON cambiati):
-  # Google Sheets
-  GSPREAD_SHEET_ID
-  GSPREAD_WORKSHEET_TITLE
+ENV:
+  GSPREAD_SHEET_ID | SPREADSHEET_ID
+  GSPREAD_WORKSHEET_TITLE | WORKSHEET_NAME
   GOOGLE_CREDENTIALS_JSON  (oppure GOOGLE_APPLICATION_CREDENTIALS -> file)
 
-  # Shopify
-  SHOPIFY_STORE                 es: racoon-lab.myshopify.com
+  SHOPIFY_STORE
   SHOPIFY_ADMIN_TOKEN
-  SHOPIFY_API_VERSION           es: 2025-01
+  SHOPIFY_API_VERSION (es: 2025-01)
 
-  # Locations (inventario)
-  PROMO_LOCATION_NAME           es: Promo
-  MAGAZZINO_LOCATION_NAME       es: Magazzino
+  PROMO_LOCATION_NAME      (es: Promo)
+  MAGAZZINO_LOCATION_NAME  (es: Magazzino)
 
-  # Rate limit / retry (opzionali)
-  SHOPIFY_MIN_INTERVAL_SEC      default: 0.7
-  SHOPIFY_MAX_RETRIES           default: 5
+  SHOPIFY_MIN_INTERVAL_SEC (default 0.7)
+  SHOPIFY_MAX_RETRIES      (default 5)
 """
 
 from __future__ import annotations
-
-import argparse
-import json
-import logging
-import os
-import re
-import time
+import argparse, json, logging, os, re, time
 from typing import Any, Dict, List, Optional, Tuple
-
 import requests
 
-# ---- GSheets (lettura e write-back) ----
+# GSheets
 import gspread
 from google.oauth2.service_account import Credentials
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("sync")
 
-# =============================================================================
-# Utils
-# =============================================================================
+# ========= Utils =========
 
 def _norm_key(k: str) -> str:
     return (k or "").strip().lower().replace("-", "_").replace(" ", "_")
 
 def _clean_price(v: Any) -> Optional[str]:
-    """ '€ 129', '129€', '129,90', '129.90' -> '129.90' """
     if v is None:
         return None
     s = str(v).strip()
@@ -80,9 +66,7 @@ def _truthy_si(v: Any) -> bool:
 def _gid_numeric(gid: str) -> str | None:
     return gid.split("/")[-1] if gid else None
 
-# =============================================================================
-# GSheets IO (read + write-back)
-# =============================================================================
+# ========= GSheets =========
 
 def _gs_creds() -> Credentials:
     cred_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
@@ -94,12 +78,7 @@ def _gs_creds() -> Credentials:
         raise RuntimeError("Credenziali GSheets mancanti: imposta GOOGLE_CREDENTIALS_JSON o GOOGLE_APPLICATION_CREDENTIALS")
     return Credentials.from_service_account_file(path, scopes=["https://www.googleapis.com/auth/spreadsheets"])
 
-
 def _get_env(name: str, *aliases: str, required: bool = False) -> str | None:
-    """
-    Restituisce la prima env non vuota tra name e aliases.
-    Esempio: _get_env("GSPREAD_SHEET_ID", "SPREADSHEET_ID", required=True)
-    """
     for key in (name, *aliases):
         val = os.environ.get(key)
         if val is not None and str(val).strip() != "":
@@ -108,22 +87,17 @@ def _get_env(name: str, *aliases: str, required: bool = False) -> str | None:
         raise RuntimeError(f"Variabile mancante: {name} (provati anche alias: {', '.join(aliases)})")
     return None
 
-
 def _gs_open():
     sheet_id = _get_env("GSPREAD_SHEET_ID", "SPREADSHEET_ID", required=True)
     title    = _get_env("GSPREAD_WORKSHEET_TITLE", "WORKSHEET_NAME", required=True)
-
-    # chi è l’account che sta chiamando?
     creds = _gs_creds()
     try:
         sa_email = getattr(creds, "service_account_email", None) or getattr(creds, "_service_account_email", None)
     except Exception:
         sa_email = None
-
     client = gspread.authorize(creds)
     logger.info("Google Sheet sorgente: id=%s | worksheet=%s | service_account=%s",
                 sheet_id, title, sa_email or "N/D")
-
     try:
         sh = client.open_by_key(sheet_id)
     except gspread.SpreadsheetNotFound:
@@ -136,13 +110,7 @@ def _gs_open():
     ws = sh.worksheet(title)
     return ws
 
-
 def gs_read_rows() -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """
-    Ritorna:
-      - rows: lista di dict con chiavi normalizzate
-      - col_index: mappa "nomecol_normalizzato" -> indice 1-based nel foglio
-    """
     ws = _gs_open()
     values = ws.get_all_values()
     if not values:
@@ -155,7 +123,6 @@ def gs_read_rows() -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         for i, cell in enumerate(vs):
             key = _norm_key(header[i]) if i < len(header) else f"col{i+1}"
             m[key] = cell
-        # alias comuni
         if "productid" in m and "product_id" not in m:
             m["product_id"] = m["productid"]
         return m
@@ -165,24 +132,16 @@ def gs_read_rows() -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     logger.debug("Header normalizzati (prima riga): %s", list(col_index.keys()))
     return rows, col_index
 
-
 def gs_write_product_id(sku: str, taglia: str, new_gid: str, col_index: Dict[str, int]) -> bool:
-    """
-    Scrive il Product_Id nella riga che matcha SKU + TAGLIA.
-    """
     ws = _gs_open()
     all_vals = ws.get_all_values()
     header = all_vals[0]
-    # trova colonne
     idx_sku = col_index.get("sku") or (header.index("SKU")+1 if "SKU" in header else None)
     idx_taglia = col_index.get("taglia") or (header.index("TAGLIA")+1 if "TAGLIA" in header else None)
     idx_pid = col_index.get("product_id") or (header.index("Product_Id")+1 if "Product_Id" in header else None)
-
     if not (idx_sku and idx_taglia and idx_pid):
         logger.warning("Write-back: colonne SKU/TAGLIA/Product_Id non trovate.")
         return False
-
-    # trova la prima riga che combacia
     for r_idx, row in enumerate(all_vals[1:], start=2):
         sku_cell = (row[idx_sku-1] if idx_sku-1 < len(row) else "").strip()
         tag_cell = (row[idx_taglia-1] if idx_taglia-1 < len(row) else "").strip()
@@ -193,9 +152,7 @@ def gs_write_product_id(sku: str, taglia: str, new_gid: str, col_index: Dict[str
     logger.warning("Write-back: riga non trovata per SKU=%s TAGLIA=%s", sku, taglia)
     return False
 
-# =============================================================================
-# Shopify client (REST + GraphQL) con throttle/retry
-# =============================================================================
+# ========= Shopify =========
 
 class Shopify:
     def __init__(self):
@@ -221,7 +178,7 @@ class Shopify:
         self._last_call_ts = 0.0
         self._location_cache: Dict[str, Any] | None = None
 
-    # ---- throttle/retry base ----
+    # ----- throttle/retry -----
 
     def _throttle(self):
         now = time.time()
@@ -235,12 +192,9 @@ class Shopify:
             self._throttle()
             r = self.sess.request(method, url, **kw)
             self._last_call_ts = time.time()
-
             if r.status_code == 429:
-                retry_after_hdr = r.headers.get("Retry-After")
-                retry_after = float(retry_after_hdr) if retry_after_hdr else 1.0
-                logger.warning("429 su %s %s. Retry fra %.2fs (tentativo %d/%d).",
-                               method, path, retry_after, attempt, self.max_retries)
+                retry_after = float(r.headers.get("Retry-After") or 1.0)
+                logger.warning("429 %s %s. Retry fra %.2fs (tentativo %d/%d).", method, path, retry_after, attempt, self.max_retries)
                 time.sleep(retry_after)
                 continue
             if 500 <= r.status_code < 600:
@@ -276,7 +230,7 @@ class Shopify:
         r = self._request("DELETE", path, **kw)
         return self._json_or_raise("DELETE", path, r)
 
-    # ---- GraphQL ----
+    # ----- GraphQL -----
 
     def graphql(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         for attempt in range(1, self.max_retries + 1):
@@ -284,8 +238,7 @@ class Shopify:
             r = self.sess.post(self.graphql_url, json={"query": query, "variables": variables})
             self._last_call_ts = time.time()
             if r.status_code == 429:
-                retry_after_hdr = r.headers.get("Retry-After")
-                retry_after = float(retry_after_hdr) if retry_after_hdr else 1.0
+                retry_after = float(r.headers.get("Retry-After") or 1.0)
                 logger.warning("429 GraphQL. Retry fra %.2fs (tentativo %d/%d).", retry_after, attempt, self.max_retries)
                 time.sleep(retry_after)
                 continue
@@ -303,12 +256,9 @@ class Shopify:
             return data["data"]
         raise RuntimeError("GraphQL fallito dopo retry")
 
-    # =============================================================================
-    # Ricerca prodotto sorgente e outlet
-    # =============================================================================
+    # ----- Ricerca prodotti -----
 
     def find_product_by_sku_non_outlet(self, sku: str) -> Dict[str, Any] | None:
-        # usa products(query: "sku:...") e scarta gli handle che terminano con "-outlet"
         q = f"sku:{sku}"
         data = self.graphql("""
         query($q: String!) {
@@ -317,13 +267,11 @@ class Shopify:
               variants(first: 100) { edges { node { id sku title selectedOptions { name value } inventoryItem { id } } } }
             }}
           }
-        }
-        """, {"q": q})
+        }""", {"q": q})
         for edge in data["products"]["edges"]:
             p = edge["node"]
             if p["handle"].endswith("-outlet"):
                 continue
-            # conferma che una variante abbia proprio quello SKU
             for vedge in p["variants"]["edges"]:
                 if (vedge["node"]["sku"] or "").strip() == sku:
                     return p
@@ -339,54 +287,24 @@ class Shopify:
             return data["products"]["edges"][0]["node"]
         return None
 
-    # =============================================================================
-    # Duplicazione + handle/status/tags
-    # =============================================================================
+    # ----- Duplicazione + polling -----
 
-    def product_duplicate(self, source_gid: str, new_title: str, desired_handle: str) -> str:
-        # Nota: API GraphQL recente NON accetta newHandle né espone job
+    def product_duplicate(self, source_gid: str, new_title: str) -> str:
         data = self.graphql("""
         mutation($productId:ID!, $newTitle:String!){
           productDuplicate(productId:$productId, newTitle:$newTitle) {
-            newProduct { id }
+            newProduct { id handle }
             userErrors { message field }
           }
         }""", {"productId": source_gid, "newTitle": new_title})
         dup = data["productDuplicate"]
         if dup["userErrors"]:
             raise RuntimeError(f"productDuplicate errors: {dup['userErrors']}")
+        # non sempre handle arriva subito; effettuo polling breve sul node
         new_gid = dup["newProduct"]["id"]
-        # piccolo delay per stabilizzare la replica
-        time.sleep(0.5)
-
-        # Aggiorna handle/status/tags via REST (con fallback -1, -2, ...)
-        num_id = _gid_numeric(new_gid)
-        handle = desired_handle
-        for suffix in [""] + [f"-{i}" for i in range(1, 11)]:
-            try_handle = f"{desired_handle}{suffix}"
-            try:
-                self._put(f"/products/{num_id}.json", json={
-                    "product": {
-                        "id": int(num_id),
-                        "handle": try_handle,
-                        "status": "active",
-                        "tags": ""  # svuota tag
-                    }
-                })
-                handle = try_handle
-                break
-            except Exception as e:
-                # se già esiste l'handle, riprovo col prossimo suffisso
-                if "has already been taken" in str(e).lower():
-                    continue
-                else:
-                    raise
-        logger.info("DUPLICATED outlet=%s (handle=%s)", new_gid, handle)
         return new_gid
 
-    # =============================================================================
-    # Media / immagini
-    # =============================================================================
+    # ----- Media -----
 
     def list_images(self, product_numeric_id: str) -> List[Dict[str, Any]]:
         return self._get(f"/products/{product_numeric_id}/images.json").get("images", [])
@@ -394,15 +312,15 @@ class Shopify:
     def delete_image(self, product_numeric_id: str, image_id: int) -> None:
         self._delete(f"/products/{product_numeric_id}/images/{image_id}.json")
 
-    def add_image(self, product_numeric_id: str, src_url: str, position: int) -> None:
-        # posizione 1-based, alt vuoto
-        self._post(f"/products/{product_numeric_id}/images.json", json={
-            "image": {"src": src_url, "position": int(position), "alt": ""}
-        })
+    def add_image(self, product_numeric_id: str, src_url: str, position: int, alt: str = "") -> Dict[str, Any]:
+        payload = {"image": {"src": src_url, "position": position, "alt": alt}}
+        return self._post(f"/products/{product_numeric_id}/images.json", json=payload).get("image", {})
 
-    # =============================================================================
-    # Metafield copy
-    # =============================================================================
+    def put_images_order(self, product_numeric_id: str, images_payload: List[Dict[str, Any]]) -> None:
+        # Enforce finale: ordina e svuota alt in modo deterministico
+        self._put(f"/products/{product_numeric_id}.json", json={"product": {"id": int(product_numeric_id), "images": images_payload}})
+
+    # ----- Metafield -----
 
     def list_product_metafields(self, product_gid: str) -> List[Dict[str, Any]]:
         data = self.graphql("""
@@ -417,7 +335,6 @@ class Shopify:
         return [e["node"] for e in edges]
 
     def metafields_set(self, owner_gid: str, metafields: List[Dict[str, Any]]) -> None:
-        # chunk piccolo per evitare userErrors
         CHUNK = 20
         for i in range(0, len(metafields), CHUNK):
             chunk = [{"ownerId": owner_gid, **m} for m in metafields[i:i+CHUNK]]
@@ -432,9 +349,7 @@ class Shopify:
             if errs:
                 logger.warning("metafieldsSet userErrors: %s", errs)
 
-    # =============================================================================
-    # Collections: cancella collect (manuali)
-    # =============================================================================
+    # ----- Collections / Tags / Status / Handle -----
 
     def delete_all_collects(self, product_numeric_id: str) -> None:
         collects = self._get(f"/collects.json", params={"product_id": product_numeric_id}).get("collects", [])
@@ -444,20 +359,28 @@ class Shopify:
             except Exception as e:
                 logger.warning("delete_collect %s fallita: %s", c.get("id"), e)
 
-    # =============================================================================
-    # Varianti / prezzi (bulk)
-    # =============================================================================
+    def update_product_header(self, product_numeric_id: str, handle: str, status: str = "active", tags: str = "") -> None:
+        self._put(f"/products/{product_numeric_id}.json", json={
+            "product": {
+                "id": int(product_numeric_id),
+                "handle": handle,
+                "status": status,
+                "tags": tags
+            }
+        })
+
+    # ----- Varianti / Prezzi -----
 
     def get_product_variants(self, product_gid: str) -> List[Dict[str, Any]]:
         data = self.graphql("""
         query($id:ID!){
           node(id:$id){
             ... on Product {
+              title handle status
               variants(first: 250){
                 edges{ node{ id sku title inventoryItem{ id } selectedOptions{ name value } } }
               }
               images(first: 50){ edges{ node{ url } } }
-              title handle status
             }
           }
         }""", {"id": product_gid})
@@ -477,9 +400,7 @@ class Shopify:
         if errs:
             logger.warning("productVariantsBulkUpdate userErrors: %s", errs)
 
-    # =============================================================================
-    # Inventory / Locations
-    # =============================================================================
+    # ----- Locations / Inventory -----
 
     def get_location_by_name(self, name: str) -> Dict[str, Any]:
         if self._location_cache is None:
@@ -500,55 +421,79 @@ class Shopify:
         })
 
     def inventory_delete_level(self, inventory_item_id: int, location_id: int) -> None:
-        # DELETE livello (disconnette la location dall'item)
-        self._request(
-            "DELETE",
-            f"/inventory_levels.json?inventory_item_id={inventory_item_id}&location_id={location_id}"
-        )
+        # **FIX PATH**: usare il path relativo, non duplicare /admin/api/...
+        self._delete("/inventory_levels.json",
+                     params={"inventory_item_id": inventory_item_id, "location_id": location_id})
 
-    def inventory_level_exists(self, inventory_item_id: int, location_id: int) -> bool:
-        # endpoint vuole stringhe comma-separate
-        resp = self._get(
-            "/inventory_levels.json",
-            params={
-                "inventory_item_ids": str(inventory_item_id),
-                "location_ids": str(location_id)
-            }
-        )
-        levels = resp.get("inventory_levels", [])
-        return any(
-            str(lvl.get("inventory_item_id")) == str(inventory_item_id)
-            and str(lvl.get("location_id")) == str(location_id)
-            for lvl in levels
-        )
+    def ensure_magazzino_disconnected(self, inventory_item_id: int, location_id: int, attempts: int = 3):
+        # set 0 e poi DELETE; verifica residui
+        try:
+            self.inventory_set(inventory_item_id, location_id, 0)
+        except Exception:
+            pass
+        for i in range(attempts):
+            try:
+                self.inventory_delete_level(inventory_item_id, location_id)
+            except Exception:
+                pass
+            # verifica: Shopify non ha un GET specifico per 1 livello; interroghiamo tutti i livelli dell'item
+            levels = self._get("/inventory_levels.json",
+                               params={"inventory_item_ids": inventory_item_id}).get("inventory_levels", [])
+            still = [lv for lv in levels if int(lv.get("location_id", 0)) == int(location_id)]
+            if not still:
+                return True
+            time.sleep(1 + i)  # backoff breve
+        logger.warning("Magazzino ancora collegato (inventory_item_id=%s, location_id=%s)", inventory_item_id, location_id)
+        return False
 
-# =============================================================================
-# GraphQL helper: forza tracking degli inventory item
-# =============================================================================
+# ========= Workflow per riga =========
 
-def inventory_item_update_tracked(shop: "Shopify", inv_item_gid: str, tracked: bool = True) -> None:
-    data = shop.graphql("""
-    mutation($id:ID!, $input:InventoryItemInput!){
-      inventoryItemUpdate(id:$id, input:$input){
-        inventoryItem{ id tracked }
-        userErrors{ field message }
-      }
-    }""", {"id": inv_item_gid, "input": {"tracked": tracked}})
-    errs = data["inventoryItemUpdate"]["userErrors"]
-    if errs:
-        logger.warning("inventoryItemUpdate userErrors: %s", errs)
-
-# =============================================================================
-# Workflow per UNA riga (SKU/TAGLIA/QTA/PREZZI/ONLINE)
-# =============================================================================
+def _rebuild_media_in_order(shop: Shopify, source_gid: str, outlet_gid: str):
+    """Cancella tutte le immagini dell'outlet e le ricostruisce nell'ordine del sorgente.
+       Enforcement finale con PUT per neutralizzare il job async di duplicazione."""
+    src_num = _gid_numeric(source_gid)
+    out_num = _gid_numeric(outlet_gid)
+    if not src_num or not out_num:
+        return
+    # 1) leggi immagini sorgente in ordine di position
+    src_imgs = sorted(shop.list_images(src_num), key=lambda x: x.get("position", 9999))
+    desired_srcs = [img.get("src") for img in src_imgs if img.get("src")]
+    # 2) cancella tutte quelle dell'outlet
+    out_imgs = shop.list_images(out_num)
+    for img in out_imgs:
+        try:
+            shop.delete_image(out_num, int(img["id"]))
+        except Exception:
+            pass
+    # 3) ricrea in ordine
+    created = []
+    for i, src in enumerate(desired_srcs, start=1):
+        info = shop.add_image(out_num, src, position=i, alt="")
+        if info:
+            created.append(info)
+        time.sleep(0.1)  # micro-pause per ordine deterministico
+    # 4) enforcement finale: remap per src -> id e imponi ordine/alt vuoto via PUT
+    #    (utile se il job duplicazione ha aggiunto immagini dopo il punto 3)
+    final_imgs = shop.list_images(out_num)
+    id_by_src = {}
+    for im in final_imgs:
+        s = im.get("src")
+        if s and "id" in im:
+            id_by_src.setdefault(s, im["id"])
+    payload = []
+    pos = 1
+    for s in desired_srcs:
+        img_id = id_by_src.get(s)
+        if img_id:
+            payload.append({"id": int(img_id), "position": pos, "alt": ""})
+            pos += 1
+    if payload:
+        shop.put_images_order(out_num, payload)
+    logger.info("MEDIA REBUILT: %d immagini replicate in ordine", len(payload))
 
 def process_row_outlet(shop: Shopify,
                        row: Dict[str, Any],
                        col_index: Dict[str, int]) -> Tuple[str, Optional[str]]:
-    """
-    Esegue l'intero workflow Outlet per UNA riga.
-    Ritorna: (azione_finale, outlet_gid or None)
-    """
     sku = (row.get("sku") or "").strip()
     taglia = (row.get("taglia") or "").strip()
     qta_raw = row.get("qta") or row.get("qty") or "0"
@@ -556,13 +501,12 @@ def process_row_outlet(shop: Shopify,
         qta = int(float(str(qta_raw).replace(",", ".")))
     except Exception:
         qta = 0
-
     prezzo_pieno = _clean_price(row.get("prezzo_pieno"))
     prezzo_scontato = _clean_price(row.get("prezzo_scontato"))
     if not prezzo_scontato:
         prezzo_scontato = prezzo_pieno or "0.00"
 
-    # 1) Risali al prodotto sorgente (non-outlet) da SKU
+    # 1) trova sorgente non-outlet
     source = shop.find_product_by_sku_non_outlet(sku)
     if not source:
         logger.warning("SOURCE_NOT_FOUND sku=%s -> skip", sku)
@@ -571,61 +515,53 @@ def process_row_outlet(shop: Shopify,
     source_handle = source["handle"]
     source_title = source["title"]
 
-    # 2) Determina handle/titolo Outlet
+    # 2) calcola outlet handle/titolo
     outlet_handle = source_handle + "-outlet" if not source_handle.endswith("-outlet") else source_handle
     outlet_title = f"{source_title} - Outlet" if not source_title.strip().endswith(" - Outlet") else source_title
 
-    # 3) Gestione esistenza Outlet
+    # 3) esistenza outlet
     outlet_existing = shop.find_product_by_handle_any(outlet_handle)
     if outlet_existing:
         if outlet_existing["status"] == "ACTIVE":
             logger.info("SKIP_OUTLET_ALREADY_ACTIVE handle=%s", outlet_handle)
             return ("SKIP_OUTLET_ALREADY_ACTIVE", outlet_existing["id"])
         else:
-            # è una bozza: elimino
+            # bozza -> elimina
             nid = _gid_numeric(outlet_existing["id"])
             try:
                 shop._delete(f"/products/{nid}.json")
                 logger.info("DELETE_DRAFT_OUTLET ok handle=%s", outlet_handle)
             except Exception as e:
-                logger.warning("DELETE_DRAFT_OUTLET fallita: %s", e)
+                logger.warning("DELETE_DRAFT_OUTLET fallito: %s", e)
 
-    # 4) DUPLICA (GraphQL) + set handle/status/tags (REST)
-    outlet_gid = shop.product_duplicate(source_gid, outlet_title, outlet_handle)
+    # 4) duplica
+    outlet_gid = shop.product_duplicate(source_gid, outlet_title)
 
-    # 5) Prezzi: su TUTTE le varianti del nuovo Outlet
+    # (opzionale) piccola attesa perché il job possa popolare i dati base
+    time.sleep(1.0)
+
+    # 4b) header: handle (con fallback auto), status active, tags vuoto
+    #      se l'handle è già occupato, Shopify appende -1/-2 automaticamente
+    out_num = _gid_numeric(outlet_gid)
+    shop.update_product_header(out_num, handle=outlet_handle, status="active", tags="")
+
+    logger.info("DUPLICATED outlet=%s (handle=%s)", outlet_gid, outlet_handle)
+
+    # 5) prezzi su TUTTE le varianti
     outlet_variants = shop.get_product_variants(outlet_gid)
     variant_gids = [v["id"] for v in outlet_variants]
     shop.variants_bulk_update_prices(outlet_gid, variant_gids, prezzo_scontato, prezzo_pieno)
-    try:
-        # log rapido (prime 3) per verifica
-        sample = [(sku or source_handle, prezzo_scontato, prezzo_pieno) for _ in outlet_variants[:3]]
-        logger.info("PREZZI OK (prime 3 varianti): %s", sample)
-    except Exception:
-        pass
+    # log breve di controllo
+    preview = [(source_title.split(" | ")[0][:24], prezzo_scontato, prezzo_pieno) for _ in variant_gids[:3]]
+    logger.info("PREZZI OK (prime 3 varianti): %s", preview)
 
-    # 6) Media: replica in ordine con alt vuoti (idempotente)
+    # 6) media: enforcement robusto ordine
     try:
-        src_num = _gid_numeric(source_gid)
-        out_num = _gid_numeric(outlet_gid)
-        src_imgs = shop.list_images(src_num)
-        out_imgs = shop.list_images(out_num)
-        # elimina tutte le immagini dell'outlet (per posizione coerente)
-        for im in out_imgs:
-            try:
-                shop.delete_image(out_num, im["id"])
-            except Exception:
-                pass
-        # ricrea in ordine 1..N con alt=""
-        for idx, im in enumerate(src_imgs, start=1):
-            src_url = im.get("src")
-            if src_url:
-                shop.add_image(out_num, src_url, position=idx)
-        logger.info("MEDIA REBUILT: %d immagini replicate in ordine", len(src_imgs))
+        _rebuild_media_in_order(shop, source_gid, outlet_gid)
     except Exception as e:
-        logger.warning("Copy immagini fallita (non bloccante): %s", e)
+        logger.warning("Copy/Reorder immagini fallita (non bloccante): %s", e)
 
-    # 7) Metafield: copia
+    # 7) metafield
     try:
         mfs = shop.list_product_metafields(source_gid)
         transferable = []
@@ -641,85 +577,57 @@ def process_row_outlet(shop: Shopify,
     except Exception as e:
         logger.warning("Copy metafield fallita (non bloccante): %s", e)
 
-    # 8) Collections: elimina tutte le collects manuali dal nuovo Outlet
+    # 8) Collections manuali via REST
     try:
-        out_num = _gid_numeric(outlet_gid)
         shop.delete_all_collects(out_num)
     except Exception as e:
         logger.warning("Pulizia collects fallita (non bloccante): %s", e)
 
-    # 9) INVENTARIO (Promo prima, poi destock Magazzino)
+    # 9) Inventory: prima Promo, poi svuota & disconnetti Magazzino
     promo_name = os.environ.get("PROMO_LOCATION_NAME", "").strip()
     mag_name   = os.environ.get("MAGAZZINO_LOCATION_NAME", "").strip()
     promo = shop.get_location_by_name(promo_name) if promo_name else None
     mag   = shop.get_location_by_name(mag_name) if mag_name else None
 
-    # ricarico le varianti (con inventoryItem) e forzo tracking
-    outlet_variants = shop.get_product_variants(outlet_gid)
+    # connect tutte le varianti a Promo e mettile a 0
     for v in outlet_variants:
-        inv_gid = v["inventoryItem"]["id"]
-        inventory_item_update_tracked(shop, inv_gid, True)
-
-    # collega tutte a Promo e porta a 0
-    if promo:
-        for v in outlet_variants:
-            inv_item = int(_gid_numeric(v["inventoryItem"]["id"]))
+        inv_item = v["inventoryItem"]["id"]
+        inv_num = int(_gid_numeric(inv_item))
+        if promo:
             try:
-                shop.inventory_connect(inv_item, promo["id"])
+                shop.inventory_connect(inv_num, promo["id"])
             except Exception:
                 pass
-            shop.inventory_set(inv_item, promo["id"], 0)
+            shop.inventory_set(inv_num, promo["id"], 0)
 
-    # imposta QTA solo sulla variante target
+    # variante target (SKU + taglia se presente)
     target_variant = None
     for v in outlet_variants:
         if (v.get("sku") or "").strip() == sku:
             if taglia:
-                if any((opt["name"] or "").lower() in {"size", "taglia"} and (opt["value"] or "").strip() == taglia
-                       for opt in v.get("selectedOptions", [])):
-                    target_variant = v; break
-            else:
-                target_variant = v; break
+                ok = any((opt["name"] or "").lower() in {"size", "taglia"} and (opt["value"] or "").strip() == taglia
+                         for opt in v.get("selectedOptions", []))
+                if not ok:
+                    continue
+            target_variant = v
+            break
     if target_variant and promo:
         inv_item = int(_gid_numeric(target_variant["inventoryItem"]["id"]))
         shop.inventory_set(inv_item, promo["id"], qta)
 
-    # Magazzino: set 0 + DELETE livello (con retry) su TUTTE le varianti
+    # Magazzino: azzera e disconnetti (con verifica)
     if mag:
         for v in outlet_variants:
-            inv_item = int(_gid_numeric(v["inventoryItem"]["id"]))
-            # 1) set 0
-            try:
-                shop.inventory_set(inv_item, mag["id"], 0)
-            except Exception:
-                pass
-            # 2) DELETE livello comunque (anche se GET non lo vede ancora)
-            for attempt in range(1, 4):
+            inv_num = int(_gid_numeric(v["inventoryItem"]["id"]))
+            ok = shop.ensure_magazzino_disconnected(inv_num, mag["id"])
+            if not ok:
+                # fallback: almeno assicurarsi che sia 0
                 try:
-                    shop.inventory_delete_level(inv_item, mag["id"])
-                    time.sleep(0.2)
-                    break
-                except Exception as e:
-                    if attempt == 3:
-                        logger.warning("Magazzino delete_level fallita inv_item=%s: %s", inv_item, e)
-                    else:
-                        time.sleep(0.5 * attempt)
+                    shop.inventory_set(inv_num, mag["id"], 0)
+                except Exception:
+                    pass
 
-        # Verifica finale
-        leftovers = []
-        for v in outlet_variants:
-            inv_item = int(_gid_numeric(v["inventoryItem"]["id"]))
-            try:
-                if shop.inventory_level_exists(inv_item, mag["id"]):
-                    leftovers.append(inv_item)
-            except Exception:
-                leftovers.append(inv_item)
-        if leftovers:
-            logger.warning("Magazzino ancora collegato per %d varianti (inv_items): %s", len(leftovers), leftovers[:10])
-        else:
-            logger.info("Magazzino: tutte le varianti disconnesse correttamente.")
-
-    # 10) Write-back Product_Id su GSheet
+    # 10) write-back Product_Id
     try:
         gs_write_product_id(sku, taglia, outlet_gid, col_index)
     except Exception as e:
@@ -727,20 +635,15 @@ def process_row_outlet(shop: Shopify,
 
     return ("OUTLET_CREATED", outlet_gid)
 
-# =============================================================================
-# Driver
-# =============================================================================
+# ========= Driver =========
 
 def run(do_apply: bool) -> None:
     rows, col_index = gs_read_rows()
-
-    # Normalizza e filtra
     usable: List[Dict[str, Any]] = []
     for r in rows:
         rnorm = { _norm_key(k): v for k, v in r.items() }
         if not _truthy_si(rnorm.get("online")):
             continue
-        # Qta > 0
         qraw = rnorm.get("qta") or rnorm.get("qty") or "0"
         try:
             qv = int(float(str(qraw).replace(",", ".")))
@@ -751,13 +654,11 @@ def run(do_apply: bool) -> None:
         usable.append(rnorm)
 
     logger.info("Righe totali: %d, selezionate (online==SI & Qta>0): %d", len(rows), len(usable))
-
     if not do_apply:
         logger.info("DRY-RUN: nessuna azione su Shopify. (--apply per eseguire)")
         return
 
     shop = Shopify()
-
     created = 0
     skipped_active = 0
     skipped_source = 0
@@ -781,12 +682,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Workflow OUTLET")
     parser.add_argument("--apply", action="store_true", help="Esegue davvero le operazioni su Shopify")
     args = parser.parse_args()
-
     logger.info("Avvio sync - workflow OUTLET")
     logger.info("apply=%s", args.apply)
-
     run(do_apply=args.apply)
-
     logger.info("Termine sync con exit code 0")
 
 if __name__ == "__main__":
