@@ -1,54 +1,52 @@
-# Sync-Scansia
+# Sync-Scansia — Workflow OUTLET
 
-Automazione per creare e allineare prodotti **Outlet** su Shopify a partire da un **Google Sheet**.
+Script che duplica i prodotti “sorgente” in versione **Outlet** a partire da un Google Sheet, imposta prezzi/saldi, media, metafield, collezioni, e rialloca l’inventario tra le location **Promo** e **Magazzino**.
 
-- Duplica il prodotto sorgente (stesso SKU) e crea la versione **" - Outlet"**.
-- Aggiorna titolo, handle (`-outlet`), rimuove tag, pulisce alt text immagini, copia media rinominando con `Outlet` nel filename quando possibile.
-- Aggiorna **tutte le varianti**: prezzi (price/compareAtPrice).
-- Alloca inventario in **Promo** per la variante presente a sheet; de-stocca tutte le varianti da **Magazzino**.
-- Copia i **metafield** prodotto.
-- Se esiste un **Outlet in DRAFT**, lo elimina e ricrea la copia pulita.
-- Scrive il `Product_Id` creato nella colonna `Product_Id` del Google Sheet (se configurato service account).
+## Requisiti
 
-## Deploy su Render (Cron Job)
+- Python 3.11+ (consigliato 3.12/3.13)
+- Dipendenze: `requests`, `gspread`, `google-auth`
+- Shopify Admin API (Admin Access Token) con permessi:
+  - Products (read/write)
+  - Product Listings / Collections (read/write)
+  - Inventory (read/write)
+  - Metafields (read/write)
+- Google Service Account con accesso al foglio (condividi il foglio con l’email del service account)
 
-1. Aggiungi questo repo.
-2. **Build Command**
-   ```bash
-   pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-3. **Start/Command**
-   ```bash
-   python -m src.sync --apply
-   ```
-4. (Consigliato) Imposta Python 3.12 via `runtime.txt` (già incluso).
+## Variabili d’ambiente
 
-## Variabili d'ambiente (Render → Environment)
+> **NB**: i nomi **non sono cambiati**. Sono supportati alcuni alias retro-compatibili.
 
 Obbligatorie:
+- `GSPREAD_SHEET_ID` (alias `SPREADSHEET_ID`) — **ID** del Google Sheet (non l’URL)
+- `GSPREAD_WORKSHEET_TITLE` (alias `WORKSHEET_NAME`) — nome del worksheet (es. `Scarpe_in_Scansia`)
+- `GOOGLE_CREDENTIALS_JSON` **oppure** `GOOGLE_APPLICATION_CREDENTIALS` (file path) — credenziali service account
 - `SHOPIFY_STORE` — es. `racoon-lab.myshopify.com`
+- `SHOPIFY_ADMIN_TOKEN` — Admin API access token
 - `SHOPIFY_API_VERSION` — es. `2025-01`
-- `SHOPIFY_ACCESS_TOKEN` — Admin API access token
-- `GSHEET_URL` — link *pubblico* allo Sheet (formato `.../edit?usp=sharing`)
+- `PROMO_LOCATION_NAME` — es. `Promo`
+- `MAGAZZINO_LOCATION_NAME` — es. `Magazzino`
 
-Opzionali/avanzate:
-- `PROMO_LOCATION_NAME` — default: `Promo`
-- `MAGAZZINO_LOCATION_NAME` — default: `Magazzino`
-- `MIN_QTY_THRESHOLD` — default: `0` (elabora se Qta > MIN_QTY_THRESHOLD)
-- `ONLINE_VALUE` — default: `SI`
-- `LOG_LEVEL` — `INFO` (default), `DEBUG`
-- `SHOPIFY_GQL_MIN_INTERVAL_MS` — default: `120`
-- `SHOPIFY_REST_MIN_INTERVAL_MS` — default: `120`
-- `SHOPIFY_MAX_RETRIES` — default: `8`
-- `GOOGLE_SERVICE_ACCOUNT_JSON` — contenuto JSON del service account per write-back `Product_Id` (se non presente, il write-back è saltato).
+Opzionali:
+- `SHOPIFY_MIN_INTERVAL_SEC` (default `0.7`) — throttle base tra chiamate
+- `SHOPIFY_MAX_RETRIES` (default `5`) — tentativi per 429/5xx
 
-## Esecuzione locale
+## Struttura colonne Google Sheet
+
+Vengono normalizzate (case-insensitive, spazi → underscore). Colonne usate:
+- `BRAND`, `MODELLO`, `TITOLO` (facoltative)
+- `SKU` (**richiesto**)
+- `TAGLIA` (consigliata; se presente viene usata per match preciso della variante)
+- `Qta` (**> 0** per essere selezionata)
+- `online` (**"SI"** per essere selezionata; ammessi: si/sì/true/1/x/ok/yes)
+- `Prezzo Pieno`, `Prezzo Scontato` (accettati anche formati tipo `129,90`, `€ 129`)
+- `Product_Id` (write-back)
+
+## Esecuzione
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-export SHOPIFY_STORE=...
-export SHOPIFY_ACCESS_TOKEN=...
-export GSHEET_URL='https://docs.google.com/spreadsheets/d/XXXXX/edit?usp=sharing'
+# dry-run (nessuna scrittura su Shopify)
+python -m src.sync
+
+# applica le modifiche
 python -m src.sync --apply
-```
