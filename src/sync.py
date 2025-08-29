@@ -320,33 +320,55 @@ class Shopify:
     # Duplicazione + polling
     # =============================================================================
 
-    def product_duplicate(self, source_gid: str, new_title: str) -> str:
-    # Shopify ora richiede newTitle non-null (String!)
-    safe_title = (new_title or "").strip() or "Outlet"
-    data = self.graphql("""
-    mutation($productId: ID!, $newTitle: String!) {
-      productDuplicate(productId: $productId, newTitle: $newTitle) {
-        newProduct { id }
-        userErrors { message field }
-      }
-    }""", {"productId": source_gid, "newTitle": safe_title})
+    def product_duplicate(self, source_gid: str, new_title: str, new_handle: str) -> str:
+  
+    # Titolo non nullo per rispettare String!
+        safe_title = (new_title or "").strip() or "Outlet"
 
-    dup = data["productDuplicate"]
-    if dup["userErrors"]:
-        raise RuntimeError(f"productDuplicate errors: {dup['userErrors']}")
-    new_gid = dup["newProduct"]["id"]
-    num = _gid_numeric(new_gid)
+    # 1) Duplica
+        data = self.graphql("""
+        mutation($productId: ID!, $newTitle: String!) {
+          productDuplicate(productId: $productId, newTitle: $newTitle) {
+            newProduct { id title handle status }
+            userErrors { field message }
+          }
+        }
+        """, {"productId": source_gid, "newTitle": safe_title})
+    
+        dup = data["productDuplicate"]
+        if dup["userErrors"]:
+            raise RuntimeError(f"productDuplicate errors: {dup['userErrors']}")
+    
+        new_gid = dup["newProduct"]["id"]
+    # 2) Aggiorna handle/status/tags via REST (GraphQL non accetta newHandle)
+        desired = (new_handle or "").strip()
+        if not desired:
+            # fallback: proviamo a derivare dall'handle del sorgente
+            desired = (self.find_product_by_handle_any("dummy") or {}).get("handle", "outlet")
 
-    # Poll REST finché il prodotto è disponibile
-    for _ in range(60):
-        try:
-            pr = self._get(f"/products/{num}.json").get("product")
-            if pr and pr.get("id"):
-                return new_gid
-        except Exception:
-            pass
-        time.sleep(1.0)
-    raise RuntimeError("Timeout in duplicazione: nuovo prodotto non trovato")
+    # gestisci eventuali conflitti di handle: -1, -2, ...
+        final_handle = desired
+        suffix = 1
+        while True:
+            existing = self.find_product_by_handle_any(final_handle)
+            if not existing:
+                break
+            final_handle = f"{desired}-{suffix}"
+            suffix += 1
+
+    # PUT /products/{id}.json
+        num_id = int(_gid_numeric(new_gid))
+        self._put(f"/products/{num_id}.json", json={
+            "product": {
+                "id": num_id,
+                "handle": final_handle,
+                "status": "active",
+                "tags": ""  # svuota i tag sul nuovo Outlet
+            }
+        })
+    
+        logger.info("DUPLICATED outlet=%s (handle=%s)", new_gid, final_handle)
+        return new_gid
 
 
     # =============================================================================
