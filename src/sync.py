@@ -321,29 +321,33 @@ class Shopify:
     # =============================================================================
 
     def product_duplicate(self, source_gid: str, new_title: str) -> str:
-        data = self.graphql("""
-        mutation($productId:ID!, $newTitle:String){
-          productDuplicate(productId:$productId, newTitle:$newTitle) {
-            newProduct { id }
-            userErrors { message field }
-          }
-        }""", {"productId": source_gid, "newTitle": new_title})
-        dup = data["productDuplicate"]
-        if dup["userErrors"]:
-            raise RuntimeError(f"productDuplicate errors: {dup['userErrors']}")
-        new_gid = dup["newProduct"]["id"]
-        num = _gid_numeric(new_gid)
+    # Shopify ora richiede newTitle non-null (String!)
+    safe_title = (new_title or "").strip() or "Outlet"
+    data = self.graphql("""
+    mutation($productId: ID!, $newTitle: String!) {
+      productDuplicate(productId: $productId, newTitle: $newTitle) {
+        newProduct { id }
+        userErrors { message field }
+      }
+    }""", {"productId": source_gid, "newTitle": safe_title})
 
-        # Poll REST finché il prodotto è leggibile
-        for _ in range(60):
-            try:
-                pr = self._get(f"/products/{num}.json").get("product")
-                if pr and pr.get("id"):
-                    return new_gid
-            except Exception:
-                pass
-            time.sleep(1.0)
-        raise RuntimeError("Timeout in duplicazione: nuovo prodotto non trovato")
+    dup = data["productDuplicate"]
+    if dup["userErrors"]:
+        raise RuntimeError(f"productDuplicate errors: {dup['userErrors']}")
+    new_gid = dup["newProduct"]["id"]
+    num = _gid_numeric(new_gid)
+
+    # Poll REST finché il prodotto è disponibile
+    for _ in range(60):
+        try:
+            pr = self._get(f"/products/{num}.json").get("product")
+            if pr and pr.get("id"):
+                return new_gid
+        except Exception:
+            pass
+        time.sleep(1.0)
+    raise RuntimeError("Timeout in duplicazione: nuovo prodotto non trovato")
+
 
     # =============================================================================
     # Media / immagini
