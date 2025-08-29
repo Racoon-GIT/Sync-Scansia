@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-sync.py — Workflow OUTLET completo
+sync.py — Workflow OUTLET
 
 Esegui:
     python -m src.sync --apply
@@ -95,10 +95,6 @@ def _gs_creds() -> Credentials:
     return Credentials.from_service_account_file(path, scopes=["https://www.googleapis.com/auth/spreadsheets"])
 
 def _get_env(name: str, *aliases: str, required: bool = False) -> str | None:
-    """
-    Restituisce la prima env non vuota tra name e aliases.
-    Esempio: _get_env("GSPREAD_SHEET_ID", "SPREADSHEET_ID", required=True)
-    """
     for key in (name, *aliases):
         val = os.environ.get(key)
         if val is not None and str(val).strip() != "":
@@ -111,7 +107,6 @@ def _gs_open():
     sheet_id = _get_env("GSPREAD_SHEET_ID", "SPREADSHEET_ID", required=True)
     title    = _get_env("GSPREAD_WORKSHEET_TITLE", "WORKSHEET_NAME", required=True)
 
-    # chi è l’account che sta chiamando?
     creds = _gs_creds()
     try:
         sa_email = getattr(creds, "service_account_email", None) or getattr(creds, "_service_account_email", None)
@@ -135,11 +130,6 @@ def _gs_open():
     return ws
 
 def gs_read_rows() -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """
-    Ritorna:
-      - rows: lista di dict con chiavi normalizzate
-      - col_index: mappa "nomecol_normalizzato" -> indice 1-based nel foglio
-    """
     ws = _gs_open()
     values = ws.get_all_values()
     if not values:
@@ -151,7 +141,6 @@ def gs_read_rows() -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         m = {}
         for i, cell in enumerate(vs):
             key = _norm_key(header[i]) if i < len(header) else f"col{i+1}"
-        # alias comuni
             m[key] = cell
         if "productid" in m and "product_id" not in m:
             m["product_id"] = m["productid"]
@@ -163,25 +152,18 @@ def gs_read_rows() -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     return rows, col_index
 
 def gs_write_product_id(sku: str, taglia: str, new_gid: str, col_index: Dict[str, int]) -> bool:
-    """
-    Scrive il Product_Id nella riga che matcha SKU + TAGLIA.
-    """
     ws = _gs_open()
     all_vals = ws.get_all_values()
     header = all_vals[0]
-    # trova colonne
-    idx_sku = col_index.get("sku") or (header.index("SKU")+1 if "SKU" in header else None)
-    idx_taglia = col_index.get("taglia") or (header.index("TAGLIA")+1 if "TAGLIA" in header else None)
-    idx_pid = col_index.get("product_id") or (header.index("Product_Id")+1 if "Product_Id" in header else None)
-
-    if not (idx_sku and idx_taglia and idx_pid):
+    idx_sku   = col_index.get("sku") or (header.index("SKU")+1 if "SKU" in header else None)
+    idx_tag   = col_index.get("taglia") or (header.index("TAGLIA")+1 if "TAGLIA" in header else None)
+    idx_pid   = col_index.get("product_id") or (header.index("Product_Id")+1 if "Product_Id" in header else None)
+    if not (idx_sku and idx_tag and idx_pid):
         logger.warning("Write-back: colonne SKU/TAGLIA/Product_Id non trovate.")
         return False
-
-    # trova la prima riga che combacia
     for r_idx, row in enumerate(all_vals[1:], start=2):
         sku_cell = (row[idx_sku-1] if idx_sku-1 < len(row) else "").strip()
-        tag_cell = (row[idx_taglia-1] if idx_taglia-1 < len(row) else "").strip()
+        tag_cell = (row[idx_tag-1] if idx_tag-1 < len(row) else "").strip()
         if sku_cell == sku and tag_cell == taglia:
             ws.update_cell(r_idx, idx_pid, new_gid)
             logger.info("Write-back Product_Id OK su riga %d (%s / %s)", r_idx, sku, taglia)
@@ -231,7 +213,6 @@ class Shopify:
             self._throttle()
             r = self.sess.request(method, url, **kw)
             self._last_call_ts = time.time()
-
             if r.status_code == 429:
                 retry_after_hdr = r.headers.get("Retry-After")
                 retry_after = float(retry_after_hdr) if retry_after_hdr else 1.0
@@ -270,7 +251,10 @@ class Shopify:
 
     def _delete(self, path: str, **kw):
         r = self._request("DELETE", path, **kw)
-        return self._json_or_raise("DELETE", path, r)
+        # DELETE su inventory_levels non ha body JSON in caso di successo; non fare _json_or_raise
+        if r.status_code >= 400:
+            raise RuntimeError(f"DELETE {path} -> {r.status_code} {r.text}")
+        return {}
 
     # ---- GraphQL ----
 
@@ -304,7 +288,6 @@ class Shopify:
     # =============================================================================
 
     def find_product_by_sku_non_outlet(self, sku: str) -> Dict[str, Any] | None:
-        # usa products(query: "sku:...") e scarta gli handle che terminano con "-outlet"
         q = f"sku:{sku}"
         data = self.graphql("""
         query($q: String!) {
@@ -313,13 +296,11 @@ class Shopify:
               variants(first: 100) { edges { node { id sku title selectedOptions { name value } inventoryItem { id } } } }
             }}
           }
-        }
-        """, {"q": q})
+        }""", {"q": q})
         for edge in data["products"]["edges"]:
             p = edge["node"]
             if p["handle"].endswith("-outlet"):
                 continue
-            # conferma che una variante abbia proprio quello SKU
             for vedge in p["variants"]["edges"]:
                 if (vedge["node"]["sku"] or "").strip() == sku:
                     return p
@@ -339,29 +320,29 @@ class Shopify:
     # Duplicazione + polling
     # =============================================================================
 
-    def product_duplicate(self, source_gid: str, new_title: str, new_handle: str) -> str:
-        # Avvia duplicazione (NB: lascia intatti i restanti campi, handle verrà eventualmente sistemato dopo)
+    def product_duplicate(self, source_gid: str, new_title: str) -> str:
         data = self.graphql("""
-        mutation($productId:ID!, $newTitle:String!){
+        mutation($productId:ID!, $newTitle:String){
           productDuplicate(productId:$productId, newTitle:$newTitle) {
-            newProduct { id handle title status }
+            newProduct { id }
             userErrors { message field }
           }
         }""", {"productId": source_gid, "newTitle": new_title})
         dup = data["productDuplicate"]
         if dup["userErrors"]:
             raise RuntimeError(f"productDuplicate errors: {dup['userErrors']}")
+        new_gid = dup["newProduct"]["id"]
+        num = _gid_numeric(new_gid)
 
-        # Poll by handle desiderato, se non trovato ripiega su title
-        # (Lasciamo la logica invariata del tuo ambiente; qui torniamo l'id del nuovo prodotto)
-        for i in range(30):
+        # Poll REST finché il prodotto è leggibile
+        for _ in range(60):
+            try:
+                pr = self._get(f"/products/{num}.json").get("product")
+                if pr and pr.get("id"):
+                    return new_gid
+            except Exception:
+                pass
             time.sleep(1.0)
-            p = self.find_product_by_handle_any(new_handle)
-            if p:
-                return p["id"]
-        # se non lo trova per handle, ritorna comunque l'id appena creato
-        if dup.get("newProduct") and dup["newProduct"].get("id"):
-            return dup["newProduct"]["id"]
         raise RuntimeError("Timeout in duplicazione: nuovo prodotto non trovato")
 
     # =============================================================================
@@ -371,19 +352,12 @@ class Shopify:
     def list_images(self, product_numeric_id: str) -> List[Dict[str, Any]]:
         return self._get(f"/products/{product_numeric_id}/images.json").get("images", [])
 
-    def add_image(self, product_numeric_id: str, src_url: str, position: Optional[int] = None) -> None:
-        payload = {"image": {"src": src_url}}
-        if position is not None:
-            payload["image"]["position"] = position
-        self._post(f"/products/{product_numeric_id}/images.json", json=payload)
+    def add_image(self, product_numeric_id: str, src_url: str, position: int) -> None:
+        self._post(f"/products/{product_numeric_id}/images.json",
+                   json={"image": {"src": src_url, "position": position, "alt": ""}})
 
-    def delete_all_images(self, product_numeric_id: str) -> None:
-        imgs = self.list_images(product_numeric_id)
-        for img in imgs:
-            try:
-                self._delete(f"/products/{product_numeric_id}/images/{img['id']}.json")
-            except Exception as e:
-                logger.warning("delete image %s fallita: %s", img.get("id"), e)
+    def delete_image(self, product_numeric_id: str, image_id: int) -> None:
+        self._delete(f"/products/{product_numeric_id}/images/{image_id}.json")
 
     # =============================================================================
     # Metafield copy
@@ -402,7 +376,6 @@ class Shopify:
         return [e["node"] for e in edges]
 
     def metafields_set(self, owner_gid: str, metafields: List[Dict[str, Any]]) -> None:
-        # chunk piccolo per evitare userErrors (es. namespace protetti)
         CHUNK = 20
         for i in range(0, len(metafields), CHUNK):
             chunk = [{"ownerId": owner_gid, **m} for m in metafields[i:i+CHUNK]]
@@ -422,7 +395,7 @@ class Shopify:
     # =============================================================================
 
     def delete_all_collects(self, product_numeric_id: str) -> None:
-        collects = self._get(f"/collects.json", params={"product_id": product_numeric_id}).get("collects", [])
+        collects = self._get("/collects.json", params={"product_id": product_numeric_id}).get("collects", [])
         for c in collects:
             try:
                 self._delete(f"/collects/{c['id']}.json")
@@ -430,7 +403,7 @@ class Shopify:
                 logger.warning("delete_collect %s fallita: %s", c.get("id"), e)
 
     # =============================================================================
-    # Varianti prezzi (bulk)
+    # Varianti & prezzi (bulk)
     # =============================================================================
 
     def get_product_variants(self, product_gid: str) -> List[Dict[str, Any]]:
@@ -441,7 +414,6 @@ class Shopify:
               variants(first: 250){
                 edges{ node{ id sku title inventoryItem{ id } selectedOptions{ name value } } }
               }
-              images(first: 50){ edges{ node{ url } } }
               title handle status
             }
           }
@@ -474,38 +446,121 @@ class Shopify:
             return self._location_cache[name]
         raise RuntimeError(f"Location non trovata: {name}")
 
+    def list_inventory_levels(self, inventory_item_id: int) -> List[Dict[str, Any]]:
+        resp = self._get("/inventory_levels.json", params={"inventory_item_ids": inventory_item_id})
+        return resp.get("inventory_levels", [])
+
     def inventory_connect(self, inventory_item_id: int, location_id: int) -> None:
-        self._post("/inventory_levels/connect.json", json={
-            "inventory_item_id": inventory_item_id, "location_id": location_id
-        })
+        self._post("/inventory_levels/connect.json",
+                   json={"inventory_item_id": inventory_item_id, "location_id": location_id})
 
     def inventory_set(self, inventory_item_id: int, location_id: int, qty: int) -> None:
-        self._post("/inventory_levels/set.json", json={
-            "inventory_item_id": inventory_item_id, "location_id": location_id, "available": int(qty)
-        })
+        self._post("/inventory_levels/set.json",
+                   json={"inventory_item_id": inventory_item_id, "location_id": location_id, "available": int(qty)})
 
     def inventory_delete_level(self, inventory_item_id: int, location_id: int) -> None:
-        """
-        Disconnette il livello di inventario per (inventory_item_id, location_id).
-        Se il livello non esiste, Shopify risponde 404/422: lo ignoriamo.
-        """
-        # ATTENZIONE: path relativo (self.base viene già aggiunta in _request)
-        r = self._request(
-            "DELETE",
-            "/inventory_levels.json",
-            params={"inventory_item_id": inventory_item_id, "location_id": location_id},
-        )
-        if r.status_code in (404, 422):
-            return
-        self._json_or_raise("DELETE", "/inventory_levels.json", r)
+        # ATTENZIONE: path RELATIVO, niente doppio /admin/api/...
+        self._delete("/inventory_levels.json",
+                     params={"inventory_item_id": inventory_item_id, "location_id": location_id})
 
-    def inventory_levels_for(self, inventory_item_id: int, location_id: int) -> list[dict]:
-        """Ritorna eventuali livelli presenti per (item, location) — solo per logging/diagnostica."""
-        data = self._get(
-            "/inventory_levels.json",
-            params={"inventory_item_ids": inventory_item_id, "location_ids": location_id},
-        )
-        return data.get("inventory_levels", [])
+    # =============================================================================
+    # Product base update (handle/status/tags)
+    # =============================================================================
+
+    def update_product_basic(self, product_numeric_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self._put(f"/products/{product_numeric_id}.json", json={"product": {"id": int(product_numeric_id), **payload}})
+
+# =============================================================================
+# Media helper (idempotente, preserva ordine)
+# =============================================================================
+
+def media_rebuild(shop: Shopify, source_num: str, outlet_num: str) -> int:
+    """Cancella tutte le immagini dell'outlet e le reinserisce in ordine dal sorgente, alt = ''. Ritorna quante inserite."""
+    src_imgs = shop.list_images(source_num)
+    order = sorted(src_imgs, key=lambda x: x.get("position") or 9999)
+    out_imgs = shop.list_images(outlet_num)
+    # delete tutte sull'outlet
+    for img in out_imgs:
+        try:
+            shop.delete_image(outlet_num, img["id"])
+        except Exception as e:
+            logger.warning("delete immagine %s fallita: %s", img.get("id"), e)
+    # reinserisci in ordine
+    count = 0
+    for i, img in enumerate(order):
+        src_url = img.get("src")
+        if not src_url:
+            continue
+        shop.add_image(outlet_num, src_url, i+1)
+        count += 1
+        # piccolo spacing per rate limit sugli images
+        time.sleep(0.15)
+    return count
+
+# =============================================================================
+# Inventory helper (Promo prima, poi Magazzino a 0 + disconnect)
+# =============================================================================
+
+def inventory_apply(shop: Shopify,
+                    outlet_variants: List[Dict[str, Any]],
+                    sku_target: str,
+                    taglia: str | None,
+                    qta: int,
+                    promo_name: str | None,
+                    mag_name: str | None) -> None:
+    promo = shop.get_location_by_name(promo_name) if promo_name else None
+    mag   = shop.get_location_by_name(mag_name) if mag_name else None
+
+    # Connessione a Promo e reset a 0 su TUTTE le varianti
+    if promo:
+        for v in outlet_variants:
+            inv_item_gid = v["inventoryItem"]["id"]
+            inv_num = int(_gid_numeric(inv_item_gid))
+            try:
+                shop.inventory_connect(inv_num, promo["id"])
+            except Exception:
+                pass
+            shop.inventory_set(inv_num, promo["id"], 0)
+
+    # Trova la variante target per quantità su Promo
+    if promo:
+        target = None
+        for v in outlet_variants:
+            if (v.get("sku") or "").strip() == (sku_target or "").strip():
+                if taglia:
+                    ok = False
+                    for opt in v.get("selectedOptions", []):
+                        if (opt["name"] or "").lower() in {"size", "taglia"} and (opt["value"] or "").strip() == taglia:
+                            ok = True
+                            break
+                    if ok:
+                        target = v
+                        break
+                else:
+                    target = v
+                    break
+        if target:
+            inv_item = int(_gid_numeric(target["inventoryItem"]["id"]))
+            shop.inventory_set(inv_item, promo["id"], qta)
+
+    # MAGAZZINO -> set a 0 + disconnect del livello (affinché l'unica disponibilità resti Promo)
+    if mag:
+        for v in outlet_variants:
+            inv_item = int(_gid_numeric(v["inventoryItem"]["id"]))
+            # Se esiste un livello in magazzino, prima lo portiamo a 0, poi lo disconnettiamo.
+            levels = shop.list_inventory_levels(inv_item)
+            for lvl in levels:
+                if lvl.get("location_id") == mag["id"]:
+                    try:
+                        if (lvl.get("available") or 0) != 0:
+                            shop.inventory_set(inv_item, mag["id"], 0)
+                    except Exception:
+                        # anche se set fallisce, proviamo comunque a disconnettere
+                        pass
+                    try:
+                        shop.inventory_delete_level(inv_item, mag["id"])
+                    except Exception as e:
+                        logger.warning("inventory_delete_level inv_item=%s loc=%s fallita: %s", inv_item, mag["id"], e)
 
 # =============================================================================
 # Workflow per UNA riga (SKU/TAGLIA/QTA/PREZZI/ONLINE)
@@ -514,10 +569,6 @@ class Shopify:
 def process_row_outlet(shop: Shopify,
                        row: Dict[str, Any],
                        col_index: Dict[str, int]) -> Tuple[str, Optional[str]]:
-    """
-    Esegue l'intero workflow Outlet per UNA riga.
-    Ritorna: (azione_finale, outlet_gid or None)
-    """
     sku = (row.get("sku") or "").strip()
     taglia = (row.get("taglia") or "").strip()
     qta_raw = row.get("qta") or row.get("qty") or "0"
@@ -531,7 +582,7 @@ def process_row_outlet(shop: Shopify,
     if not prezzo_scontato:
         prezzo_scontato = prezzo_pieno or "0.00"
 
-    # 1) Risali al prodotto sorgente (non-outlet) da SKU
+    # 1) Risali al prodotto sorgente
     source = shop.find_product_by_sku_non_outlet(sku)
     if not source:
         logger.warning("SOURCE_NOT_FOUND sku=%s -> skip", sku)
@@ -540,130 +591,92 @@ def process_row_outlet(shop: Shopify,
     source_handle = source["handle"]
     source_title = source["title"]
 
-    # 2) Determina handle/titolo Outlet
-    outlet_handle = source_handle + "-outlet" if not source_handle.endswith("-outlet") else source_handle
+    # 2) Handle/titolo Outlet desiderati
+    desired_handle = source_handle + "-outlet" if not source_handle.endswith("-outlet") else source_handle
     outlet_title = f"{source_title} - Outlet" if not source_title.strip().endswith(" - Outlet") else source_title
 
     # 3) Gestione esistenza Outlet
-    outlet_existing = shop.find_product_by_handle_any(outlet_handle)
+    outlet_existing = shop.find_product_by_handle_any(desired_handle)
     if outlet_existing:
         if outlet_existing["status"] == "ACTIVE":
-            logger.info("SKIP_OUTLET_ALREADY_ACTIVE handle=%s", outlet_handle)
+            logger.info("SKIP_OUTLET_ALREADY_ACTIVE handle=%s", desired_handle)
             return ("SKIP_OUTLET_ALREADY_ACTIVE", outlet_existing["id"])
         else:
-            # è una bozza: elimino
-            nid = _gid_numeric(outlet_existing["id"])
+            # bozza: elimino
             try:
+                nid = _gid_numeric(outlet_existing["id"])
                 shop._delete(f"/products/{nid}.json")
-                logger.info("DELETE_DRAFT_OUTLET ok handle=%s", outlet_handle)
+                logger.info("DELETE_DRAFT_OUTLET ok handle=%s", desired_handle)
             except Exception as e:
                 logger.warning("DELETE_DRAFT_OUTLET fallito: %s", e)
 
-    # 4) DUPLICA
-    outlet_gid = shop.product_duplicate(source_gid, outlet_title, outlet_handle)
-    logger.info("DUPLICATED outlet=%s (handle=%s)", outlet_gid, outlet_handle)
+    # 4) DUPLICA (GraphQL compatibile)
+    outlet_gid = shop.product_duplicate(source_gid, outlet_title)
+    outlet_num = _gid_numeric(outlet_gid)
+    source_num = _gid_numeric(source_gid)
+    logger.info("DUPLICATED outlet=%s (handle=%s)", outlet_gid, desired_handle)
 
-    # 5) Prezzi: su TUTTE le varianti del nuovo Outlet
+    # 5) Aggiorna handle+status+tags con fallback
+    #    Proviamo handle desiderato; se preso, tentiamo -1, -2, ...
+    base = desired_handle
+    suffix = 0
+    while True:
+        try:
+            payload = {"handle": base if suffix == 0 else f"{base}-{suffix}",
+                       "status": "active",
+                       "tags": ""}  # tags vuoto
+            shop.update_product_basic(outlet_num, payload)
+            break
+        except RuntimeError as e:
+            text = str(e)
+            if "has already been taken" in text or "taken" in text:
+                suffix += 1
+                continue
+            else:
+                raise
+    final_handle = base if suffix == 0 else f"{base}-{suffix}"
+
+    # 6) Prezzi: bulk su tutte le varianti
     outlet_variants = shop.get_product_variants(outlet_gid)
     variant_gids = [v["id"] for v in outlet_variants]
     shop.variants_bulk_update_prices(outlet_gid, variant_gids, prezzo_scontato, prezzo_pieno)
+    # log di controllo (prime 3)
+    preview = [(source_title[:22], prezzo_scontato, prezzo_pieno) for _ in range(min(3, len(variant_gids)))]
+    logger.info("PREZZI OK (prime 3 varianti): %s", preview)
 
-    # 6) Media: copia immagini mantenendo l'ordine (idempotente) e senza alt
+    # 7) Media: ricostruzione ordine + alt vuoto (idempotente)
     try:
-        src_num = _gid_numeric(source_gid)
-        out_num = _gid_numeric(outlet_gid)
-        src_imgs = shop.list_images(src_num)
-        out_imgs = shop.list_images(out_num)
-
-        # Se le sequenze differiscono, ricostruisci
-        src_urls = [img.get("src") for img in src_imgs if img.get("src")]
-        out_urls = [img.get("src") for img in out_imgs if img.get("src")]
-
-        if src_urls != out_urls:
-            shop.delete_all_images(out_num)
-            # Aggiungi in ordine, senza alt/position rispetta 'position' passata
-            for idx, url in enumerate(src_urls, start=1):
-                shop.add_image(out_num, url, position=idx)
-            logger.info("MEDIA REBUILT: %d immagini replicate in ordine", len(src_urls))
-        else:
-            logger.info("MEDIA OK: ordine già coerente (%d immagini)", len(src_urls))
+        n = media_rebuild(shop, source_num, outlet_num)
+        logger.info("MEDIA REBUILT: %d immagini replicate in ordine", n)
     except Exception as e:
-        logger.warning("Copy immagini: warning non bloccante -> %s", e)
+        logger.warning("Copy immagini fallita (non bloccante): %s", e)
 
-    # 7) Metafield: copia
+    # 8) Metafield: copia
     try:
         mfs = shop.list_product_metafields(source_gid)
-        transferable = []
-        for m in mfs:
-            transferable.append({
-                "namespace": m["namespace"],
-                "key": m["key"],
-                "type": m.get("type") or "single_line_text_field",
-                "value": m.get("value") or "",
-            })
+        transferable = [{
+            "namespace": m["namespace"],
+            "key": m["key"],
+            "type": m.get("type") or "single_line_text_field",
+            "value": m.get("value") or "",
+        } for m in mfs]
         if transferable:
             shop.metafields_set(outlet_gid, transferable)
     except Exception as e:
         logger.warning("Copy metafield fallita (non bloccante): %s", e)
 
-    # 8) Collections: elimina tutte le collects manuali dal nuovo Outlet
+    # 9) Collections: elimina tutte le collects manuali
     try:
-        out_num = _gid_numeric(outlet_gid)
-        shop.delete_all_collects(out_num)
+        shop.delete_all_collects(outlet_num)
     except Exception as e:
         logger.warning("Pulizia collects fallita (non bloccante): %s", e)
 
-    # 9) Locations & inventario
-    promo_name = os.environ.get("PROMO_LOCATION_NAME", "").strip()
-    mag_name = os.environ.get("MAGAZZINO_LOCATION_NAME", "").strip()
-    promo = shop.get_location_by_name(promo_name) if promo_name else None
-    mag = shop.get_location_by_name(mag_name) if mag_name else None
+    # 10) Locations & inventario (Promo prima, poi Magazzino a 0 + disconnect)
+    promo_name = os.environ.get("PROMO_LOCATION_NAME", "").strip() or None
+    mag_name   = os.environ.get("MAGAZZINO_LOCATION_NAME", "").strip() or None
+    inventory_apply(shop, outlet_variants, sku, taglia, qta, promo_name, mag_name)
 
-    # Promo: collega tutte le varianti e mettile a 0
-    for v in outlet_variants:
-        inv_item = v["inventoryItem"]["id"]
-        inv_num = int(_gid_numeric(inv_item))
-        if promo:
-            try:
-                shop.inventory_connect(inv_num, promo["id"])
-            except Exception:
-                pass
-            shop.inventory_set(inv_num, promo["id"], 0)
-
-    # Trova la variante target (SKU + eventuale TAGLIA)
-    target_variant = None
-    for v in outlet_variants:
-        if (v.get("sku") or "").strip() == sku:
-            if taglia:
-                ok = False
-                for opt in v.get("selectedOptions", []):
-                    if (opt["name"] or "").lower() in {"size", "taglia"} and (opt["value"] or "").strip() == taglia:
-                        ok = True
-                        break
-                if ok:
-                    target_variant = v
-                    break
-            else:
-                target_variant = v
-                break
-    if target_variant and promo:
-        inv_item = int(_gid_numeric(target_variant["inventoryItem"]["id"]))
-        shop.inventory_set(inv_item, promo["id"], qta)
-
-    # Magazzino: rimuovi i livelli per TUTTE le varianti (niente set a 0 che ricrea i livelli)
-    if mag:
-        for v in outlet_variants:
-            inv_num = int(_gid_numeric(v["inventoryItem"]["id"]))
-            try:
-                shop.inventory_delete_level(inv_num, mag["id"])
-            except Exception as e:
-                logger.warning("MAGAZZINO disconnect warn item=%s: %s", inv_num, e)
-            else:
-                leftover = shop.inventory_levels_for(inv_num, mag["id"])
-                if leftover:
-                    logger.warning("MAGAZZINO residuo item=%s -> %s", inv_num, leftover)
-
-    # 10) Write-back Product_Id su GSheet
+    # 11) Write-back Product_Id su GSheet
     try:
         gs_write_product_id(sku, taglia, outlet_gid, col_index)
     except Exception as e:
@@ -684,7 +697,6 @@ def run(do_apply: bool) -> None:
         rnorm = { _norm_key(k): v for k, v in r.items() }
         if not _truthy_si(rnorm.get("online")):
             continue
-        # Qta > 0
         qraw = rnorm.get("qta") or rnorm.get("qty") or "0"
         try:
             qv = int(float(str(qraw).replace(",", ".")))
@@ -708,7 +720,7 @@ def run(do_apply: bool) -> None:
 
     for r in usable:
         try:
-            action, _ = process_row_outlet(shop, r, col_index)
+            action, out_gid = process_row_outlet(shop, r, col_index)
             if action == "OUTLET_CREATED":
                 created += 1
             elif action == "SKIP_OUTLET_ALREADY_ACTIVE":
