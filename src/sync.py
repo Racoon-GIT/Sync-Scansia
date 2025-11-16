@@ -293,6 +293,40 @@ class Shopify:
                 return edge["node"]
         return None
 
+    def find_outlet_by_sku(self, sku: str) -> Optional[Dict[str, Any]]:
+        """
+        Trova prodotto OUTLET esistente per SKU.
+        Cerca prodotti con variante che ha questo SKU ed handle contenente 'outlet'.
+        Esclude il prodotto sorgente (senza -outlet).
+        """
+        q = f"sku:{sku}"
+        data = self.graphql("""
+        query($q: String!) {
+          products(first: 20, query: $q) {
+            edges { node { 
+              id title handle status
+              variants(first: 5) {
+                edges { node { sku }}
+              }
+            }}
+          }
+        }""", {"q": q})
+        
+        # Cerca prodotto outlet (handle contiene "outlet") con questo SKU
+        for edge in data["products"]["edges"]:
+            p = edge["node"]
+            # Deve essere un outlet (handle contiene -outlet)
+            if "-outlet" not in p["handle"].lower():
+                continue
+            
+            # Verifica che abbia effettivamente una variante con questo SKU
+            for vedge in p["variants"]["edges"]:
+                if (vedge["node"]["sku"] or "").strip() == sku:
+                    logger.debug("Trovato outlet esistente per SKU=%s: %s", sku, p["handle"])
+                    return p
+        
+        return None
+
     def product_duplicate(self, source_gid: str, new_title: str) -> str:
         """Duplica prodotto (solo con newTitle, handle viene aggiornato dopo)"""
         data = self.graphql("""
@@ -518,7 +552,7 @@ def process_row(shop: Shopify, row: Dict[str, Any], ws, col_index: Dict[str, int
     source_handle = source["handle"]
     source_title = source["title"]
     
-    # 3. Verifica esistenza Outlet
+    # 3. Verifica esistenza Outlet (cerca per SKU - più affidabile)
     outlet_handle = f"{source_handle}-outlet"
     
     # FIX BUG #5: Previeni titoli duplicati "Outlet - Outlet"
@@ -527,15 +561,18 @@ def process_row(shop: Shopify, row: Dict[str, Any], ws, col_index: Dict[str, int
     else:
         outlet_title = f"{source_title} - Outlet"
     
-    existing = shop.find_product_by_handle(outlet_handle)
-    if existing:
-        if existing["status"] == "ACTIVE":
-            logger.info("Outlet già attivo: %s", outlet_handle)
+    # FIX BUG #8 MIGLIORATO: Cerca outlet esistente per SKU (univoco!)
+    # Cerca tutti i prodotti che hanno una variante con questo SKU
+    existing_outlet = shop.find_outlet_by_sku(sku)
+    if existing_outlet:
+        if existing_outlet["status"] == "ACTIVE":
+            logger.info("Outlet già attivo per SKU=%s: %s (handle: %s)", 
+                       sku, existing_outlet["title"], existing_outlet["handle"])
             return "SKIP_ALREADY_ACTIVE"
         else:
             # Elimina draft
-            logger.info("Eliminazione draft outlet: %s", existing["id"])
-            shop.delete_product(existing["id"])
+            logger.info("Eliminazione draft outlet per SKU=%s: %s", sku, existing_outlet["id"])
+            shop.delete_product(existing_outlet["id"])
     
     # 4. Duplica prodotto
     logger.info("Duplicazione: %s -> %s", source_title, outlet_title)
@@ -629,23 +666,24 @@ def process_row(shop: Shopify, row: Dict[str, Any], ws, col_index: Dict[str, int
             else:
                 logger.warning("Variante target non trovata per SKU=%s TAGLIA=%s", sku, taglia)
     
-    # FIX BUG #3: Gestione inventario Magazzino migliorata
+    # FIX: Gestione inventario Magazzino - Solo disconnetti se già connesso
     if mag_name:
         mag = shop.get_location_by_name(mag_name)
         if mag:
             variants = shop.get_product_variants(outlet_gid)
+            disconnected = 0
             for v in variants:
                 inv_id = int(_gid_numeric(v["inventoryItem"]["id"]))
                 try:
-                    # Prima connetti (se necessario)
-                    shop.inventory_connect(inv_id, mag["id"])
-                    # Poi azzera
-                    shop.inventory_set(inv_id, mag["id"], 0)
-                    # Infine disconnetti
+                    # Tenta di disconnettere direttamente (senza connettere prima!)
+                    # Se non è connesso, il DELETE fallirà silenziosamente
                     shop.inventory_delete_level(inv_id, mag["id"])
+                    disconnected += 1
+                    logger.debug("Disconnesso inventory item=%s da Magazzino", inv_id)
                 except Exception as e:
-                    logger.warning("Errore gestione inventario Magazzino item=%s: %s", inv_id, e)
-            logger.info("Inventario Magazzino azzerato e disconnesso")
+                    # Se fallisce è normale (item non era connesso)
+                    logger.debug("Item %s non era connesso a Magazzino: %s", inv_id, e)
+            logger.info("Inventario Magazzino: %d varianti disconnesse", disconnected)
     
     # 11. Write-back Product_Id
     if ws and "_row_index" in row:
