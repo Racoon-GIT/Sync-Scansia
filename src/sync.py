@@ -300,6 +300,8 @@ class Shopify:
         Esclude il prodotto sorgente (senza -outlet).
         """
         q = f"sku:{sku}"
+        logger.info("🔍 Query GraphQL: '%s'", q)
+        
         data = self.graphql("""
         query($q: String!) {
           products(first: 20, query: $q) {
@@ -312,40 +314,61 @@ class Shopify:
           }
         }""", {"q": q})
         
-        logger.debug("Ricerca outlet per SKU=%s: trovati %d prodotti totali", 
-                     sku, len(data["products"]["edges"]))
+        num_results = len(data["products"]["edges"])
+        logger.info("📊 Ricerca outlet per SKU=%s: trovati %d prodotti totali", sku, num_results)
+        
+        if num_results == 0:
+            logger.warning("⚠️ ATTENZIONE: GraphQL non ha trovato NESSUN prodotto con SKU=%s!", sku)
+            logger.warning("⚠️ Verifica che il prodotto outlet esistente su Shopify abbia effettivamente SKU=%s", sku)
+            return None
         
         # Cerca prodotto outlet (handle contiene "outlet") con questo SKU
-        for edge in data["products"]["edges"]:
+        for i, edge in enumerate(data["products"]["edges"], 1):
             p = edge["node"]
             handle_lower = p["handle"].lower()
             
-            # Log per debug
-            logger.debug("  - Valuto prodotto: handle=%s, status=%s", p["handle"], p["status"])
+            # Log TUTTI i prodotti trovati
+            logger.info("  [%d/%d] Prodotto trovato:", i, num_results)
+            logger.info("      - ID: %s", p["id"])
+            logger.info("      - Titolo: %s", p["title"])
+            logger.info("      - Handle: %s", p["handle"])
+            logger.info("      - Status: %s", p["status"])
+            
+            # Mostra SKU varianti
+            variant_skus = [v["node"]["sku"] for v in p["variants"]["edges"]]
+            logger.info("      - SKU varianti: %s", variant_skus)
             
             # FILTRO OUTLET: Handle deve contenere "outlet" 
-            # (potrebbe essere: "scarpa-outlet", "scarpa-outlet-1", "scarpa-nera-outlet")
             if "outlet" not in handle_lower:
-                logger.debug("    -> Scartato: handle non contiene 'outlet'")
+                logger.info("      ❌ Scartato: handle non contiene 'outlet'")
                 continue
+            else:
+                logger.info("      ✓ Handle contiene 'outlet'")
             
             # Verifica che abbia effettivamente una variante con questo SKU
             has_sku = False
             for vedge in p["variants"]["edges"]:
-                if (vedge["node"]["sku"] or "").strip() == sku:
+                variant_sku = (vedge["node"]["sku"] or "").strip()
+                if variant_sku == sku:
                     has_sku = True
+                    logger.info("      ✓ Trovata variante con SKU match: '%s' == '%s'", variant_sku, sku)
                     break
+                else:
+                    logger.debug("      - Variante SKU '%s' != '%s'", variant_sku, sku)
             
             if not has_sku:
-                logger.debug("    -> Scartato: nessuna variante con SKU=%s", sku)
+                logger.info("      ❌ Scartato: nessuna variante con SKU esatto '%s'", sku)
                 continue
             
             # Trovato outlet!
-            logger.info("✓ Trovato outlet esistente per SKU=%s: handle=%s status=%s", 
-                       sku, p["handle"], p["status"])
+            logger.info("🎯 MATCH! Trovato outlet esistente:")
+            logger.info("   - SKU: %s", sku)
+            logger.info("   - Handle: %s", p["handle"])
+            logger.info("   - Status: %s", p["status"])
+            logger.info("   - ID: %s", p["id"])
             return p
         
-        logger.debug("✗ Nessun outlet trovato per SKU=%s", sku)
+        logger.warning("❌ Nessun outlet trovato per SKU=%s dopo verifica %d prodotti", sku, num_results)
         return None
 
     def product_duplicate(self, source_gid: str, new_title: str) -> str:
@@ -695,8 +718,10 @@ def process_row(shop: Shopify, row: Dict[str, Any], ws, col_index: Dict[str, int
     # Quindi l'outlet parte già connesso a Magazzino con le stesse quantità del sorgente
     # SOLUZIONE: Prima AZZERARE tutto, POI disconnettere
     if mag_name:
+        logger.info("Cerco location Magazzino con nome: '%s'", mag_name)
         mag = shop.get_location_by_name(mag_name)
         if mag:
+            logger.info("Location Magazzino trovata: ID=%s Nome='%s'", mag["id"], mag["name"])
             variants = shop.get_product_variants(outlet_gid)
             disconnected = 0
             for v in variants:
@@ -714,6 +739,11 @@ def process_row(shop: Shopify, row: Dict[str, Any], ws, col_index: Dict[str, int
                     # Se fallisce potrebbe essere già disconnesso o problema API
                     logger.warning("Errore gestione Magazzino item=%s: %s", inv_id, e)
             logger.info("Inventario Magazzino: %d varianti azzerate e disconnesse", disconnected)
+        else:
+            logger.error("⚠️ Location Magazzino NON TROVATA! Nome cercato: '%s'", mag_name)
+            logger.error("⚠️ Verifica MAGAZZINO_LOCATION_NAME e che corrisponda ESATTAMENTE al nome su Shopify")
+    else:
+        logger.warning("⚠️ MAGAZZINO_LOCATION_NAME non settata - skip gestione Magazzino")
     
     # 11. Write-back Product_Id
     if ws and "_row_index" in row:
