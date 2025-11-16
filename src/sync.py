@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-sync.py — Workflow OUTLET (VERSIONE CORRETTA)
+sync.py — Workflow OUTLET (VERSIONE CORRETTA - Bug Fixed)
 
 Esegui:
     python -m src.sync --apply
@@ -320,7 +320,7 @@ class Shopify:
         num_id = _gid_numeric(product_gid)
         payload = {
             "product": {
-                "id": int(num_id),
+                # FIX BUG #1: Rimosso campo "id" che causava errore 422
                 "handle": handle,
                 "status": status,
                 "tags": tags
@@ -459,8 +459,10 @@ class Shopify:
                 "inventory_item_id": inv_item_id,
                 "location_id": location_id
             })
-        except Exception:
-            pass  # Già connesso
+        except Exception as e:
+            # FIX BUG #6: Log solo se non è già connesso
+            if "already exists" not in str(e).lower():
+                logger.warning("inventory_connect failed item=%s loc=%s: %s", inv_item_id, location_id, e)
 
     def inventory_set(self, inv_item_id: int, location_id: int, qty: int):
         """Imposta quantità"""
@@ -477,8 +479,8 @@ class Shopify:
                 "inventory_item_id": inv_item_id,
                 "location_id": location_id
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("inventory_delete_level failed item=%s loc=%s: %s", inv_item_id, location_id, e)
 
 # =============================================================================
 # Workflow principale
@@ -497,8 +499,9 @@ def process_row(shop: Shopify, row: Dict[str, Any], ws, col_index: Dict[str, int
     except:
         qta = 0
     
-    prezzo_pieno = _clean_price(row.get("prezzo_pieno") or row.get("prezzo pieno"))
-    prezzo_scontato = _clean_price(row.get("prezzo_scontato") or row.get("prezzo scontato"))
+    # FIX BUG #4: Rimossi .get() ridondanti (chiavi già normalizzate)
+    prezzo_pieno = _clean_price(row.get("prezzo_pieno"))
+    prezzo_scontato = _clean_price(row.get("prezzo_scontato"))
     
     if not prezzo_scontato:
         prezzo_scontato = prezzo_pieno or "0.00"
@@ -517,7 +520,12 @@ def process_row(shop: Shopify, row: Dict[str, Any], ws, col_index: Dict[str, int
     
     # 3. Verifica esistenza Outlet
     outlet_handle = f"{source_handle}-outlet"
-    outlet_title = f"{source_title} - Outlet"
+    
+    # FIX BUG #5: Previeni titoli duplicati "Outlet - Outlet"
+    if source_title.endswith(" - Outlet"):
+        outlet_title = source_title
+    else:
+        outlet_title = f"{source_title} - Outlet"
     
     existing = shop.find_product_by_handle(outlet_handle)
     if existing:
@@ -592,8 +600,10 @@ def process_row(shop: Shopify, row: Dict[str, Any], ws, col_index: Dict[str, int
                 shop.inventory_connect(inv_id, promo["id"])
                 shop.inventory_set(inv_id, promo["id"], 0)
             
-            # Trova variante target e imposta quantità
+            # FIX BUG #2: Trova variante target con break corretto
             target_variant = None
+            found = False
+            
             for v in variants:
                 if (v.get("sku") or "").strip() != sku:
                     continue
@@ -604,7 +614,10 @@ def process_row(shop: Shopify, row: Dict[str, Any], ws, col_index: Dict[str, int
                         if opt["name"].lower() in ["size", "taglia"]:
                             if opt["value"].strip() == taglia:
                                 target_variant = v
+                                found = True
                                 break
+                    if found:  # Esci anche dal loop esterno
+                        break
                 else:
                     target_variant = v
                     break
@@ -613,19 +626,25 @@ def process_row(shop: Shopify, row: Dict[str, Any], ws, col_index: Dict[str, int
                 inv_id = int(_gid_numeric(target_variant["inventoryItem"]["id"]))
                 shop.inventory_set(inv_id, promo["id"], qta)
                 logger.info("Inventario Promo: variante %s -> %d", target_variant["id"], qta)
+            else:
+                logger.warning("Variante target non trovata per SKU=%s TAGLIA=%s", sku, taglia)
     
+    # FIX BUG #3: Gestione inventario Magazzino migliorata
     if mag_name:
         mag = shop.get_location_by_name(mag_name)
         if mag:
             variants = shop.get_product_variants(outlet_gid)
             for v in variants:
                 inv_id = int(_gid_numeric(v["inventoryItem"]["id"]))
-                # Set 0 e disconnetti
                 try:
+                    # Prima connetti (se necessario)
+                    shop.inventory_connect(inv_id, mag["id"])
+                    # Poi azzera
                     shop.inventory_set(inv_id, mag["id"], 0)
-                except:
-                    pass
-                shop.inventory_delete_level(inv_id, mag["id"])
+                    # Infine disconnetti
+                    shop.inventory_delete_level(inv_id, mag["id"])
+                except Exception as e:
+                    logger.warning("Errore gestione inventario Magazzino item=%s: %s", inv_id, e)
             logger.info("Inventario Magazzino azzerato e disconnesso")
     
     # 11. Write-back Product_Id
@@ -695,7 +714,7 @@ def main():
             elif result == "SKIP_NO_SOURCE":
                 stats["skip_source"] += 1
         except Exception as e:
-            logger.error("Errore processando riga: %s", e)
+            logger.error("Errore processando riga: %s", e, exc_info=True)
             stats["errors"] += 1
     
     # Report finale
