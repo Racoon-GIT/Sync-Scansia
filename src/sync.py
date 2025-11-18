@@ -338,12 +338,23 @@ class Shopify:
             variant_skus = [v["node"]["sku"] for v in p["variants"]["edges"]]
             logger.info("      - SKU varianti: %s", variant_skus)
             
-            # FILTRO OUTLET: Handle deve contenere "outlet" 
-            if "outlet" not in handle_lower:
-                logger.info("      ❌ Scartato: handle non contiene 'outlet'")
+            # FILTRO OUTLET: Handle O Titolo devono indicare che è un outlet
+            # Alcuni outlet hanno titolo "... - Outlet" ma handle senza "outlet"!
+            handle_has_outlet = "outlet" in handle_lower
+            title_lower = p["title"].lower()
+            title_has_outlet = "outlet" in title_lower or p["title"].endswith(" - Outlet")
+            
+            is_outlet = handle_has_outlet or title_has_outlet
+            
+            if not is_outlet:
+                logger.info("      ❌ Scartato: né handle né titolo indicano 'outlet'")
+                logger.info("         (handle='%s', titolo='%s')", p["handle"], p["title"])
                 continue
             else:
-                logger.info("      ✓ Handle contiene 'outlet'")
+                if handle_has_outlet:
+                    logger.info("      ✓ Handle contiene 'outlet'")
+                if title_has_outlet:
+                    logger.info("      ✓ Titolo indica 'outlet' (termina con '- Outlet' o contiene 'outlet')")
             
             # Verifica che abbia effettivamente una variante con questo SKU
             has_sku = False
