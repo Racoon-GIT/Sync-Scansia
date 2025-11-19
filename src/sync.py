@@ -278,6 +278,36 @@ class Shopify:
                     return p
         return None
 
+    def find_product_by_sku_non_outlet(self, sku: str) -> Optional[Dict[str, Any]]:
+        """Trova prodotto sorgente (non-outlet) by SKU"""
+        q = f"sku:{sku}"
+        data = self.graphql("""
+        query($q: String!) {
+          products(first: 10, query: $q) {
+            edges { node { 
+              id title handle status
+              variants(first: 100) { 
+                edges { node { 
+                  id sku title 
+                  selectedOptions { name value } 
+                  inventoryItem { id } 
+                }}
+              }
+            }}
+          }
+        }""", {"q": q})
+        
+        for edge in data["products"]["edges"]:
+            p = edge["node"]
+            # Skip prodotti outlet
+            if p["handle"].endswith("-outlet"):
+                continue
+            # Verifica SKU nelle varianti
+            for vedge in p["variants"]["edges"]:
+                if (vedge["node"]["sku"] or "").strip() == sku:
+                    return p
+        return None
+
     def find_product_by_handle(self, handle: str) -> Optional[Dict[str, Any]]:
         """Trova prodotto by handle esatto"""
         q = f"handle:{handle}"
@@ -773,21 +803,17 @@ def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, c
     logger.info("=" * 60)
     logger.info("Processing SKU=%s con %d taglie", sku, len(rows))
     
-    # Usa prima riga per dati comuni (titolo, handle, sorgente)
+    # Usa prima riga per dati comuni
     first_row = rows[0]
     
-    # 1. Trova prodotto sorgente
-    source_handle = (first_row.get("handle") or "").strip()
-    if not source_handle:
-        logger.warning("Handle mancante per SKU=%s", sku)
-        return "SKIP_NO_SOURCE"
-    
-    source = shop.find_product_by_handle(source_handle)
+    # 1. Trova prodotto sorgente su Shopify (NON dal Google Sheet!)
+    source = shop.find_product_by_sku_non_outlet(sku)
     if not source:
-        logger.warning("Prodotto sorgente non trovato: %s", source_handle)
+        logger.warning("Prodotto sorgente non trovato per SKU=%s", sku)
         return "SKIP_NO_SOURCE"
     
     source_gid = source["id"]
+    source_handle = source["handle"]
     source_title = source["title"]
     
     # 2. Prepara titolo/handle outlet
