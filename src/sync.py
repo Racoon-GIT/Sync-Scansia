@@ -765,6 +765,162 @@ def process_row(shop: Shopify, row: Dict[str, Any], ws, col_index: Dict[str, int
     
     return "SUCCESS"
 
+def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, col_index: Dict[str, int]) -> str:
+    """
+    Processa gruppo di righe con stesso SKU (prodotto con più taglie).
+    Crea 1 outlet con tutte le taglie/quantità del gruppo.
+    """
+    logger.info("=" * 60)
+    logger.info("Processing SKU=%s con %d taglie", sku, len(rows))
+    
+    # Usa prima riga per dati comuni (titolo, handle, sorgente)
+    first_row = rows[0]
+    
+    # 1. Trova prodotto sorgente
+    source_handle = (first_row.get("handle") or "").strip()
+    if not source_handle:
+        logger.warning("Handle mancante per SKU=%s", sku)
+        return "SKIP_NO_SOURCE"
+    
+    source = shop.find_product_by_handle(source_handle)
+    if not source:
+        logger.warning("Prodotto sorgente non trovato: %s", source_handle)
+        return "SKIP_NO_SOURCE"
+    
+    source_gid = source["id"]
+    source_title = source["title"]
+    
+    # 2. Prepara titolo/handle outlet
+    outlet_handle = f"{source_handle}-outlet"
+    if source_title.endswith(" - Outlet"):
+        outlet_title = source_title
+    else:
+        outlet_title = f"{source_title} - Outlet"
+    
+    # 3. Verifica esistenza outlet per questo SKU
+    logger.info("Verifico esistenza outlet per SKU=%s...", sku)
+    existing_outlet = shop.find_outlet_by_sku(sku)
+    
+    if existing_outlet:
+        # OPZIONE C: Elimina e ricrea con TUTTE le taglie
+        logger.info("⚠️ Outlet esistente trovato per SKU=%s (status=%s)", sku, existing_outlet["status"])
+        logger.info("   Elimino e ricreo con tutte le %d taglie aggiornate", len(rows))
+        shop.delete_product(existing_outlet["id"])
+    else:
+        logger.info("✓ Nessun outlet esistente per SKU=%s, creo nuovo", sku)
+    
+    # 4. Duplica prodotto (crea outlet)
+    logger.info("Duplicazione: %s -> %s", source_title, outlet_title)
+    outlet_gid = shop.product_duplicate(source_gid, outlet_title)
+    logger.info("Outlet creato: %s (handle: %s)", outlet_gid, outlet_handle)
+    
+    # 5. Copia immagini, metafields, pulisci collections
+    shop.copy_images(source_gid, outlet_gid)
+    logger.info("Immagini copiate")
+    
+    shop.copy_metafields(source_gid, outlet_gid)
+    logger.info("Metafields copiati")
+    
+    shop.remove_collections(outlet_gid)
+    logger.info("Collections pulite")
+    
+    # 6. Gestisci PREZZI e INVENTORY per ogni taglia
+    promo_name = os.getenv("PROMO_LOCATION_NAME", "Promo")
+    promo = shop.get_location_by_name(promo_name)
+    
+    if not promo:
+        logger.error("Location Promo non trovata!")
+        return "ERROR"
+    
+    variants = shop.get_product_variants(outlet_gid)
+    logger.info("Gestisco %d taglie per outlet:", len(rows))
+    
+    for row in rows:
+        taglia = (row.get("taglia") or "").strip()
+        qta_str = row.get("qta") or row.get("qty") or "0"
+        try:
+            qta = int(float(str(qta_str).replace(",", ".")))
+        except:
+            qta = 0
+        
+        prezzo_scontato = _clean_price(row.get("prezzo_scontato"))
+        prezzo_pieno = _clean_price(row.get("prezzo_pieno"))
+        
+        # Trova variante per questa taglia
+        target_variant = None
+        for v in variants:
+            # Match SKU
+            if (v.get("sku") or "").strip() != sku:
+                continue
+            
+            # Match taglia
+            if taglia:
+                for opt in v.get("selectedOptions", []):
+                    if opt["name"].lower() in ["size", "taglia"]:
+                        if opt["value"].strip() == taglia:
+                            target_variant = v
+                            break
+                if target_variant:
+                    break
+            else:
+                target_variant = v
+                break
+        
+        if not target_variant:
+            logger.warning("  ⚠️ Variante non trovata per TAGLIA=%s", taglia)
+            continue
+        
+        variant_gid = target_variant["id"]
+        inv_id = int(_gid_numeric(target_variant["inventoryItem"]["id"]))
+        
+        # Imposta inventory Promo
+        shop.inventory_set(inv_id, promo["id"], qta)
+        
+        # Imposta prezzo per questa variante
+        if prezzo_scontato is not None:
+            shop.update_variant_price(variant_gid, prezzo_scontato, prezzo_pieno)
+            logger.info("  ✓ Taglia %s: Qta=%d, Prezzo=%.2f (pieno=%.2f)", 
+                       taglia, qta, prezzo_scontato, prezzo_pieno or 0)
+        else:
+            logger.info("  ✓ Taglia %s: Qta=%d", taglia, qta)
+    
+    # 7. Gestione Magazzino (una volta per tutte le varianti)
+    mag_name = os.getenv("MAGAZZINO_LOCATION_NAME")
+    if mag_name:
+        logger.info("Cerco location Magazzino con nome: '%s'", mag_name)
+        mag = shop.get_location_by_name(mag_name)
+        if mag:
+            logger.info("Location Magazzino trovata: ID=%s Nome='%s'", mag["id"], mag["name"])
+            variants = shop.get_product_variants(outlet_gid)
+            disconnected = 0
+            for v in variants:
+                inv_id = int(_gid_numeric(v["inventoryItem"]["id"]))
+                try:
+                    logger.debug("Azzerando stock Magazzino per item=%s", inv_id)
+                    shop.inventory_set(inv_id, mag["id"], 0)
+                    shop.inventory_delete_level(inv_id, mag["id"])
+                    disconnected += 1
+                    logger.debug("Disconnesso inventory item=%s da Magazzino", inv_id)
+                except Exception as e:
+                    logger.warning("Errore gestione Magazzino item=%s: %s", inv_id, e)
+            logger.info("Inventario Magazzino: %d varianti azzerate e disconnesse", disconnected)
+        else:
+            logger.error("⚠️ Location Magazzino NON TROVATA! Nome cercato: '%s'", mag_name)
+    else:
+        logger.warning("⚠️ MAGAZZINO_LOCATION_NAME non settata - skip gestione Magazzino")
+    
+    # 8. Write-back Product_Id per TUTTE le righe del gruppo
+    for row in rows:
+        if ws and "_row_index" in row:
+            try:
+                gs_write_product_id(ws, row["_row_index"], col_index, outlet_gid)
+                logger.debug("Write-back OK riga %d -> %s", row["_row_index"], outlet_gid)
+            except Exception as e:
+                logger.warning("Write-back fallito riga %d: %s", row["_row_index"], e)
+    
+    logger.info("✅ SKU=%s completato (%d taglie)", sku, len(rows))
+    return "SUCCESS"
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -807,15 +963,35 @@ def main():
         logger.info("Nessuna riga da processare")
         return
     
+    # NUOVO: Raggruppa righe per SKU
+    grouped_by_sku = {}
+    for row in selected:
+        sku = (row.get("sku") or "").strip()
+        if not sku:
+            logger.warning("Riga senza SKU, skip: %s", row)
+            continue
+        
+        if sku not in grouped_by_sku:
+            grouped_by_sku[sku] = []
+        grouped_by_sku[sku].append(row)
+    
+    logger.info("Prodotti unici (per SKU): %d", len(grouped_by_sku))
+    logger.info("Taglie totali: %d", len(selected))
+    
+    # Mostra riepilogo raggruppamento
+    for sku, sku_rows in grouped_by_sku.items():
+        taglie = [r.get("taglia", "?") for r in sku_rows]
+        logger.info("  - SKU=%s: %d taglie %s", sku, len(sku_rows), taglie)
+    
     # Inizializza Shopify
     shop = Shopify()
     
-    # Processa righe
+    # Processa gruppi (1 outlet per SKU, con N taglie)
     stats = {"success": 0, "skip_active": 0, "skip_source": 0, "errors": 0}
     
-    for row in selected:
+    for sku, sku_rows in grouped_by_sku.items():
         try:
-            result = process_row(shop, row, ws, col_index)
+            result = process_sku_group(shop, sku, sku_rows, ws, col_index)
             if result == "SUCCESS":
                 stats["success"] += 1
             elif result == "SKIP_ALREADY_ACTIVE":
@@ -823,7 +999,7 @@ def main():
             elif result == "SKIP_NO_SOURCE":
                 stats["skip_source"] += 1
         except Exception as e:
-            logger.error("Errore processando riga: %s", e, exc_info=True)
+            logger.error("Errore processando SKU=%s: %s", sku, e, exc_info=True)
             stats["errors"] += 1
     
     # Report finale
@@ -833,6 +1009,7 @@ def main():
     logger.info("- Skip (già attivi): %d", stats["skip_active"])
     logger.info("- Skip (no source): %d", stats["skip_source"])
     logger.info("- Errori: %d", stats["errors"])
+    logger.info("- Taglie totali gestite: %d", len(selected))
     logger.info("=" * 60)
 
 if __name__ == "__main__":
