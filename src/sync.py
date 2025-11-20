@@ -673,7 +673,7 @@ def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, c
     shop.variants_bulk_update_prices(outlet_gid, prezzo_scontato, prezzo_pieno)
     logger.info("Prezzi aggiornati: scontato=%s pieno=%s", prezzo_scontato, prezzo_pieno)
     
-    # 10. Gestione inventario MULTI-TAGLIA
+    # 10. Gestione inventario
     promo_name = os.environ.get("PROMO_LOCATION_NAME")
     mag_name = os.environ.get("MAGAZZINO_LOCATION_NAME")
     
@@ -682,7 +682,7 @@ def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, c
         if promo:
             variants = shop.get_product_variants(outlet_gid)
             
-            # Reset tutte le varianti a 0 in Promo
+            # Reset tutte le varianti a 0 in Promo (PRIMA di impostare quantità specifiche)
             for v in variants:
                 inv_id = int(_gid_numeric(v["inventoryItem"]["id"]))
                 shop.inventory_connect(inv_id, promo["id"])
@@ -714,7 +714,7 @@ def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, c
                                     target_variant = v
                                     found = True
                                     break
-                        if found:
+                        if found:  # Esci anche dal loop esterno
                             break
                     else:
                         target_variant = v
@@ -727,7 +727,10 @@ def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, c
                 else:
                     logger.warning("  ✗ Variante non trovata per TAGLIA=%s", taglia)
     
-    # Gestione Magazzino (disconnetti tutte le varianti)
+    # FIX CRITICO: Gestione inventario Magazzino
+    # Quando si duplica un prodotto, Shopify EREDITA gli inventory levels dal sorgente!
+    # Quindi l'outlet parte già connesso a Magazzino con le stesse quantità del sorgente
+    # SOLUZIONE: Prima AZZERARE tutto, POI disconnettere
     if mag_name:
         logger.info("Cerco location Magazzino con nome: '%s'", mag_name)
         mag = shop.get_location_by_name(mag_name)
@@ -738,16 +741,21 @@ def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, c
             for v in variants:
                 inv_id = int(_gid_numeric(v["inventoryItem"]["id"]))
                 try:
+                    # STEP 1: AZZERA la quantità (eredita stock dal sorgente!)
                     logger.debug("Azzerando stock Magazzino per item=%s", inv_id)
                     shop.inventory_set(inv_id, mag["id"], 0)
+                    
+                    # STEP 2: ORA disconnetti (funziona solo se stock = 0)
                     shop.inventory_delete_level(inv_id, mag["id"])
                     disconnected += 1
                     logger.debug("Disconnesso inventory item=%s da Magazzino", inv_id)
                 except Exception as e:
+                    # Se fallisce potrebbe essere già disconnesso o problema API
                     logger.warning("Errore gestione Magazzino item=%s: %s", inv_id, e)
             logger.info("Inventario Magazzino: %d varianti azzerate e disconnesse", disconnected)
         else:
             logger.error("⚠️ Location Magazzino NON TROVATA! Nome cercato: '%s'", mag_name)
+            logger.error("⚠️ Verifica MAGAZZINO_LOCATION_NAME e che corrisponda ESATTAMENTE al nome su Shopify")
     else:
         logger.warning("⚠️ MAGAZZINO_LOCATION_NAME non settata - skip gestione Magazzino")
     
