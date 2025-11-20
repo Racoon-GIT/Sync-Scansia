@@ -554,12 +554,34 @@ class Shopify:
                 logger.warning("inventory_connect failed item=%s loc=%s: %s", inv_item_id, location_id, e)
 
     def inventory_set(self, inv_item_id: int, location_id: int, qty: int):
-        """Imposta quantità"""
-        self._post("/inventory_levels/set.json", json={
-            "inventory_item_id": inv_item_id,
-            "location_id": location_id,
-            "available": qty
-        })
+        """Imposta quantità (con retry automatico se item non connesso)"""
+        try:
+            self._post("/inventory_levels/set.json", json={
+                "inventory_item_id": inv_item_id,
+                "location_id": location_id,
+                "available": qty
+            })
+        except RuntimeError as e:
+            # Se 422 = item non connesso, prova a connettere e riprova
+            if "422" in str(e):
+                logger.warning("Item %s non connesso a location %s (422), connetto e riprovo", 
+                             inv_item_id, location_id)
+                try:
+                    self.inventory_connect(inv_item_id, location_id)
+                    # Piccolo delay per propagazione
+                    time.sleep(0.5)
+                    # Riprova
+                    self._post("/inventory_levels/set.json", json={
+                        "inventory_item_id": inv_item_id,
+                        "location_id": location_id,
+                        "available": qty
+                    })
+                    logger.info("✓ Retry riuscito dopo connect")
+                except Exception as retry_e:
+                    logger.error("✗ Retry fallito: %s", retry_e)
+                    raise
+            else:
+                raise
 
     def inventory_delete_level(self, inv_item_id: int, location_id: int):
         """Rimuove inventory level"""
@@ -686,6 +708,13 @@ def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, c
             for v in variants:
                 inv_id = int(_gid_numeric(v["inventoryItem"]["id"]))
                 shop.inventory_connect(inv_id, promo["id"])
+            
+            # Piccolo delay per propagazione connessioni
+            time.sleep(0.3)
+            
+            # Ora azzera tutte
+            for v in variants:
+                inv_id = int(_gid_numeric(v["inventoryItem"]["id"]))
                 shop.inventory_set(inv_id, promo["id"], 0)
             
             # Imposta inventory per ogni taglia specifica dal Google Sheet
