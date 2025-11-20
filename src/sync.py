@@ -568,8 +568,8 @@ class Shopify:
                              inv_item_id, location_id)
                 try:
                     self.inventory_connect(inv_item_id, location_id)
-                    # Piccolo delay per propagazione
-                    time.sleep(0.5)
+                    # Delay più lungo per propagazione Shopify (è lento!)
+                    time.sleep(1.5)
                     # Riprova
                     self._post("/inventory_levels/set.json", json={
                         "inventory_item_id": inv_item_id,
@@ -704,18 +704,18 @@ def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, c
         if promo:
             variants = shop.get_product_variants(outlet_gid)
             
-            # Reset tutte le varianti a 0 in Promo (PRIMA di impostare quantità specifiche)
+            # Reset tutte le varianti a 0 in Promo
+            # Fai connect+set in modo atomico per ogni variante con delay
+            logger.info("Connetto e azzero %d varianti a Promo...", len(variants))
             for v in variants:
                 inv_id = int(_gid_numeric(v["inventoryItem"]["id"]))
-                shop.inventory_connect(inv_id, promo["id"])
-            
-            # Piccolo delay per propagazione connessioni
-            time.sleep(0.3)
-            
-            # Ora azzera tutte
-            for v in variants:
-                inv_id = int(_gid_numeric(v["inventoryItem"]["id"]))
-                shop.inventory_set(inv_id, promo["id"], 0)
+                try:
+                    shop.inventory_connect(inv_id, promo["id"])
+                    # Delay più lungo per propagazione (Shopify è lento!)
+                    time.sleep(0.8)
+                    shop.inventory_set(inv_id, promo["id"], 0)
+                except Exception as e:
+                    logger.warning("Errore reset variante %s: %s", inv_id, e)
             
             # Imposta inventory per ogni taglia specifica dal Google Sheet
             logger.info("Gestisco %d taglie per outlet:", len(rows))
