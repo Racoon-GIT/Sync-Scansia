@@ -1,1 +1,0 @@
-<contenuto corretto di gsheets_client.py>
