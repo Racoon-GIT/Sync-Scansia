@@ -609,8 +609,8 @@ def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, c
     first_row = rows[0]
     
     # 1. Estrai dati comuni dalla prima riga
-    prezzo_pieno = _clean_price(first_row.get("prezzo_pieno"))
-    prezzo_scontato = _clean_price(first_row.get("prezzo_scontato"))
+    prezzo_pieno = _clean_price(first_row.get("prezzo"))
+    prezzo_scontato = _clean_price(first_row.get("prezzo_outlet"))
     
     if not prezzo_scontato:
         prezzo_scontato = prezzo_pieno or "0.00"
