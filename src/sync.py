@@ -659,6 +659,81 @@ class Shopify:
         except Exception as e:
             logger.warning("inventory_delete_level failed item=%s loc=%s: %s", inv_item_id, location_id, e)
 
+    # ========== NUOVI METODI per variant_reset.py e channel_manager.py ==========
+
+    def inventory_levels_get(self, inventory_item_id: int) -> List[Dict[str, Any]]:
+        """Recupera inventory levels per inventory_item_id"""
+        data = self._get("/inventory_levels.json", params={"inventory_item_ids": str(inventory_item_id)})
+        return data.get("inventory_levels", [])
+
+    def variant_delete(self, variant_gid: str):
+        """Elimina variante via GraphQL"""
+        data = self.graphql("""
+        mutation($id: ID!) {
+          productVariantDelete(id: $id) {
+            deletedProductVariantId
+            userErrors { field message }
+          }
+        }
+        """, {"id": variant_gid})
+
+        errs = data.get("productVariantDelete", {}).get("userErrors", [])
+        if errs:
+            raise RuntimeError(f"variant_delete errors: {errs}")
+
+    def variant_create(self, product_gid: str, variant_input: Dict[str, Any]) -> Dict[str, Any]:
+        """Crea variante via GraphQL"""
+        data = self.graphql("""
+        mutation($productId: ID!, $input: [ProductVariantInput!]!) {
+          productVariantsBulkCreate(productId: $productId, variants: $input) {
+            productVariants {
+              id title sku price compareAtPrice
+              inventoryItem { id }
+              selectedOptions { name value }
+            }
+            userErrors { field message }
+          }
+        }
+        """, {"productId": product_gid, "input": [variant_input]})
+
+        errs = data.get("productVariantsBulkCreate", {}).get("userErrors", [])
+        if errs:
+            raise RuntimeError(f"variant_create errors: {errs}")
+
+        variants = data.get("productVariantsBulkCreate", {}).get("productVariants", [])
+        if not variants:
+            raise RuntimeError("variant_create: nessuna variante creata")
+
+        return variants[0]
+
+    def get_publications(self) -> List[Dict[str, Any]]:
+        """Recupera canali di pubblicazione"""
+        data = self.graphql("""
+        query {
+          publications(first: 50) {
+            nodes { id name }
+          }
+        }
+        """)
+        return data.get("publications", {}).get("nodes", [])
+
+    def unpublish_from_publication(self, product_gid: str, publication_id: str):
+        """Unpublish prodotto da canale"""
+        data = self.graphql("""
+        mutation($id: ID!, $input: [PublicationInput!]!) {
+          publishableUnpublish(id: $id, input: $input) {
+            userErrors { field message }
+          }
+        }
+        """, {
+            "id": product_gid,
+            "input": [{"publicationId": publication_id}]
+        })
+
+        errs = data.get("publishableUnpublish", {}).get("userErrors", [])
+        if errs:
+            logger.warning("unpublish_from_publication userErrors: %s", errs)
+
 # =============================================================================
 # Workflow principale
 # =============================================================================
