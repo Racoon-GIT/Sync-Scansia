@@ -667,44 +667,44 @@ class Shopify:
         return data.get("inventory_levels", [])
 
     def variant_delete(self, variant_gid: str):
-        """Elimina variante via GraphQL"""
-        data = self.graphql("""
-        mutation($id: ID!) {
-          productVariantDelete(id: $id) {
-            deletedProductVariantId
-            userErrors { field message }
-          }
-        }
-        """, {"id": variant_gid})
+        """Elimina variante via REST"""
+        # Estrai ID numerico da GID
+        variant_id = _gid_numeric(variant_gid)
+        if not variant_id:
+            raise RuntimeError(f"Invalid variant GID: {variant_gid}")
 
-        errs = data.get("productVariantDelete", {}).get("userErrors", [])
-        if errs:
-            raise RuntimeError(f"variant_delete errors: {errs}")
+        # DELETE via REST (productVariantDelete non disponibile in API 2025-01)
+        self._delete(f"/variants/{variant_id}.json")
 
     def variant_create(self, product_gid: str, variant_input: Dict[str, Any]) -> Dict[str, Any]:
-        """Crea variante via GraphQL"""
-        data = self.graphql("""
-        mutation($productId: ID!, $input: [ProductVariantInput!]!) {
-          productVariantsBulkCreate(productId: $productId, variants: $input) {
-            productVariants {
-              id title sku price compareAtPrice
-              inventoryItem { id }
-              selectedOptions { name value }
-            }
-            userErrors { field message }
-          }
-        }
-        """, {"productId": product_gid, "input": [variant_input]})
+        """Crea variante via REST"""
+        # Estrai ID numerico prodotto
+        product_id = _gid_numeric(product_gid)
+        if not product_id:
+            raise RuntimeError(f"Invalid product GID: {product_gid}")
 
-        errs = data.get("productVariantsBulkCreate", {}).get("userErrors", [])
-        if errs:
-            raise RuntimeError(f"variant_create errors: {errs}")
+        # POST via REST (productVariantsBulkCreate ha type mismatch)
+        payload = {"variant": variant_input}
+        response = self._post(f"/products/{product_id}/variants.json", json=payload)
 
-        variants = data.get("productVariantsBulkCreate", {}).get("productVariants", [])
-        if not variants:
+        variant_data = response.get("variant", {})
+        if not variant_data:
             raise RuntimeError("variant_create: nessuna variante creata")
 
-        return variants[0]
+        # Converti response REST in formato GraphQL-like per compatibilità
+        return {
+            "id": f"gid://shopify/ProductVariant/{variant_data.get('id')}",
+            "title": variant_data.get("title"),
+            "sku": variant_data.get("sku"),
+            "price": variant_data.get("price"),
+            "compareAtPrice": variant_data.get("compare_at_price"),
+            "inventoryItem": {
+                "id": f"gid://shopify/InventoryItem/{variant_data.get('inventory_item_id')}"
+            } if variant_data.get("inventory_item_id") else None,
+            "selectedOptions": [
+                {"name": "Size", "value": variant_data.get("option1")}
+            ] if variant_data.get("option1") else []
+        }
 
     def get_publications(self) -> List[Dict[str, Any]]:
         """Recupera canali di pubblicazione"""
@@ -714,7 +714,7 @@ class Shopify:
             nodes { id name }
           }
         }
-        """)
+        """, {})  # FIX: Aggiungi variables vuoto
         return data.get("publications", {}).get("nodes", [])
 
     def unpublish_from_publication(self, product_gid: str, publication_id: str):

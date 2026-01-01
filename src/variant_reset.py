@@ -235,36 +235,44 @@ def reset_product_variants(
 
 def _build_variant_input(variant_data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Costruisce input variante per GraphQL productVariantsBulkCreate.
+    Costruisce input variante per REST API POST /products/{id}/variants.json
 
     Args:
-        variant_data: Dati variante originale
+        variant_data: Dati variante originale (formato GraphQL)
 
     Returns:
-        Dict input per mutation
+        Dict input per REST API
     """
     selected_options = variant_data.get("selectedOptions", [])
 
-    # Costruisci options array (ordinato)
-    options = []
-    for opt in selected_options:
-        options.append(opt.get("value"))
+    # Estrai option values (max 3)
+    option1 = None
+    option2 = None
+    option3 = None
 
-    # Padding con None fino a 3 options
-    while len(options) < 3:
-        options.append(None)
+    for idx, opt in enumerate(selected_options):
+        if idx == 0:
+            option1 = opt.get("value")
+        elif idx == 1:
+            option2 = opt.get("value")
+        elif idx == 2:
+            option3 = opt.get("value")
 
+    # Formato REST API
     variant_input = {
-        "options": options[:3],  # Max 3 options
+        "option1": option1,
+        "option2": option2,
+        "option3": option3,
         "price": str(variant_data.get("price", "0.00")),
+        "compare_at_price": variant_data.get("compareAtPrice"),
         "sku": variant_data.get("sku"),
         "barcode": variant_data.get("barcode"),
-        "inventoryManagement": "SHOPIFY" if variant_data.get("inventoryItem") else None,
-        "inventoryPolicy": "DENY",  # Default safe
-        "requiresShipping": True,
+        "inventory_management": "shopify" if variant_data.get("inventoryItem") else None,
+        "inventory_policy": "deny",  # REST usa lowercase
+        "requires_shipping": True,
         "taxable": True,
         "weight": 0.0,
-        "weightUnit": "KILOGRAMS",
+        "weight_unit": "kg",
     }
 
     # Rimuovi None values
