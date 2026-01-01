@@ -841,12 +841,23 @@ def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, c
     logger.info("Prezzi aggiornati: scontato=%s pieno=%s", prezzo_scontato, prezzo_pieno)
     
     # 10. Gestione inventario
+    # WORKAROUND: Supporta sia NAME che ID diretto (per evitare 403 su /locations.json)
     promo_name = os.environ.get("PROMO_LOCATION_NAME")
+    promo_id = os.environ.get("PROMO_LOCATION_ID")
     mag_name = os.environ.get("MAGAZZINO_LOCATION_NAME")
-    
-    if promo_name:
+    mag_id = os.environ.get("MAGAZZINO_LOCATION_ID")
+
+    # Promo location
+    promo = None
+    if promo_id:
+        # Workaround: usa ID diretto (no API call)
+        promo = {"id": int(promo_id), "name": "Promo"}
+        logger.info("Location Promo (da ID): %s", promo_id)
+    elif promo_name:
+        # Normale: cerca by name (richiede read_locations permission)
         promo = shop.get_location_by_name(promo_name)
-        if promo:
+
+    if promo:
             variants = shop.get_product_variants(outlet_gid)
             
             # Reset tutte le varianti a 0 in Promo
@@ -905,10 +916,20 @@ def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, c
     # Quando si duplica un prodotto, Shopify EREDITA gli inventory levels dal sorgente!
     # Quindi l'outlet parte già connesso a Magazzino con le stesse quantità del sorgente
     # SOLUZIONE: Prima AZZERARE tutto, POI disconnettere
-    if mag_name:
+
+    # Magazzino location
+    mag = None
+    if mag_id:
+        # Workaround: usa ID diretto (no API call)
+        mag = {"id": int(mag_id), "name": "Magazzino"}
+        logger.info("Location Magazzino (da ID): %s", mag_id)
+    elif mag_name:
+        # Normale: cerca by name (richiede read_locations permission)
         logger.info("Cerco location Magazzino con nome: '%s'", mag_name)
         mag = shop.get_location_by_name(mag_name)
-        if mag:
+
+    if mag:
+        if mag_name:  # Log solo se cercato by name
             logger.info("Location Magazzino trovata: ID=%s Nome='%s'", mag["id"], mag["name"])
             variants = shop.get_product_variants(outlet_gid)
             disconnected = 0
