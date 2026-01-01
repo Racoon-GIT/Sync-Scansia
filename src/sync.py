@@ -666,6 +666,10 @@ class Shopify:
         data = self._get("/inventory_levels.json", params={"inventory_item_ids": str(inventory_item_id)})
         return data.get("inventory_levels", [])
 
+    def inventory_delete(self, inventory_item_id: int, location_id: int):
+        """Alias per inventory_delete_level (per compatibilità variant_reset.py)"""
+        self.inventory_delete_level(inventory_item_id, location_id)
+
     def variant_delete(self, variant_gid: str):
         """Elimina variante via REST"""
         # Estrai ID numerico da GID
