@@ -6,6 +6,9 @@ import re
 import requests
 import pandas as pd
 from slugify import slugify
+from typing import Union
+
+from .exceptions import InvalidSKUError, InvalidQuantityError
 
 LOG = logging.getLogger("sync.utils")
 
@@ -163,3 +166,66 @@ def gid_to_id(gid: str) -> int:
     # gid://shopify/Product/123456789 → 123456789
     m = re.search(r"/(\d+)$", gid or "")
     return int(m.group(1)) if m else None
+
+
+def sanitize_sku(sku: Union[str, None]) -> str:
+    """
+    Sanitizza e valida un SKU.
+
+    Args:
+        sku: SKU da validare
+
+    Returns:
+        SKU sanitizzato (uppercase, stripped)
+
+    Raises:
+        InvalidSKUError: Se SKU non valido
+    """
+    if not sku or not isinstance(sku, str):
+        raise InvalidSKUError(f"SKU vuoto o non valido: {sku}")
+
+    sku_clean = str(sku).strip().upper()
+
+    # Permetti solo alfanumerici + - _
+    if not re.match(r'^[A-Z0-9_-]+$', sku_clean):
+        raise InvalidSKUError(f"SKU contiene caratteri non validi: {sku}")
+
+    if len(sku_clean) < 2:
+        raise InvalidSKUError(f"SKU troppo corto: {sku}")
+
+    return sku_clean
+
+
+def sanitize_quantity(qty: Union[str, int, float, None]) -> int:
+    """
+    Sanitizza e valida una quantità.
+
+    Args:
+        qty: Quantità da validare
+
+    Returns:
+        Quantità come intero (>=0)
+
+    Raises:
+        InvalidQuantityError: Se quantità non valida
+    """
+    try:
+        if qty is None or (isinstance(qty, str) and qty.strip() == ""):
+            return 0
+
+        qty_str = str(qty).strip()
+
+        # Supporta formato "1/3"
+        if "/" in qty_str:
+            numerator, _ = qty_str.split("/", 1)
+            qty_parsed = int(float(numerator))
+        else:
+            qty_parsed = int(float(qty_str))
+
+        if qty_parsed < 0:
+            raise InvalidQuantityError(f"Quantità negativa non valida: {qty}")
+
+        return qty_parsed
+
+    except (ValueError, TypeError) as e:
+        raise InvalidQuantityError(f"Quantità non valida '{qty}': {e}")

@@ -464,14 +464,14 @@ class Shopify:
             logger.warning("Errori update prezzi: %s", errs)
 
     def copy_images(self, source_gid: str, dest_gid: str):
-        """Copia immagini mantenendo ordine"""
+        """Copia immagini mantenendo ordine (con batch GraphQL opzionale)"""
         source_num = _gid_numeric(source_gid)
         dest_num = _gid_numeric(dest_gid)
-        
+
         # Get source images
         src_imgs = self._get(f"/products/{source_num}/images.json").get("images", [])
         src_imgs.sort(key=lambda x: x.get("position", 999))
-        
+
         # Delete existing dest images
         dest_imgs = self._get(f"/products/{dest_num}/images.json").get("images", [])
         for img in dest_imgs:
@@ -479,8 +479,48 @@ class Shopify:
                 self._delete(f"/products/{dest_num}/images/{img['id']}.json")
             except Exception as e:
                 logger.warning("Delete image failed: %s", e)
-        
-        # Add images in order
+
+        # OTTIMIZZAZIONE: Batch GraphQL upload se abilitato
+        enable_batch = os.getenv("ENABLE_BATCH_IMAGE_UPLOAD", "true").lower() in ("true", "1", "yes")
+        batch_size = int(os.getenv("BATCH_SIZE_IMAGES", "10"))
+
+        if enable_batch and len(src_imgs) >= 3:
+            # Usa productCreateMedia GraphQL per batch upload
+            try:
+                media_inputs = []
+                for img in src_imgs:
+                    media_inputs.append({
+                        "originalSource": img["src"],
+                        "alt": "",
+                        "mediaContentType": "IMAGE"
+                    })
+
+                # Process in chunks
+                for i in range(0, len(media_inputs), batch_size):
+                    chunk = media_inputs[i:i+batch_size]
+
+                    data = self.graphql("""
+                    mutation($productId: ID!, $media: [CreateMediaInput!]!) {
+                      productCreateMedia(productId: $productId, media: $media) {
+                        media { ... on MediaImage { id } }
+                        userErrors { field message }
+                      }
+                    }""", {"productId": dest_gid, "media": chunk})
+
+                    errs = data["productCreateMedia"]["userErrors"]
+                    if errs:
+                        logger.warning("Batch image upload errors: %s", errs)
+
+                    logger.debug("Uploaded %d images via batch GraphQL", len(chunk))
+                    time.sleep(0.5)  # Delay tra batch
+
+                logger.info("Immagini copiate via batch GraphQL: %d totali", len(src_imgs))
+                return
+
+            except Exception as e:
+                logger.warning("Batch image upload fallito, fallback a REST: %s", e)
+
+        # Fallback: REST upload sequenziale (comportamento originale)
         for i, img in enumerate(src_imgs, 1):
             try:
                 self._post(f"/products/{dest_num}/images.json", json={
@@ -535,10 +575,36 @@ class Shopify:
                 pass
 
     def get_location_by_name(self, name: str) -> Optional[Dict[str, Any]]:
-        """Trova location by name"""
+        """Trova location by name (con cache persistente opzionale)"""
+        enable_cache = os.getenv("ENABLE_LOCATION_CACHE", "true").lower() in ("true", "1", "yes")
+        cache_file = os.getenv("LOCATION_CACHE_FILE", "/tmp/shopify_locations_cache.json")
+
+        # Carica cache da file se abilitato
+        if enable_cache and self._location_cache is None and os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r") as f:
+                    cache_data = json.load(f)
+                    self._location_cache = {loc["name"]: loc for loc in cache_data}
+                    logger.debug("Location cache loaded from %s", cache_file)
+            except Exception as e:
+                logger.warning("Impossibile caricare location cache: %s", e)
+
+        # Fetch da API se non in cache
         if self._location_cache is None:
             locs = self._get("/locations.json").get("locations", [])
             self._location_cache = {loc["name"]: loc for loc in locs}
+
+            # Salva cache su file se abilitato
+            if enable_cache:
+                try:
+                    import os as os_module
+                    os_module.makedirs(os_module.path.dirname(cache_file), exist_ok=True)
+                    with open(cache_file, "w") as f:
+                        json.dump(locs, f)
+                    logger.debug("Location cache saved to %s", cache_file)
+                except Exception as e:
+                    logger.warning("Impossibile salvare location cache: %s", e)
+
         return self._location_cache.get(name)
 
     def inventory_connect(self, inv_item_id: int, location_id: int):
@@ -788,7 +854,30 @@ def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, c
     else:
         logger.warning("⚠️ MAGAZZINO_LOCATION_NAME non settata - skip gestione Magazzino")
     
-    # 11. Write-back Product_Id per TUTTE le righe del gruppo
+    # 11. NUOVO: Restrizione canali vendita (solo Online Store)
+    enable_channel_restriction = os.getenv("ENABLE_CHANNEL_RESTRICTION", "true").lower() in ("true", "1", "yes")
+    if enable_channel_restriction:
+        try:
+            from .channel_manager import restrict_to_online_store_only
+            restrict_to_online_store_only(shop, outlet_gid)
+            logger.info("Canali vendita ristretti: solo Online Store")
+        except Exception as e:
+            logger.warning("Errore restrizione canali: %s", e)
+
+    # 12. NUOVO: Reset varianti (elimina e ricrea per riordinamento)
+    enable_variant_reset = os.getenv("ENABLE_VARIANT_RESET", "true").lower() in ("true", "1", "yes")
+    if enable_variant_reset:
+        try:
+            from .variant_reset import reset_product_variants
+            reset_success = reset_product_variants(shop, outlet_gid, skip_filter="perso", delay=0.6)
+            if reset_success:
+                logger.info("Reset varianti completato")
+            else:
+                logger.warning("Reset varianti fallito")
+        except Exception as e:
+            logger.warning("Errore reset varianti: %s", e)
+
+    # 13. Write-back Product_Id per TUTTE le righe del gruppo
     if ws:
         for row in rows:
             if "_row_index" in row:
@@ -796,7 +885,7 @@ def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, c
                     gs_write_product_id(ws, row["_row_index"], col_index, outlet_gid)
                 except Exception as e:
                     logger.warning("Write-back fallito per riga %d: %s", row["_row_index"], e)
-    
+
     logger.info("✅ SKU=%s completato (%d taglie)", sku, len(rows))
     return "SUCCESS"
 

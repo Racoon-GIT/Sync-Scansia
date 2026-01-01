@@ -7,6 +7,13 @@ from typing import Dict, Any, List, Optional
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+from .exceptions import (
+    ShopifyAPIError,
+    ShopifyRateLimitError,
+    ShopifyServerError,
+    LocationNotFoundError,
+)
+
 LOG = logging.getLogger("sync.shopify")
 
 
@@ -323,3 +330,230 @@ class ShopifyClient:
         payload = {"image": {"src": src_url, "alt": alt}}
         LOG.debug("[REST] POST /products/%s/images.json payload_keys=%s", product_numeric_id, list(payload.keys()))
         return self.rest("POST", f"/products/{product_numeric_id}/images.json", payload=payload)
+
+    # --------- Batch Image Upload (GraphQL) ---------
+    def product_create_media_batch(self, product_id: str, media_inputs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Crea media batch via GraphQL (productCreateMedia).
+
+        Args:
+            product_id: GID prodotto
+            media_inputs: Lista di dict con format:
+                [{"originalSource": "url", "alt": "text", "mediaContentType": "IMAGE"}, ...]
+
+        Returns:
+            Dict con risultato mutation
+        """
+        q = """
+        mutation($productId: ID!, $media: [CreateMediaInput!]!) {
+          productCreateMedia(productId: $productId, media: $media) {
+            media {
+              ... on MediaImage {
+                id
+                alt
+                image { url }
+              }
+            }
+            userErrors { field message }
+          }
+        }
+        """
+        data = self.graphql(q, {"productId": product_id, "media": media_inputs})
+        errs = data["productCreateMedia"]["userErrors"]
+        if errs:
+            LOG.error("productCreateMedia userErrors: %s", errs)
+            raise ShopifyAPIError(f"productCreateMedia errors: {errs}")
+
+        media_created = data["productCreateMedia"]["media"]
+        LOG.debug("product_create_media_batch(%s) → %d media created", product_id, len(media_created))
+        return data
+
+    # --------- Variant Management (Reset Variants) ---------
+    def variant_delete(self, variant_id: str) -> Dict[str, Any]:
+        """
+        Elimina una variante via GraphQL.
+
+        Args:
+            variant_id: GID variante (gid://shopify/ProductVariant/...)
+
+        Returns:
+            Dict con risultato mutation
+        """
+        q = """
+        mutation($id: ID!) {
+          productVariantDelete(id: $id) {
+            deletedProductVariantId
+            userErrors { field message }
+          }
+        }
+        """
+        data = self.graphql(q, {"id": variant_id})
+        errs = data["productVariantDelete"]["userErrors"]
+        if errs:
+            LOG.error("productVariantDelete userErrors: %s", errs)
+            raise ShopifyAPIError(f"productVariantDelete errors: {errs}")
+
+        LOG.debug("variant_delete(%s) → OK", variant_id)
+        return data
+
+    def variant_create(self, product_id: str, variant_input: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Crea una nuova variante via GraphQL.
+
+        Args:
+            product_id: GID prodotto
+            variant_input: Dict con dati variante (options, price, sku, etc.)
+
+        Returns:
+            Dict con nuova variante creata
+        """
+        q = """
+        mutation($productId: ID!, $input: [ProductVariantInput!]!) {
+          productVariantsBulkCreate(productId: $productId, variants: $input) {
+            productVariants {
+              id
+              title
+              sku
+              price
+              compareAtPrice
+              inventoryItem { id }
+              selectedOptions { name value }
+            }
+            userErrors { field message }
+          }
+        }
+        """
+        data = self.graphql(q, {"productId": product_id, "input": [variant_input]})
+        errs = data["productVariantsBulkCreate"]["userErrors"]
+        if errs:
+            LOG.error("productVariantsBulkCreate userErrors: %s", errs)
+            raise ShopifyAPIError(f"productVariantsBulkCreate errors: {errs}")
+
+        variants = data["productVariantsBulkCreate"]["productVariants"]
+        if not variants:
+            raise ShopifyAPIError("productVariantsBulkCreate: nessuna variante creata")
+
+        new_variant = variants[0]
+        LOG.debug("variant_create(%s) → %s", product_id, new_variant["id"])
+        return new_variant
+
+    def inventory_levels_get(self, inventory_item_id: int) -> List[Dict[str, Any]]:
+        """
+        Recupera tutti gli inventory levels per un inventory_item_id.
+
+        Args:
+            inventory_item_id: ID numerico inventory item
+
+        Returns:
+            Lista di inventory levels
+        """
+        data = self.rest("GET", "/inventory_levels.json", params={"inventory_item_ids": str(inventory_item_id)})
+        levels = data.get("inventory_levels", [])
+        LOG.debug("inventory_levels_get(%s) → %d levels", inventory_item_id, len(levels))
+        return levels
+
+    # --------- Channel/Publication Management ---------
+    def get_publications(self) -> List[Dict[str, Any]]:
+        """
+        Recupera tutti i canali di pubblicazione disponibili.
+
+        Returns:
+            Lista di publications con id e name
+        """
+        q = """
+        query {
+          publications(first: 50) {
+            nodes {
+              id
+              name
+            }
+          }
+        }
+        """
+        data = self.graphql(q)
+        nodes = data["publications"]["nodes"]
+        LOG.debug("get_publications() → %d publications", len(nodes))
+        return nodes
+
+    def unpublish_from_publication(self, product_id: str, publication_id: str) -> Dict[str, Any]:
+        """
+        Rimuove un prodotto da un canale di pubblicazione.
+
+        Args:
+            product_id: GID prodotto
+            publication_id: GID publication
+
+        Returns:
+            Dict con risultato mutation
+        """
+        q = """
+        mutation($id: ID!, $input: [PublicationInput!]!) {
+          publishableUnpublish(id: $id, input: $input) {
+            userErrors { field message }
+          }
+        }
+        """
+        data = self.graphql(q, {
+            "id": product_id,
+            "input": [{"publicationId": publication_id}]
+        })
+        errs = data["publishableUnpublish"]["userErrors"]
+        if errs:
+            LOG.warning("publishableUnpublish userErrors: %s", errs)
+
+        LOG.debug("unpublish_from_publication(product=%s, pub=%s) → OK", product_id, publication_id)
+        return data
+
+    # --------- Location Cache ---------
+    _location_cache: Dict[str, int] = {}
+
+    def get_location_by_name(self, name: str, cache_file: Optional[str] = None) -> Optional[int]:
+        """
+        Recupera location ID by name con cache opzionale su file.
+
+        Args:
+            name: Nome location
+            cache_file: Path file cache JSON (opzionale)
+
+        Returns:
+            ID numerico location o None se non trovata
+
+        Raises:
+            LocationNotFoundError: Se location non trovata
+        """
+        # Carica cache da file se specificato
+        if cache_file and os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r") as f:
+                    self._location_cache = json.load(f)
+                    LOG.debug("Location cache loaded from %s", cache_file)
+            except Exception as e:
+                LOG.warning("Impossibile caricare location cache da %s: %s", cache_file, e)
+
+        # Check in-memory cache
+        if name in self._location_cache:
+            LOG.debug("Location '%s' trovata in cache: %s", name, self._location_cache[name])
+            return self._location_cache[name]
+
+        # Fetch da API
+        locations = self.get_locations()
+        for loc in locations:
+            loc_name = loc.get("name", "")
+            loc_id = loc.get("id")
+            if loc_id:
+                self._location_cache[loc_name] = loc_id
+
+        # Salva cache su file se specificato
+        if cache_file:
+            try:
+                os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+                with open(cache_file, "w") as f:
+                    json.dump(self._location_cache, f)
+                LOG.debug("Location cache saved to %s", cache_file)
+            except Exception as e:
+                LOG.warning("Impossibile salvare location cache su %s: %s", cache_file, e)
+
+        if name not in self._location_cache:
+            raise LocationNotFoundError(f"Location '{name}' non trovata")
+
+        return self._location_cache[name]
