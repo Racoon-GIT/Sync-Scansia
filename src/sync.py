@@ -661,82 +661,6 @@ class Shopify:
 
     # ========== NUOVI METODI per variant_reset.py e channel_manager.py ==========
 
-    def inventory_levels_get(self, inventory_item_id: int) -> List[Dict[str, Any]]:
-        """Recupera inventory levels per inventory_item_id"""
-        data = self._get("/inventory_levels.json", params={"inventory_item_ids": str(inventory_item_id)})
-        return data.get("inventory_levels", [])
-
-    def inventory_delete(self, inventory_item_id: int, location_id: int):
-        """Alias per inventory_delete_level (per compatibilità variant_reset.py)"""
-        self.inventory_delete_level(inventory_item_id, location_id)
-
-    def variant_delete(self, variant_gid: str):
-        """Elimina variante via REST"""
-        # Estrai ID numerico da GID
-        variant_id = _gid_numeric(variant_gid)
-        if not variant_id:
-            raise RuntimeError(f"Invalid variant GID: {variant_gid}")
-
-        # DELETE via REST (productVariantDelete non disponibile in API 2025-01)
-        self._delete(f"/variants/{variant_id}.json")
-
-    def variant_create(self, product_gid: str, variant_input: Dict[str, Any]) -> Dict[str, Any]:
-        """Crea variante via REST"""
-        # Estrai ID numerico prodotto
-        product_id = _gid_numeric(product_gid)
-        if not product_id:
-            raise RuntimeError(f"Invalid product GID: {product_gid}")
-
-        # POST via REST (productVariantsBulkCreate ha type mismatch)
-        payload = {"variant": variant_input}
-        response = self._post(f"/products/{product_id}/variants.json", json=payload)
-
-        variant_data = response.get("variant", {})
-        if not variant_data:
-            raise RuntimeError("variant_create: nessuna variante creata")
-
-        # Converti response REST in formato GraphQL-like per compatibilità
-        return {
-            "id": f"gid://shopify/ProductVariant/{variant_data.get('id')}",
-            "title": variant_data.get("title"),
-            "sku": variant_data.get("sku"),
-            "price": variant_data.get("price"),
-            "compareAtPrice": variant_data.get("compare_at_price"),
-            "inventoryItem": {
-                "id": f"gid://shopify/InventoryItem/{variant_data.get('inventory_item_id')}"
-            } if variant_data.get("inventory_item_id") else None,
-            "selectedOptions": [
-                {"name": "Size", "value": variant_data.get("option1")}
-            ] if variant_data.get("option1") else []
-        }
-
-    def get_publications(self) -> List[Dict[str, Any]]:
-        """Recupera canali di pubblicazione"""
-        data = self.graphql("""
-        query {
-          publications(first: 50) {
-            nodes { id name }
-          }
-        }
-        """, {})  # FIX: Aggiungi variables vuoto
-        return data.get("publications", {}).get("nodes", [])
-
-    def unpublish_from_publication(self, product_gid: str, publication_id: str):
-        """Unpublish prodotto da canale"""
-        data = self.graphql("""
-        mutation($id: ID!, $input: [PublicationInput!]!) {
-          publishableUnpublish(id: $id, input: $input) {
-            userErrors { field message }
-          }
-        }
-        """, {
-            "id": product_gid,
-            "input": [{"publicationId": publication_id}]
-        })
-
-        errs = data.get("publishableUnpublish", {}).get("userErrors", [])
-        if errs:
-            logger.warning("unpublish_from_publication userErrors: %s", errs)
 
 # =============================================================================
 # Workflow principale
@@ -953,31 +877,8 @@ def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, c
             logger.error("⚠️ Verifica MAGAZZINO_LOCATION_NAME e che corrisponda ESATTAMENTE al nome su Shopify")
     else:
         logger.warning("⚠️ MAGAZZINO_LOCATION_NAME non settata - skip gestione Magazzino")
-    
-    # 11. NUOVO: Restrizione canali vendita (solo Online Store)
-    enable_channel_restriction = os.getenv("ENABLE_CHANNEL_RESTRICTION", "true").lower() in ("true", "1", "yes")
-    if enable_channel_restriction:
-        try:
-            from .channel_manager import restrict_to_online_store_only
-            restrict_to_online_store_only(shop, outlet_gid)
-            logger.info("Canali vendita ristretti: solo Online Store")
-        except Exception as e:
-            logger.warning("Errore restrizione canali: %s", e)
 
-    # 12. NUOVO: Reset varianti (elimina e ricrea per riordinamento)
-    enable_variant_reset = os.getenv("ENABLE_VARIANT_RESET", "true").lower() in ("true", "1", "yes")
-    if enable_variant_reset:
-        try:
-            from .variant_reset import reset_product_variants
-            reset_success = reset_product_variants(shop, outlet_gid, skip_filter="perso", delay=0.6)
-            if reset_success:
-                logger.info("Reset varianti completato")
-            else:
-                logger.warning("Reset varianti fallito")
-        except Exception as e:
-            logger.warning("Errore reset varianti: %s", e)
-
-    # 13. Write-back Product_Id per TUTTE le righe del gruppo
+    # 11. Write-back Product_Id per TUTTE le righe del gruppo
     if ws:
         for row in rows:
             if "_row_index" in row:
