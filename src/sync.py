@@ -148,7 +148,8 @@ def gs_write_product_id(ws, row_index: int, col_index: Dict[str, int], product_g
 
 class Shopify:
     def __init__(self):
-        self.store = os.environ["SHOPIFY_STORE"]
+        # Supporta SHOPIFY_STORE o usa default hardcoded
+        self.store = os.environ.get("SHOPIFY_STORE") or "racoon-lab.myshopify.com"
         self.token = os.environ["SHOPIFY_ADMIN_TOKEN"]
         self.api_version = os.environ.get("SHOPIFY_API_VERSION", "2025-01")
         self.base = f"https://{self.store}/admin/api/{self.api_version}"

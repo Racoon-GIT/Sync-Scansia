@@ -25,12 +25,11 @@ logger = logging.getLogger("reorder")
 
 class ShopifyCollectionReorder:
     def __init__(self):
-        self.store = os.environ.get("SHOPIFY_STORE")
+        # Supporta SHOPIFY_STORE o usa default hardcoded
+        self.store = os.environ.get("SHOPIFY_STORE") or "racoon-lab.myshopify.com"
         self.token = os.environ.get("SHOPIFY_ADMIN_TOKEN")
         self.api_version = os.environ.get("SHOPIFY_API_VERSION", "2025-01")
 
-        if not self.store:
-            raise RuntimeError("SHOPIFY_STORE environment variable not set")
         if not self.token:
             raise RuntimeError("SHOPIFY_ADMIN_TOKEN environment variable not set")
         self.base = f"https://{self.store}/admin/api/{self.api_version}"
