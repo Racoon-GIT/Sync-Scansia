@@ -4,6 +4,73 @@ Sistema automatizzato per la gestione prodotti Outlet su Shopify, con sincronizz
 
 ---
 
+## 🎯 MODALITÀ OPERATIVE (RUN_MODE)
+
+Il sistema supporta **3 modalità operative** configurabili tramite variabile `RUN_MODE`:
+
+### 1️⃣ SYNC - Creazione/Gestione Outlet
+
+**Cosa fa**: Crea prodotti outlet da prodotti sorgente, gestisce inventory multi-location, copia immagini e metafields.
+
+**Input richiesti** (Google Sheets):
+- `sku`: SKU prodotto sorgente
+- `online`: Flag SI/NO (processa solo righe con "SI")
+- `qta`: Quantità disponibile (processa solo righe con qta > 0)
+- `taglia`: Taglia specifica (opzionale, per multi-taglia)
+- `prezzo`: Prezzo pieno (per compareAtPrice)
+- `prezzo_outlet`: Prezzo scontato (per price)
+
+**Configurazione**:
+```bash
+RUN_MODE=SYNC
+```
+
+**Output**: Prodotti outlet creati su Shopify con prezzi, inventory e Product_Id scritto su Google Sheets.
+
+---
+
+### 2️⃣ REORDER - Ordinamento Collections
+
+**Cosa fa**: Ordina prodotti di una collection Shopify per sconto percentuale decrescente.
+
+**Input richiesti**:
+- `COLLECTION_ID`: ID numerico collection Shopify (es: 262965428289)
+
+**Configurazione**:
+```bash
+RUN_MODE=REORDER
+COLLECTION_ID=262965428289
+```
+
+**Output**: Prodotti della collection riordinati per sconto % (dal maggiore al minore).
+
+---
+
+### 3️⃣ FIX_PRICES - Aggiornamento Massivo Prezzi
+
+**Cosa fa**: Aggiorna prezzi outlet leggendo valori da Google Sheets. **OVERWRITE forzato** su tutti i prodotti.
+
+**Input richiesti** (Google Sheets):
+- **Colonna Q**: Product ID Shopify (OBBLIGATORIO - se vuota la riga viene skippata)
+  - Formato GID: `gid://shopify/Product/15506299421004`
+  - Oppure handle: `scarpa-nike-outlet`
+- **Colonna J** "Prezzo Outlet": Nuovo prezzo di vendita (price)
+- **Colonna H** "Prezzo High": Nuovo prezzo pieno barrato (compareAtPrice)
+
+**Configurazione**:
+```bash
+RUN_MODE=FIX_PRICES
+```
+
+**Output**: Prezzi aggiornati su Shopify per tutti i prodotti con colonna Q valorizzata.
+
+**⚠️ IMPORTANTE**:
+- Colonna Q OBBLIGATORIA → Se vuota, riga skippata
+- Aggiorna SEMPRE i prezzi (overwrite), indipendentemente dal valore attuale
+- Nessun fallback a SKU
+
+---
+
 ## 📋 INDICE
 
 1. [Quick Start](#quick-start)
@@ -411,22 +478,22 @@ END
 
 ---
 
-## 🔧 WORKFLOW FIX_PRICES - CORREZIONE PREZZI ZERO
+## 🔧 WORKFLOW FIX_PRICES - AGGIORNAMENTO MASSIVO PREZZI
 
 ### Descrizione
-Aggiorna prezzi dei prodotti outlet leggendo i valori corretti dal Google Sheet. Modalità di aggiornamento:
-- **Colonna Q valorizzata**: OVERWRITE forzato (aggiorna sempre, indipendentemente dal prezzo attuale)
-- **Colonna Q vuota**: Aggiorna SOLO se price = 0 (comportamento originale per correggere bug v2.0)
+Aggiorna prezzi dei prodotti outlet leggendo i valori corretti dal Google Sheet. **OVERWRITE forzato**: aggiorna SEMPRE i prezzi indipendentemente dal valore attuale.
+
+**REQUISITO OBBLIGATORIO**: Colonna Q (Product ID) DEVE essere valorizzata. Se vuota, la riga viene skippata.
 
 ### Quando Usare
-- ✅ Vuoi aggiornare massivamente i prezzi da Google Sheet (colonna Q valorizzata)
-- ✅ Hai prodotti outlet online con price = 0.00 da correggere (colonna Q vuota)
-- ✅ I prezzi corretti sono nel Google Sheet (colonne H e J)
+- ✅ Vuoi aggiornare massivamente i prezzi da Google Sheet
+- ✅ Hai compilato la colonna Q con i Product ID Shopify
+- ✅ I nuovi prezzi sono nel Google Sheet (colonne H e J)
 
 ### Logica Prezzi
 ```python
 # Colonne Google Sheets utilizzate:
-# - Colonna Q: Product ID Shopify (per ricerca prodotto)
+# - Colonna Q: Product ID Shopify (OBBLIGATORIA - se vuota riga skippata)
 # - Colonna J "Prezzo Outlet": price (prezzo di vendita)
 # - Colonna H "Prezzo High": compareAtPrice (prezzo pieno barrato)
 
@@ -474,28 +541,30 @@ START
   │
   ├─ 3. Per ogni SKU:
   │    ├─ Estrae prezzi: Colonna J (Prezzo Outlet), Colonna H (Prezzo High)
-  │    ├─ Legge Product ID dalla Colonna Q
-  │    ├─ Cerca outlet usando Product ID (o fallback per SKU se Q vuota)
+  │    ├─ Legge Product ID dalla Colonna Q (OBBLIGATORIA)
+  │    ├─ Se Colonna Q vuota → SKIP riga
+  │    ├─ Se Colonna Q valorizzata → Cerca outlet usando Product ID
   │    ├─ Verifica se ACTIVE
-  │    ├─ Controlla se ha varianti con price = 0
-  │    └─ Se SI: aggiorna con variants_bulk_update_prices
+  │    └─ Aggiorna SEMPRE con variants_bulk_update_prices (OVERWRITE)
   │
   └─ 4. Report statistiche
        ├─ Prodotti aggiornati
-       ├─ Skip (nessun prezzo zero)
+       ├─ Skip (colonna Q vuota)
+       ├─ Skip (non trovati)
        └─ Errori
 END
 ```
 
 ### Filtri di Sicurezza
 
-**Condizioni base** (sempre verificate):
+**REQUISITO OBBLIGATORIO**:
+- ❌ **Colonna Q vuota** → Riga SKIPPATA (nessun fallback a SKU)
+- ✅ **Colonna Q valorizzata** → Processa riga
+
+**Condizioni aggiuntive**:
 - ✅ Outlet esiste su Shopify
 - ✅ Status = ACTIVE (skip se DRAFT)
-
-**Modalità aggiornamento**:
-- **Colonna Q valorizzata**: OVERWRITE forzato → Aggiorna SEMPRE i prezzi
-- **Colonna Q vuota** (fallback a SKU): Aggiorna SOLO se almeno una variante ha price = 0.00
+- ✅ OVERWRITE forzato → Aggiorna SEMPRE i prezzi (indipendentemente dal valore attuale)
 
 ### Performance
 

@@ -90,36 +90,31 @@ def fix_prices_for_sku(shop: Shopify, sku: str, rows: List[Dict[str, Any]], dry_
                 prezzo_scontato, prezzo_pieno)
 
     # 2. Cerca outlet esistente usando colonna Q (Product ID)
-    # La colonna Q dovrebbe contenere il Product ID o handle Shopify
+    # REQUISITO: La colonna Q DEVE essere valorizzata, altrimenti skip
     product_id_q = (first_row.get("q") or "").strip()
 
     if not product_id_q:
-        logger.warning("Colonna Q vuota per SKU=%s, fallback a ricerca per SKU", sku)
-        # Fallback: cerca per SKU come prima
-        try:
-            outlet = shop.find_outlet_by_sku(sku)
-        except Exception as e:
-            logger.error("Errore ricerca outlet per SKU=%s: %s", sku, e)
-            return "ERROR"
-    else:
-        # Cerca usando Product ID dalla colonna Q
-        try:
-            # Se inizia con gid:// è già un GID Shopify
-            if product_id_q.startswith("gid://shopify/Product/"):
-                outlet_gid = product_id_q
-                # Verifica che esista e sia ACTIVE
-                variants = shop.get_product_variants(outlet_gid)
-                if variants:
-                    outlet = {"id": outlet_gid, "status": "ACTIVE"}
-                else:
-                    logger.warning("Product ID=%s non trovato su Shopify", product_id_q)
-                    return "SKIP_NOT_FOUND"
+        logger.warning("Colonna Q NON valorizzata per SKU=%s, SKIP (requisito obbligatorio)", sku)
+        return "SKIP_NO_PRODUCT_ID"
+
+    # Cerca usando Product ID dalla colonna Q
+    try:
+        # Se inizia con gid:// è già un GID Shopify
+        if product_id_q.startswith("gid://shopify/Product/"):
+            outlet_gid = product_id_q
+            # Verifica che esista e sia ACTIVE
+            variants = shop.get_product_variants(outlet_gid)
+            if variants:
+                outlet = {"id": outlet_gid, "status": "ACTIVE"}
             else:
-                # Altrimenti cerca per handle
-                outlet = shop.find_product_by_handle(product_id_q)
-        except Exception as e:
-            logger.error("Errore ricerca outlet per Product ID=%s: %s", product_id_q, e)
-            return "ERROR"
+                logger.warning("Product ID=%s non trovato su Shopify", product_id_q)
+                return "SKIP_NOT_FOUND"
+        else:
+            # Altrimenti cerca per handle
+            outlet = shop.find_product_by_handle(product_id_q)
+    except Exception as e:
+        logger.error("Errore ricerca outlet per Product ID=%s: %s", product_id_q, e)
+        return "ERROR"
 
     if not outlet:
         logger.warning("Outlet non trovato, skip")
@@ -145,24 +140,9 @@ def fix_prices_for_sku(shop: Shopify, sku: str, rows: List[Dict[str, Any]], dry_
         logger.warning("Nessuna variante trovata, skip")
         return "SKIP_NOT_FOUND"
 
-    # 5. Se colonna Q NON valorizzata, verifica prezzi a zero (comportamento originale)
-    # Se colonna Q valorizzata, aggiorna SEMPRE (overwrite forzato)
-    if not product_id_q:
-        # Fallback mode: aggiorna solo se prezzo a zero
-        has_zero_price = False
-        for v in variants:
-            current_price = v.get("price", "0.00")
-            if current_price == "0.00" or current_price == "0" or not current_price:
-                has_zero_price = True
-                logger.debug("Variante %s: prezzo a zero (attuale=%s)", v.get("title", v["id"]), current_price)
-                break
-
-        if not has_zero_price:
-            logger.info("✓ Nessuna variante con prezzo a zero, skip (colonna Q non valorizzata)")
-            return "SKIP_NO_ZERO_PRICE"
-    else:
-        # Colonna Q valorizzata: OVERWRITE forzato indipendentemente dal prezzo attuale
-        logger.info("Colonna Q valorizzata: aggiornamento FORZATO prezzi (overwrite)")
+    # 5. Colonna Q valorizzata (requisito verificato sopra)
+    # OVERWRITE forzato: aggiorna SEMPRE i prezzi indipendentemente dal valore attuale
+    logger.info("Colonna Q valorizzata: aggiornamento FORZATO prezzi (overwrite)")
 
     # 6. Aggiorna prezzi
     if dry_run:
@@ -276,7 +256,7 @@ Esempi:
         "success_dry": 0,
         "skip_not_found": 0,
         "skip_draft": 0,
-        "skip_no_zero_price": 0,
+        "skip_no_product_id": 0,
         "errors": 0
     }
 
@@ -292,8 +272,8 @@ Esempi:
                 stats["skip_not_found"] += 1
             elif result == "SKIP_DRAFT":
                 stats["skip_draft"] += 1
-            elif result == "SKIP_NO_ZERO_PRICE":
-                stats["skip_no_zero_price"] += 1
+            elif result == "SKIP_NO_PRODUCT_ID":
+                stats["skip_no_product_id"] += 1
             elif result == "ERROR":
                 stats["errors"] += 1
         except Exception as e:
@@ -307,7 +287,7 @@ Esempi:
         logger.info("- Prodotti da aggiornare: %d", stats["success_dry"])
     else:
         logger.info("- Prodotti aggiornati: %d", stats["success"])
-    logger.info("- Skip (nessun prezzo zero): %d", stats["skip_no_zero_price"])
+    logger.info("- Skip (colonna Q vuota): %d", stats["skip_no_product_id"])
     logger.info("- Skip (non trovati): %d", stats["skip_not_found"])
     logger.info("- Skip (draft): %d", stats["skip_draft"])
     logger.info("- Errori: %d", stats["errors"])
