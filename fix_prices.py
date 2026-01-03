@@ -68,40 +68,71 @@ def fix_prices_for_sku(shop: Shopify, sku: str, rows: List[Dict[str, Any]], dry_
 
     # 1. Estrai prezzi dalla prima riga (tutti i prodotti stesso SKU hanno stessi prezzi)
     first_row = rows[0]
-    prezzo_pieno = _clean_price(first_row.get("prezzo"))
+
+    # Colonne secondo specifiche utente:
+    # - Colonna H "Prezzo High" → compareAtPrice
+    # - Colonna J "Prezzo Outlet" → price
+    prezzo_pieno = _clean_price(first_row.get("prezzo_high"))
     prezzo_scontato = _clean_price(first_row.get("prezzo_outlet"))
 
     # Logica prezzi secondo requisiti:
-    # - prezzo_scontato = prezzo_outlet dal foglio
-    # - Se prezzo_outlet non valorizzato, usa prezzo
+    # - prezzo_scontato = prezzo_outlet dal foglio (colonna J)
+    # - Se prezzo_outlet non valorizzato, usa prezzo_high (colonna H)
     if not prezzo_scontato:
         prezzo_scontato = prezzo_pieno or "0.00"
 
-    # - prezzo_pieno = prezzo dal foglio
-    # - Se prezzo non valorizzato o zero, usa prezzo_outlet
+    # - prezzo_pieno = prezzo_high dal foglio (colonna H)
+    # - Se prezzo_high non valorizzato o zero, usa prezzo_outlet (colonna J)
     if not prezzo_pieno or prezzo_pieno == "0.00":
         prezzo_pieno = prezzo_scontato
 
-    logger.info("Prezzi target: scontato=%s, pieno=%s", prezzo_scontato, prezzo_pieno)
+    logger.info("Prezzi target: price=%s (da Prezzo Outlet), compareAtPrice=%s (da Prezzo High)",
+                prezzo_scontato, prezzo_pieno)
 
-    # 2. Cerca outlet esistente per SKU
-    try:
-        outlet = shop.find_outlet_by_sku(sku)
-    except Exception as e:
-        logger.error("Errore ricerca outlet per SKU=%s: %s", sku, e)
-        return "ERROR"
+    # 2. Cerca outlet esistente usando colonna Q (Product ID)
+    # La colonna Q dovrebbe contenere il Product ID o handle Shopify
+    product_id_q = (first_row.get("q") or "").strip()
+
+    if not product_id_q:
+        logger.warning("Colonna Q vuota per SKU=%s, fallback a ricerca per SKU", sku)
+        # Fallback: cerca per SKU come prima
+        try:
+            outlet = shop.find_outlet_by_sku(sku)
+        except Exception as e:
+            logger.error("Errore ricerca outlet per SKU=%s: %s", sku, e)
+            return "ERROR"
+    else:
+        # Cerca usando Product ID dalla colonna Q
+        try:
+            # Se inizia con gid:// è già un GID Shopify
+            if product_id_q.startswith("gid://shopify/Product/"):
+                outlet_gid = product_id_q
+                # Verifica che esista e sia ACTIVE
+                variants = shop.get_product_variants(outlet_gid)
+                if variants:
+                    outlet = {"id": outlet_gid, "status": "ACTIVE"}
+                else:
+                    logger.warning("Product ID=%s non trovato su Shopify", product_id_q)
+                    return "SKIP_NOT_FOUND"
+            else:
+                # Altrimenti cerca per handle
+                outlet = shop.find_product_by_handle(product_id_q)
+        except Exception as e:
+            logger.error("Errore ricerca outlet per Product ID=%s: %s", product_id_q, e)
+            return "ERROR"
 
     if not outlet:
-        logger.warning("Outlet non trovato per SKU=%s, skip", sku)
+        logger.warning("Outlet non trovato, skip")
         return "SKIP_NOT_FOUND"
 
     # 3. Verifica che sia ACTIVE
-    if outlet["status"] != "ACTIVE":
-        logger.info("Outlet trovato ma status=%s (non ACTIVE), skip", outlet["status"])
+    if outlet.get("status") != "ACTIVE":
+        logger.info("Outlet trovato ma status=%s (non ACTIVE), skip", outlet.get("status"))
         return "SKIP_DRAFT"
 
     outlet_gid = outlet["id"]
-    logger.info("Outlet trovato: %s (handle: %s)", outlet_gid, outlet["handle"])
+    outlet_handle = outlet.get("handle", "N/A")
+    logger.info("Outlet trovato: %s (handle: %s)", outlet_gid, outlet_handle)
 
     # 4. Fetch varianti correnti per verificare prezzi
     try:

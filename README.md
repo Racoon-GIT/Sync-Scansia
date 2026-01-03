@@ -423,17 +423,22 @@ Corregge prodotti outlet con **prezzo a zero** causati dal bug nelle versioni �
 
 ### Logica Prezzi
 ```python
+# Colonne Google Sheets utilizzate:
+# - Colonna Q: Product ID Shopify (per ricerca prodotto)
+# - Colonna J "Prezzo Outlet": price (prezzo di vendita)
+# - Colonna H "Prezzo High": compareAtPrice (prezzo pieno barrato)
+
 # Prezzo scontato (price)
 if prezzo_outlet valorizzato:
-    price = prezzo_outlet
+    price = prezzo_outlet  # Colonna J
 else:
-    price = prezzo
+    price = prezzo_high    # Colonna H (fallback)
 
 # Prezzo pieno (compareAtPrice)
-if prezzo valorizzato e != 0:
-    compareAtPrice = prezzo
+if prezzo_high valorizzato e != 0:
+    compareAtPrice = prezzo_high    # Colonna H
 else:
-    compareAtPrice = prezzo_outlet
+    compareAtPrice = prezzo_outlet  # Colonna J (fallback)
 ```
 
 ### Utilizzo
@@ -466,8 +471,9 @@ START
   ├─ 2. Raggruppa righe per SKU
   │
   ├─ 3. Per ogni SKU:
-  │    ├─ Estrae prezzi: prezzo_outlet, prezzo
-  │    ├─ Cerca outlet esistente (find_outlet_by_sku)
+  │    ├─ Estrae prezzi: Colonna J (Prezzo Outlet), Colonna H (Prezzo High)
+  │    ├─ Legge Product ID dalla Colonna Q
+  │    ├─ Cerca outlet usando Product ID (o fallback per SKU se Q vuota)
   │    ├─ Verifica se ACTIVE
   │    ├─ Controlla se ha varianti con price = 0
   │    └─ Se SI: aggiorna con variants_bulk_update_prices
@@ -864,9 +870,10 @@ Sync-Scansia/
   - Integrato in main.py con `RUN_MODE=FIX_PRICES`
   - Eseguibile da Render o localmente
   - Filtra solo prodotti con price=0, skip automatici per prodotti ok
-  - Logica prezzi: usa prezzo_outlet come price, prezzo come compareAtPrice (con fallback)
+  - **Colonne GSheets**: Usa Colonna Q (Product ID), Colonna J (Prezzo Outlet → price), Colonna H (Prezzo High → compareAtPrice)
+  - Ricerca prodotto tramite Product ID (colonna Q) con fallback a SKU se vuota
 - ✅ Documentazione completa: sezione dedicata workflow FIX_PRICES
-- ✅ Script fix_prices.py potenziato: filtro zero-price, logica prezzi migliorata
+- ✅ Script fix_prices.py potenziato: filtro zero-price, logica prezzi migliorata, supporto Product ID
 
 ### v2.2 (2026-01-03)
 - 🐛 **FIX CRITICO**: Risolto bug prezzi a zero dopo SYNC
