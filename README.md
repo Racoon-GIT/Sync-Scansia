@@ -54,6 +54,9 @@ RUN_MODE=SYNC python -m main
 
 # REORDER workflow
 RUN_MODE=REORDER COLLECTION_ID=262965428289 python -m main
+
+# FIX_PRICES workflow (correzione prezzi a zero)
+RUN_MODE=FIX_PRICES python -m main
 ```
 
 **Esecuzione Diretta** (per sviluppo locale):
@@ -405,10 +408,93 @@ END
 - **Paginazione**: 50 prodotti/pagina
 - **Batch reorder**: 250 prodotti/mutation
 - **Rate limiting**: 0.7s tra chiamate
-- **Retry**: 5 tentativi con backoff
-- **Tempo stimato**: ~10-15s per 100 prodotti
 
-### Output Esempio
+---
+
+## 🔧 WORKFLOW FIX_PRICES - CORREZIONE PREZZI ZERO
+
+### Descrizione
+Corregge prodotti outlet con **prezzo a zero** causati dal bug nelle versioni ≤ v2.0. Legge i prezzi corretti dal Google Sheet e li applica agli outlet esistenti senza modificare inventory, immagini o metafields.
+
+### Quando Usare
+- ✅ Hai prodotti outlet online con price = 0.00
+- ✅ I prezzi corretti sono nel Google Sheet
+- ✅ Vuoi aggiornare SOLO i prezzi
+
+### Logica Prezzi
+```python
+# Prezzo scontato (price)
+if prezzo_outlet valorizzato:
+    price = prezzo_outlet
+else:
+    price = prezzo
+
+# Prezzo pieno (compareAtPrice)
+if prezzo valorizzato e != 0:
+    compareAtPrice = prezzo
+else:
+    compareAtPrice = prezzo_outlet
+```
+
+### Utilizzo
+
+**Locale** (per test o esecuzione manuale):
+```bash
+# Dry-run (visualizza cosa verrà modificato)
+python fix_prices.py --dry-run
+
+# Apply (applica modifiche)
+python fix_prices.py --apply
+```
+
+**Render** (per esecuzione automatica):
+```bash
+# Imposta RUN_MODE su Render Dashboard
+RUN_MODE=FIX_PRICES
+
+# Triggera job manualmente o attendi cron
+# Esegue automaticamente con --apply (no dry-run)
+```
+
+### Flusso Operativo
+
+```
+START
+  │
+  ├─ 1. Legge Google Sheet (online=SI, qta>0)
+  │
+  ├─ 2. Raggruppa righe per SKU
+  │
+  ├─ 3. Per ogni SKU:
+  │    ├─ Estrae prezzi: prezzo_outlet, prezzo
+  │    ├─ Cerca outlet esistente (find_outlet_by_sku)
+  │    ├─ Verifica se ACTIVE
+  │    ├─ Controlla se ha varianti con price = 0
+  │    └─ Se SI: aggiorna con variants_bulk_update_prices
+  │
+  └─ 4. Report statistiche
+       ├─ Prodotti aggiornati
+       ├─ Skip (nessun prezzo zero)
+       └─ Errori
+END
+```
+
+### Filtri di Sicurezza
+
+Lo script processa un prodotto SOLO se:
+- ✅ Outlet esiste su Shopify
+- ✅ Status = ACTIVE (skip se DRAFT)
+- ✅ Ha almeno una variante con price = 0.00
+
+Se tutte le varianti hanno già prezzo > 0, il prodotto viene skippato (nessuna modifica).
+
+### Performance
+
+- **Batch update**: 1 mutation GraphQL per prodotto (tutte le varianti)
+- **Rate limiting**: 0.7s tra chiamate
+- **Safe**: Skip automatici, no modifiche se prezzi già ok
+
+---
 
 ```
 ======================================================================
@@ -523,15 +609,18 @@ unset MAGAZZINO_LOCATION_NAME
 **Causa**: Bug in versioni ≤ v2.0 - Il metodo `get_product_variants()` non fetchava i campi `price` e `compareAtPrice` dal GraphQL, causando la perdita dei prezzi quando il variant reset ricreava le varianti.
 
 **Soluzione**:
-1. ✅ **Già risolto in v2.2** - Il GraphQL query ora include `price` e `compareAtPrice`
-2. Se usi Render: verifica che il deploy sia aggiornato
+1. ✅ **Bug risolto in v2.2** - Il GraphQL query ora include `price` e `compareAtPrice`
+2. ✅ **Script FIX_PRICES disponibile** - Corregge prodotti esistenti con prezzo zero
    ```bash
-   # Controlla log Render per commit hash
-   # Deve essere >= v2.2 (commit 2f0167f o successivi)
+   # Locale
+   python fix_prices.py --apply
+
+   # Render
+   RUN_MODE=FIX_PRICES  # Imposta su Dashboard → Trigger job
    ```
-3. Se hai ancora il problema:
-   - Forza un nuovo deploy su Render (Dashboard → Manual Deploy)
-   - Verifica che `render.yaml` punti a `startCommand: python -m main` (non vecchio entry point)
+3. Se usi Render: verifica che il deploy sia aggiornato
+   - Forza Manual Deploy su Render Dashboard
+   - Verifica commit hash >= v2.2 nei log
 
 **Root Cause Tecnico**:
 Il workflow SYNC (versioni v2.0 e precedenti) eseguiva:
@@ -639,6 +728,11 @@ SHOPIFY_MAX_RETRIES=5
 ```
 RUN_MODE=REORDER
 COLLECTION_ID=95310381121
+```
+
+**Per FIX_PRICES** (cambia temporaneamente per correggere prezzi zero):
+```
+RUN_MODE=FIX_PRICES
 ```
 
 ### Fix Python Version (se errori build pandas)
@@ -765,12 +859,22 @@ Sync-Scansia/
 
 ## 📜 CHANGELOG
 
+### v2.3 (2026-01-03)
+- ✨ **NUOVA FEATURE**: Aggiunto workflow FIX_PRICES per correzione automatica prezzi zero
+  - Integrato in main.py con `RUN_MODE=FIX_PRICES`
+  - Eseguibile da Render o localmente
+  - Filtra solo prodotti con price=0, skip automatici per prodotti ok
+  - Logica prezzi: usa prezzo_outlet come price, prezzo come compareAtPrice (con fallback)
+- ✅ Documentazione completa: sezione dedicata workflow FIX_PRICES
+- ✅ Script fix_prices.py potenziato: filtro zero-price, logica prezzi migliorata
+
 ### v2.2 (2026-01-03)
 - 🐛 **FIX CRITICO**: Risolto bug prezzi a zero dopo SYNC
   - Root cause: `get_product_variants()` non fetchava `price` e `compareAtPrice` da GraphQL
   - Impatto: Variant reset perdeva i prezzi, resettando tutto a 0.00
   - Soluzione: Aggiunto `price` e `compareAtPrice` al GraphQL query in src/sync.py:421-441
-- ✅ Documentazione troubleshooting aggiornata con sezione "Prodotti con prezzi a zero dopo SYNC"
+- ✅ Script fix_prices.py per correzione prodotti esistenti
+- ✅ Documentazione troubleshooting aggiornata
 
 ### v2.1 (2026-01-03)
 - ✅ Entry point unificato `main.py` con RUN_MODE per SYNC e REORDER
