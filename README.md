@@ -519,6 +519,26 @@ unset MAGAZZINO_LOCATION_NAME
 3. Rigenera token
 4. Aggiorna `SHOPIFY_ADMIN_TOKEN`
 
+#### `Prodotti con prezzi a zero dopo SYNC`
+**Causa**: Bug in versioni ≤ v2.0 - Il metodo `get_product_variants()` non fetchava i campi `price` e `compareAtPrice` dal GraphQL, causando la perdita dei prezzi quando il variant reset ricreava le varianti.
+
+**Soluzione**:
+1. ✅ **Già risolto in v2.2** - Il GraphQL query ora include `price` e `compareAtPrice`
+2. Se usi Render: verifica che il deploy sia aggiornato
+   ```bash
+   # Controlla log Render per commit hash
+   # Deve essere >= v2.2 (commit 2f0167f o successivi)
+   ```
+3. Se hai ancora il problema:
+   - Forza un nuovo deploy su Render (Dashboard → Manual Deploy)
+   - Verifica che `render.yaml` punti a `startCommand: python -m main` (non vecchio entry point)
+
+**Root Cause Tecnico**:
+Il workflow SYNC (versioni v2.0 e precedenti) eseguiva:
+- Step 9: Aggiornamento prezzi outlet → `variants_bulk_update_prices()` ✅
+- Step 12: Reset varianti per riordinamento → chiamava `get_product_variants()` che NON fetchava `price` ❌
+- Risultato: `_build_variant_input()` usava default `"0.00"` perché il campo era undefined
+
 ### Errori Comuni REORDER
 
 #### `Collection not found`
@@ -744,6 +764,13 @@ Sync-Scansia/
 ---
 
 ## 📜 CHANGELOG
+
+### v2.2 (2026-01-03)
+- 🐛 **FIX CRITICO**: Risolto bug prezzi a zero dopo SYNC
+  - Root cause: `get_product_variants()` non fetchava `price` e `compareAtPrice` da GraphQL
+  - Impatto: Variant reset perdeva i prezzi, resettando tutto a 0.00
+  - Soluzione: Aggiunto `price` e `compareAtPrice` al GraphQL query in src/sync.py:421-441
+- ✅ Documentazione troubleshooting aggiornata con sezione "Prodotti con prezzi a zero dopo SYNC"
 
 ### v2.1 (2026-01-03)
 - ✅ Entry point unificato `main.py` con RUN_MODE per SYNC e REORDER

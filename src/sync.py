@@ -425,8 +425,10 @@ class Shopify:
           node(id: $id) {
             ... on Product {
               variants(first: 250) {
-                edges { node { 
-                  id sku title 
+                edges { node {
+                  id sku title
+                  price
+                  compareAtPrice
                   inventoryItem { id }
                   selectedOptions { name value }
                 }}
@@ -434,7 +436,7 @@ class Shopify:
             }
           }
         }""", {"id": product_gid})
-        
+
         edges = data["node"]["variants"]["edges"]
         return [e["node"] for e in edges]
 
