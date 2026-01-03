@@ -100,7 +100,14 @@ def run_reorder():
     logger.info("")
     logger.info("🔄 Esecuzione REORDER - Riordino Collection per Sconto %")
     logger.info("")
-    
+
+    # DEBUG: Verifica variabili Shopify
+    shopify_store = os.environ.get("SHOPIFY_STORE", "NOT_SET")
+    shopify_token = os.environ.get("SHOPIFY_ADMIN_TOKEN", "NOT_SET")
+    logger.info(f"DEBUG: SHOPIFY_STORE = {shopify_store}")
+    logger.info(f"DEBUG: SHOPIFY_ADMIN_TOKEN = {'***' if shopify_token != 'NOT_SET' else 'NOT_SET'}")
+    logger.info("")
+
     # Verifica COLLECTION_ID
     collection_id = os.environ.get("COLLECTION_ID", "").strip()
     
