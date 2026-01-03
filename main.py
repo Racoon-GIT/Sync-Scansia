@@ -40,13 +40,14 @@ def main():
         sys.exit(1)
     
     # Valida RUN_MODE
-    if run_mode not in ["SYNC", "REORDER"]:
+    if run_mode not in ["SYNC", "REORDER", "FIX_PRICES"]:
         logger.error("=" * 70)
         logger.error(f"ERRORE: RUN_MODE='{run_mode}' non valido!")
         logger.error("")
         logger.error("Valori ammessi:")
         logger.error('  - RUN_MODE=SYNC')
         logger.error('  - RUN_MODE=REORDER')
+        logger.error('  - RUN_MODE=FIX_PRICES')
         logger.error("=" * 70)
         sys.exit(1)
     
@@ -60,6 +61,8 @@ def main():
         run_sync()
     elif run_mode == "REORDER":
         run_reorder()
+    elif run_mode == "FIX_PRICES":
+        run_fix_prices()
 
 def run_sync():
     """Esegue sync.py"""
@@ -163,6 +166,48 @@ def run_reorder():
         logger.error("")
         logger.error("❌ REORDER fallito: %s", e, exc_info=True)
         sys.exit(1)
+
+def run_fix_prices():
+    """Esegue fix_prices.py per correggere prezzi a zero"""
+    logger.info("")
+    logger.info("🔧 Esecuzione FIX_PRICES - Correzione Prezzi Zero")
+    logger.info("")
+
+    # Importa modulo fix_prices
+    try:
+        import fix_prices
+    except ImportError as e:
+        logger.error("Errore import fix_prices.py: %s", e)
+        sys.exit(1)
+
+    # Salva sys.argv originale
+    original_argv = sys.argv
+
+    try:
+        # Imposta args per fix_prices (--apply forzato, no dry-run)
+        sys.argv = ["fix_prices.py", "--apply"]
+
+        # Esegui main di fix_prices
+        fix_prices.main()
+        logger.info("")
+        logger.info("✅ FIX_PRICES completato con successo")
+
+    except SystemExit as e:
+        # fix_prices.py usa sys.exit(), gestiamo normalmente
+        if e.code != 0:
+            logger.error("")
+            logger.error("❌ FIX_PRICES fallito con exit code %s", e.code)
+            raise
+        else:
+            logger.info("")
+            logger.info("✅ FIX_PRICES completato")
+    except Exception as e:
+        logger.error("")
+        logger.error("❌ FIX_PRICES fallito: %s", e, exc_info=True)
+        sys.exit(1)
+    finally:
+        # Ripristina sys.argv
+        sys.argv = original_argv
 
 if __name__ == "__main__":
     main()

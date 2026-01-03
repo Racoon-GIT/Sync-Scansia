@@ -71,8 +71,16 @@ def fix_prices_for_sku(shop: Shopify, sku: str, rows: List[Dict[str, Any]], dry_
     prezzo_pieno = _clean_price(first_row.get("prezzo"))
     prezzo_scontato = _clean_price(first_row.get("prezzo_outlet"))
 
+    # Logica prezzi secondo requisiti:
+    # - prezzo_scontato = prezzo_outlet dal foglio
+    # - Se prezzo_outlet non valorizzato, usa prezzo
     if not prezzo_scontato:
         prezzo_scontato = prezzo_pieno or "0.00"
+
+    # - prezzo_pieno = prezzo dal foglio
+    # - Se prezzo non valorizzato o zero, usa prezzo_outlet
+    if not prezzo_pieno or prezzo_pieno == "0.00":
+        prezzo_pieno = prezzo_scontato
 
     logger.info("Prezzi target: scontato=%s, pieno=%s", prezzo_scontato, prezzo_pieno)
 
@@ -106,21 +114,18 @@ def fix_prices_for_sku(shop: Shopify, sku: str, rows: List[Dict[str, Any]], dry_
         logger.warning("Nessuna variante trovata, skip")
         return "SKIP_NOT_FOUND"
 
-    # 5. Controlla se i prezzi sono già corretti
-    all_correct = True
+    # 5. Verifica se ci sono prezzi a zero (filtro principale)
+    has_zero_price = False
     for v in variants:
         current_price = v.get("price", "0.00")
-        current_compare = v.get("compareAtPrice")
+        if current_price == "0.00" or current_price == "0" or not current_price:
+            has_zero_price = True
+            logger.debug("Variante %s: prezzo a zero (attuale=%s)", v.get("title", v["id"]), current_price)
+            break
 
-        if current_price != prezzo_scontato or current_compare != prezzo_pieno:
-            all_correct = False
-            logger.debug("Variante %s: prezzo attuale=%s (target=%s), compare=%s (target=%s)",
-                        v.get("title", v["id"]), current_price, prezzo_scontato,
-                        current_compare, prezzo_pieno)
-
-    if all_correct:
-        logger.info("✓ Prezzi già corretti per tutte le varianti, skip")
-        return "SKIP_ALREADY_CORRECT"
+    if not has_zero_price:
+        logger.info("✓ Nessuna variante con prezzo a zero, skip")
+        return "SKIP_NO_ZERO_PRICE"
 
     # 6. Aggiorna prezzi
     if dry_run:
@@ -234,7 +239,7 @@ Esempi:
         "success_dry": 0,
         "skip_not_found": 0,
         "skip_draft": 0,
-        "skip_already_correct": 0,
+        "skip_no_zero_price": 0,
         "errors": 0
     }
 
@@ -250,8 +255,8 @@ Esempi:
                 stats["skip_not_found"] += 1
             elif result == "SKIP_DRAFT":
                 stats["skip_draft"] += 1
-            elif result == "SKIP_ALREADY_CORRECT":
-                stats["skip_already_correct"] += 1
+            elif result == "SKIP_NO_ZERO_PRICE":
+                stats["skip_no_zero_price"] += 1
             elif result == "ERROR":
                 stats["errors"] += 1
         except Exception as e:
@@ -265,7 +270,7 @@ Esempi:
         logger.info("- Prodotti da aggiornare: %d", stats["success_dry"])
     else:
         logger.info("- Prodotti aggiornati: %d", stats["success"])
-    logger.info("- Skip (già corretti): %d", stats["skip_already_correct"])
+    logger.info("- Skip (nessun prezzo zero): %d", stats["skip_no_zero_price"])
     logger.info("- Skip (non trovati): %d", stats["skip_not_found"])
     logger.info("- Skip (draft): %d", stats["skip_draft"])
     logger.info("- Errori: %d", stats["errors"])
