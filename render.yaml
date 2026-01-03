@@ -4,4 +4,4 @@ services:
     env: python
     pythonVersion: 3.12.4
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m src.sync --apply
+    startCommand: python -m main
