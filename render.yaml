@@ -5,3 +5,24 @@ services:
     pythonVersion: 3.12.4
     buildCommand: pip install -r requirements.txt
     startCommand: python -m main
+    envVars:
+      - key: SHOPIFY_STORE
+        sync: false
+      - key: SHOPIFY_ADMIN_TOKEN
+        sync: false
+      - key: SHOPIFY_API_VERSION
+        value: "2025-01"
+      - key: PROMO_LOCATION_ID
+        sync: false
+      - key: MAGAZZINO_LOCATION_ID
+        sync: false
+      - key: GSPREAD_SHEET_ID
+        sync: false
+      - key: GSPREAD_WORKSHEET_TITLE
+        sync: false
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: RUN_MODE
+        value: SYNC
+      - key: COLLECTION_ID
+        sync: false
