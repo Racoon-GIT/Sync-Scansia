@@ -32,28 +32,39 @@ pip install -r requirements.txt
 
 ### Configurazione Base
 ```bash
-# Copia e configura le variabili d'ambiente
-export SHOPIFY_STORE=yourstore.myshopify.com
+# Variabili obbligatorie
 export SHOPIFY_ADMIN_TOKEN=shpat_xxxxx
-export SHOPIFY_API_VERSION=2025-01
-
 export GSPREAD_SHEET_ID=1ABC...XYZ
 export GSPREAD_WORKSHEET_TITLE=Scarpe_in_Scansia
 export GOOGLE_CREDENTIALS_JSON='{"type":"service_account",...}'
 
-export PROMO_LOCATION_NAME=Promo
-export MAGAZZINO_LOCATION_NAME=Magazzino
+# Variabili opzionali (con defaults)
+export SHOPIFY_STORE=racoon-lab.myshopify.com  # Default già configurato
+export SHOPIFY_API_VERSION=2025-01            # Default: 2025-01
+export PROMO_LOCATION_ID=8251572336           # O usa PROMO_LOCATION_NAME
+export MAGAZZINO_LOCATION_ID=8251572336       # O usa MAGAZZINO_LOCATION_NAME
 ```
 
 ### Esecuzione
+
+**Entry Point Unificato** (raccomandato per produzione):
 ```bash
-# SYNC - Dry-run (anteprima senza modifiche)
+# SYNC workflow
+RUN_MODE=SYNC python -m main
+
+# REORDER workflow
+RUN_MODE=REORDER COLLECTION_ID=262965428289 python -m main
+```
+
+**Esecuzione Diretta** (per sviluppo locale):
+```bash
+# SYNC - Dry-run
 python -m src.sync
 
-# SYNC - Apply (applica modifiche)
+# SYNC - Apply
 python -m src.sync --apply
 
-# REORDER - Riordina collection per sconto
+# REORDER
 python -m src.reorder_collection --collection-id 262965428289 --apply
 ```
 
@@ -157,14 +168,19 @@ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
 - `SPREADSHEET_ID` → `GSPREAD_SHEET_ID`
 - `WORKSHEET_NAME` → `GSPREAD_WORKSHEET_TITLE`
 
-### Shopify (Obbligatorie)
-| Variabile | Descrizione | Esempio |
-|-----------|-------------|---------|
-| `SHOPIFY_STORE` | Dominio store | `racoon-lab.myshopify.com` |
-| `SHOPIFY_ADMIN_TOKEN` | Access token Admin API | `shpat_xxxxxxxxxxxxx` |
-| `SHOPIFY_API_VERSION` | Versione API | `2025-01` |
+### Shopify
 
-### Locations (Obbligatorie)
+| Variabile | Obbligatorio | Default | Descrizione |
+|-----------|--------------|---------|-------------|
+| `SHOPIFY_ADMIN_TOKEN` | ✅ Sì | - | Access token Admin API |
+| `SHOPIFY_STORE` | ⚠️ Opzionale | `racoon-lab.myshopify.com` | Dominio store (hardcoded se non specificato) |
+| `SHOPIFY_API_VERSION` | ❌ No | `2025-01` | Versione API Shopify |
+
+**Note**:
+- `SHOPIFY_STORE` ha un default hardcoded per questo progetto. Se usi uno store diverso, specifica la variabile.
+- `SHOPIFY_ADMIN_TOKEN` è l'unica variabile Shopify strettamente obbligatoria.
+
+### Locations
 
 **Opzione 1 - By Name** (richiede `read_locations` permission):
 ```bash
@@ -544,50 +560,65 @@ export SHOPIFY_MAX_RETRIES=3         # Riduci tentativi
 
 ### Setup Cron Service
 
-**render.yaml** (commit al repository):
+**render.yaml** (già configurato nel repository):
 ```yaml
 services:
   - type: cron
-    name: sync-scansia
-    runtime: python
-    schedule: "0 6 * * *"  # Ogni giorno alle 6:00 UTC
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python -m main"
+    name: Sync-Scansia
+    env: python
+    pythonVersion: 3.12.4
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m main
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.12.4"
+      - key: SHOPIFY_STORE
+        sync: false              # Prende valore da Dashboard (opzionale)
+      - key: SHOPIFY_ADMIN_TOKEN
+        sync: false              # Prende valore da Dashboard (obbligatorio)
+      - key: SHOPIFY_API_VERSION
+        value: "2025-01"
+      - key: PROMO_LOCATION_ID
+        sync: false
+      - key: MAGAZZINO_LOCATION_ID
+        sync: false
+      - key: GSPREAD_SHEET_ID
+        sync: false
+      - key: GSPREAD_WORKSHEET_TITLE
+        sync: false
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
       - key: RUN_MODE
-        value: SYNC
+        value: SYNC              # Default: SYNC, cambia a REORDER se necessario
+      - key: COLLECTION_ID
+        sync: false              # Solo per REORDER
 ```
+
+**Note**: `sync: false` significa che la variabile viene presa dal Dashboard di Render (secret), `value:` significa valore hardcoded nel yaml.
 
 ### Configurazione Environment Variables
 
-Render Dashboard → Service → Environment:
+Render Dashboard → Service → Environment → Add Environment Variable:
 
-**Google Sheets**:
+**Obbligatorie**:
 ```
+SHOPIFY_ADMIN_TOKEN=shpat_xxxxx
 GSPREAD_SHEET_ID=1ABC...XYZ
 GSPREAD_WORKSHEET_TITLE=Scarpe_in_Scansia
 GOOGLE_CREDENTIALS_JSON={"type":"service_account",...}
-```
-
-**Shopify**:
-```
-SHOPIFY_STORE=yourstore.myshopify.com
-SHOPIFY_ADMIN_TOKEN=shpat_xxxxx
-SHOPIFY_API_VERSION=2025-01
-```
-
-**Locations**:
-```
 PROMO_LOCATION_ID=8251572336
 MAGAZZINO_LOCATION_ID=8251572336
 ```
 
-**Opzionali**:
+**Opzionali** (hanno defaults):
 ```
+SHOPIFY_STORE=racoon-lab.myshopify.com    # Default già hardcoded
 SHOPIFY_MIN_INTERVAL_SEC=0.7
 SHOPIFY_MAX_RETRIES=5
+```
+
+**Per REORDER** (cambia temporaneamente):
+```
+RUN_MODE=REORDER
+COLLECTION_ID=95310381121
 ```
 
 ### Fix Python Version (se errori build pandas)
@@ -713,6 +744,13 @@ Sync-Scansia/
 ---
 
 ## 📜 CHANGELOG
+
+### v2.1 (2026-01-03)
+- ✅ Entry point unificato `main.py` con RUN_MODE per SYNC e REORDER
+- ✅ SHOPIFY_STORE ora opzionale con default hardcoded (`racoon-lab.myshopify.com`)
+- ✅ Fix render.yaml: ripristinata sezione envVars per injection variabili
+- ✅ REORDER workflow completamente funzionante
+- ✅ Debug logging per troubleshooting variabili ambiente
 
 ### v2.0 (2026-01-02)
 - ✅ Rimozione moduli inutilizzati (variant_reset, channel_manager, config, exceptions)
