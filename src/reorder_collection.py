@@ -25,9 +25,14 @@ logger = logging.getLogger("reorder")
 
 class ShopifyCollectionReorder:
     def __init__(self):
-        self.store = os.environ["SHOPIFY_STORE"]
-        self.token = os.environ["SHOPIFY_ADMIN_TOKEN"]
+        self.store = os.environ.get("SHOPIFY_STORE")
+        self.token = os.environ.get("SHOPIFY_ADMIN_TOKEN")
         self.api_version = os.environ.get("SHOPIFY_API_VERSION", "2025-01")
+
+        if not self.store:
+            raise RuntimeError("SHOPIFY_STORE environment variable not set")
+        if not self.token:
+            raise RuntimeError("SHOPIFY_ADMIN_TOKEN environment variable not set")
         self.base = f"https://{self.store}/admin/api/{self.api_version}"
         self.graphql_url = f"{self.base}/graphql.json"
         
