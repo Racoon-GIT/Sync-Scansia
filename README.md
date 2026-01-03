@@ -414,12 +414,14 @@ END
 ## 🔧 WORKFLOW FIX_PRICES - CORREZIONE PREZZI ZERO
 
 ### Descrizione
-Corregge prodotti outlet con **prezzo a zero** causati dal bug nelle versioni ≤ v2.0. Legge i prezzi corretti dal Google Sheet e li applica agli outlet esistenti senza modificare inventory, immagini o metafields.
+Aggiorna prezzi dei prodotti outlet leggendo i valori corretti dal Google Sheet. Modalità di aggiornamento:
+- **Colonna Q valorizzata**: OVERWRITE forzato (aggiorna sempre, indipendentemente dal prezzo attuale)
+- **Colonna Q vuota**: Aggiorna SOLO se price = 0 (comportamento originale per correggere bug v2.0)
 
 ### Quando Usare
-- ✅ Hai prodotti outlet online con price = 0.00
-- ✅ I prezzi corretti sono nel Google Sheet
-- ✅ Vuoi aggiornare SOLO i prezzi
+- ✅ Vuoi aggiornare massivamente i prezzi da Google Sheet (colonna Q valorizzata)
+- ✅ Hai prodotti outlet online con price = 0.00 da correggere (colonna Q vuota)
+- ✅ I prezzi corretti sono nel Google Sheet (colonne H e J)
 
 ### Logica Prezzi
 ```python
@@ -487,18 +489,20 @@ END
 
 ### Filtri di Sicurezza
 
-Lo script processa un prodotto SOLO se:
+**Condizioni base** (sempre verificate):
 - ✅ Outlet esiste su Shopify
 - ✅ Status = ACTIVE (skip se DRAFT)
-- ✅ Ha almeno una variante con price = 0.00
 
-Se tutte le varianti hanno già prezzo > 0, il prodotto viene skippato (nessuna modifica).
+**Modalità aggiornamento**:
+- **Colonna Q valorizzata**: OVERWRITE forzato → Aggiorna SEMPRE i prezzi
+- **Colonna Q vuota** (fallback a SKU): Aggiorna SOLO se almeno una variante ha price = 0.00
 
 ### Performance
 
 - **Batch update**: 1 mutation GraphQL per prodotto (tutte le varianti)
 - **Rate limiting**: 0.7s tra chiamate
-- **Safe**: Skip automatici, no modifiche se prezzi già ok
+- **Overwrite mode**: Se colonna Q valorizzata, aggiorna sempre (massimo controllo)
+- **Safe mode**: Se colonna Q vuota, skip automatico per prezzi già ok
 
 ---
 
@@ -866,14 +870,15 @@ Sync-Scansia/
 ## 📜 CHANGELOG
 
 ### v2.3 (2026-01-03)
-- ✨ **NUOVA FEATURE**: Aggiunto workflow FIX_PRICES per correzione automatica prezzi zero
+- ✨ **NUOVA FEATURE**: Aggiunto workflow FIX_PRICES per aggiornamento prezzi massivo o correzione prezzi zero
   - Integrato in main.py con `RUN_MODE=FIX_PRICES`
   - Eseguibile da Render o localmente
-  - Filtra solo prodotti con price=0, skip automatici per prodotti ok
+  - **Modalità OVERWRITE**: Se colonna Q valorizzata, aggiorna SEMPRE i prezzi (update massivo)
+  - **Modalità SAFE**: Se colonna Q vuota (fallback SKU), aggiorna SOLO se price=0 (correzione bug)
   - **Colonne GSheets**: Usa Colonna Q (Product ID), Colonna J (Prezzo Outlet → price), Colonna H (Prezzo High → compareAtPrice)
   - Ricerca prodotto tramite Product ID (colonna Q) con fallback a SKU se vuota
 - ✅ Documentazione completa: sezione dedicata workflow FIX_PRICES
-- ✅ Script fix_prices.py potenziato: filtro zero-price, logica prezzi migliorata, supporto Product ID
+- ✅ Script fix_prices.py: doppia modalità (overwrite/safe), supporto Product ID, logica prezzi con fallback
 
 ### v2.2 (2026-01-03)
 - 🐛 **FIX CRITICO**: Risolto bug prezzi a zero dopo SYNC

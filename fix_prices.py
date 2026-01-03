@@ -145,18 +145,24 @@ def fix_prices_for_sku(shop: Shopify, sku: str, rows: List[Dict[str, Any]], dry_
         logger.warning("Nessuna variante trovata, skip")
         return "SKIP_NOT_FOUND"
 
-    # 5. Verifica se ci sono prezzi a zero (filtro principale)
-    has_zero_price = False
-    for v in variants:
-        current_price = v.get("price", "0.00")
-        if current_price == "0.00" or current_price == "0" or not current_price:
-            has_zero_price = True
-            logger.debug("Variante %s: prezzo a zero (attuale=%s)", v.get("title", v["id"]), current_price)
-            break
+    # 5. Se colonna Q NON valorizzata, verifica prezzi a zero (comportamento originale)
+    # Se colonna Q valorizzata, aggiorna SEMPRE (overwrite forzato)
+    if not product_id_q:
+        # Fallback mode: aggiorna solo se prezzo a zero
+        has_zero_price = False
+        for v in variants:
+            current_price = v.get("price", "0.00")
+            if current_price == "0.00" or current_price == "0" or not current_price:
+                has_zero_price = True
+                logger.debug("Variante %s: prezzo a zero (attuale=%s)", v.get("title", v["id"]), current_price)
+                break
 
-    if not has_zero_price:
-        logger.info("✓ Nessuna variante con prezzo a zero, skip")
-        return "SKIP_NO_ZERO_PRICE"
+        if not has_zero_price:
+            logger.info("✓ Nessuna variante con prezzo a zero, skip (colonna Q non valorizzata)")
+            return "SKIP_NO_ZERO_PRICE"
+    else:
+        # Colonna Q valorizzata: OVERWRITE forzato indipendentemente dal prezzo attuale
+        logger.info("Colonna Q valorizzata: aggiornamento FORZATO prezzi (overwrite)")
 
     # 6. Aggiorna prezzi
     if dry_run:
