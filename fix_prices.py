@@ -72,8 +72,16 @@ def fix_prices_for_sku(shop: Shopify, sku: str, rows: List[Dict[str, Any]], dry_
     # Colonne secondo specifiche utente:
     # - Colonna H "Prezzo High" → compareAtPrice
     # - Colonna J "Prezzo Outlet" → price
-    prezzo_pieno = _clean_price(first_row.get("prezzo_high"))
-    prezzo_scontato = _clean_price(first_row.get("prezzo_outlet"))
+
+    # Leggi valori raw dalle colonne
+    raw_prezzo_high = first_row.get("prezzo_high")
+    raw_prezzo_outlet = first_row.get("prezzo_outlet")
+
+    logger.info("Valori raw letti: prezzo_high='%s', prezzo_outlet='%s'",
+                raw_prezzo_high or "(vuoto)", raw_prezzo_outlet or "(vuoto)")
+
+    prezzo_pieno = _clean_price(raw_prezzo_high)
+    prezzo_scontato = _clean_price(raw_prezzo_outlet)
 
     # Logica prezzi secondo requisiti:
     # - prezzo_scontato = prezzo_outlet dal foglio (colonna J)
@@ -92,7 +100,10 @@ def fix_prices_for_sku(shop: Shopify, sku: str, rows: List[Dict[str, Any]], dry_
     # 2. Cerca outlet esistente usando colonna Q (Product ID)
     # REQUISITO: La colonna Q DEVE essere valorizzata, altrimenti skip
     # Nota: header "Product_Id" viene normalizzato in "product_id"
-    product_id_q = (first_row.get("product_id") or "").strip()
+    raw_product_id = first_row.get("product_id")
+    logger.info("Valore raw colonna Q (product_id): '%s'", raw_product_id or "(vuoto)")
+
+    product_id_q = (raw_product_id or "").strip()
 
     if not product_id_q:
         logger.warning("Colonna Q NON valorizzata per SKU=%s, SKIP (requisito obbligatorio)", sku)
