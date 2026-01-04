@@ -17,8 +17,8 @@ Il sistema supporta **3 modalità operative** configurabili tramite variabile `R
 - `online`: Flag SI/NO (processa solo righe con "SI")
 - `qta`: Quantità disponibile (processa solo righe con qta > 0)
 - `taglia`: Taglia specifica (opzionale, per multi-taglia)
-- `prezzo`: Prezzo pieno (per compareAtPrice)
-- `prezzo_outlet`: Prezzo scontato (per price)
+- **Colonna H** `Prezzo High`: Prezzo pieno barrato (per compareAtPrice)
+- **Colonna J** `Prezzo Outlet`: Prezzo scontato di vendita (per price)
 
 **Configurazione**:
 ```bash
@@ -292,15 +292,16 @@ Duplica prodotti "sorgente" in versione **Outlet** partendo da Google Sheet, imp
 **Colonne Opzionali**:
 - `BRAND`, `MODELLO`, `TITOLO` (usate per logging)
 - `TAGLIA` - Se presente, match preciso variante
-- `Prezzo Pieno`, `Prezzo Scontato` (formati: `129,90`, `€ 129`, `129.90`)
-- `Product_Id` - Write-back GID prodotto outlet creato
+- **Colonna H** `Prezzo High` - Prezzo pieno barrato (compareAtPrice) (formati: `129,90`, `€ 129`, `129.90`)
+- **Colonna J** `Prezzo Outlet` - Prezzo scontato di vendita (price) (formati: `129,90`, `€ 129`, `129.90`)
+- `Product_Id` - Write-back GID prodotto outlet creato (colonna Q)
 
 **Esempio**:
 ```
-SKU       | TAGLIA | Qta | online | Prezzo Pieno | Prezzo Scontato
-ABC123    | 35     | 1   | SI     | 159,90       | 99,90
-ABC123    | 36     | 2   | SI     | 159,90       | 99,90
-ABC123    | 37     | 1   | NO     | 159,90       | 99,90
+SKU       | TAGLIA | Qta | online | Prezzo High (H) | Prezzo Outlet (J)
+ABC123    | 35     | 1   | SI     | 159,90          | 99,90
+ABC123    | 36     | 2   | SI     | 159,90          | 99,90
+ABC123    | 37     | 1   | NO     | 159,90          | 99,90
 ```
 
 ### Flusso Operativo Dettagliato
@@ -938,16 +939,19 @@ Sync-Scansia/
 
 ## 📜 CHANGELOG
 
-### v2.3 (2026-01-03)
-- ✨ **NUOVA FEATURE**: Aggiunto workflow FIX_PRICES per aggiornamento prezzi massivo o correzione prezzi zero
+### v2.3 (2026-01-04)
+- ✨ **NUOVA FEATURE**: Aggiunto workflow FIX_PRICES per aggiornamento prezzi massivo
   - Integrato in main.py con `RUN_MODE=FIX_PRICES`
   - Eseguibile da Render o localmente
-  - **Modalità OVERWRITE**: Se colonna Q valorizzata, aggiorna SEMPRE i prezzi (update massivo)
-  - **Modalità SAFE**: Se colonna Q vuota (fallback SKU), aggiorna SOLO se price=0 (correzione bug)
-  - **Colonne GSheets**: Usa Colonna Q (Product ID), Colonna J (Prezzo Outlet → price), Colonna H (Prezzo High → compareAtPrice)
-  - Ricerca prodotto tramite Product ID (colonna Q) con fallback a SKU se vuota
+  - **Modalità OVERWRITE forzato**: Colonna Q OBBLIGATORIA, aggiorna SEMPRE i prezzi
+  - **Colonne GSheets**: Colonna Q (Product ID obbligatorio), Colonna J (Prezzo Outlet → price), Colonna H (Prezzo High → compareAtPrice)
+  - Ricerca prodotto tramite Product ID (colonna Q), nessun fallback a SKU
+- 🔧 **CORREZIONE IMPORTANTE**: Workflow SYNC ora usa Colonna H "Prezzo High" invece di Colonna I "Prezzo"
+  - **BREAKING CHANGE**: SYNC ora legge `prezzo_high` (colonna H) per compareAtPrice
+  - Colonna I "Prezzo" non più utilizzata nei workflow
+  - Uniformata logica prezzi tra SYNC e FIX_PRICES
 - ✅ Documentazione completa: sezione dedicata workflow FIX_PRICES
-- ✅ Script fix_prices.py: doppia modalità (overwrite/safe), supporto Product ID, logica prezzi con fallback
+- ✅ Debug logging per diagnosi lettura colonne
 
 ### v2.2 (2026-01-03)
 - 🐛 **FIX CRITICO**: Risolto bug prezzi a zero dopo SYNC

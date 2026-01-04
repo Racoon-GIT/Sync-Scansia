@@ -681,11 +681,21 @@ def process_sku_group(shop: Shopify, sku: str, rows: List[Dict[str, Any]], ws, c
     first_row = rows[0]
     
     # 1. Estrai dati comuni dalla prima riga
-    prezzo_pieno = _clean_price(first_row.get("prezzo"))
+    # Colonna H "Prezzo High" → compareAtPrice (prezzo pieno barrato)
+    # Colonna J "Prezzo Outlet" → price (prezzo scontato di vendita)
+    prezzo_pieno = _clean_price(first_row.get("prezzo_high"))
     prezzo_scontato = _clean_price(first_row.get("prezzo_outlet"))
-    
+
+    # Logica prezzi secondo requisiti:
+    # - prezzo_scontato = prezzo_outlet dal foglio (colonna J)
+    # - Se prezzo_outlet non valorizzato, usa prezzo_high (colonna H)
     if not prezzo_scontato:
         prezzo_scontato = prezzo_pieno or "0.00"
+
+    # - prezzo_pieno = prezzo_high dal foglio (colonna H)
+    # - Se prezzo_high non valorizzato o zero, usa prezzo_outlet (colonna J)
+    if not prezzo_pieno or prezzo_pieno == "0.00":
+        prezzo_pieno = prezzo_scontato
     
     # 2. Trova prodotto sorgente
     source = shop.find_product_by_sku_non_outlet(sku)
