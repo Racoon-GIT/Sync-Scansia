@@ -91,7 +91,8 @@ def fix_prices_for_sku(shop: Shopify, sku: str, rows: List[Dict[str, Any]], dry_
 
     # 2. Cerca outlet esistente usando colonna Q (Product ID)
     # REQUISITO: La colonna Q DEVE essere valorizzata, altrimenti skip
-    product_id_q = (first_row.get("q") or "").strip()
+    # Nota: header "Product_Id" viene normalizzato in "product_id"
+    product_id_q = (first_row.get("product_id") or "").strip()
 
     if not product_id_q:
         logger.warning("Colonna Q NON valorizzata per SKU=%s, SKIP (requisito obbligatorio)", sku)
