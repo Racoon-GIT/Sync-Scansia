@@ -69,20 +69,26 @@ def run_sync():
     logger.info("")
     logger.info("🔄 Esecuzione SYNC - Creazione/Aggiornamento Outlet")
     logger.info("")
-    
+
+    # Verifica modalità dry-run
+    dry_run = os.environ.get("DRY_RUN", "").lower() in ("true", "1", "yes")
+    mode_str = "DRY-RUN (nessuna modifica)" if dry_run else "APPLY (applica modifiche)"
+    logger.info(f"Modalità: {mode_str}")
+    logger.info("")
+
     try:
         # Import e esegui sync
         from src import sync
-        
-        # Simula args --apply (modalità reale)
-        class Args:
-            apply = True
-        
+
         # Salva sys.argv originale
         original_argv = sys.argv
-        
-        # Imposta args per sync
-        sys.argv = ["sync.py", "--apply"]
+
+        # Imposta args per sync (aggiungi --apply solo se NON dry-run)
+        args = ["sync.py"]
+        if not dry_run:
+            args.append("--apply")
+
+        sys.argv = args
         
         try:
             # Esegui main di sync
@@ -142,16 +148,26 @@ def run_reorder():
     
     logger.info(f"Collection ID: {collection_id}")
     logger.info("")
-    
+
+    # Verifica modalità dry-run
+    dry_run = os.environ.get("DRY_RUN", "").lower() in ("true", "1", "yes")
+    mode_str = "DRY-RUN (nessuna modifica)" if dry_run else "APPLY (applica modifiche)"
+    logger.info(f"Modalità: {mode_str}")
+    logger.info("")
+
     try:
         # Import e esegui reorder
         from src import reorder_collection
-        
+
         # Salva sys.argv originale
         original_argv = sys.argv
-        
-        # Imposta args per reorder
-        sys.argv = ["reorder_collection.py", "--collection-id", collection_id, "--apply"]
+
+        # Imposta args per reorder (aggiungi --apply solo se NON dry-run)
+        args = ["reorder_collection.py", "--collection-id", collection_id]
+        if not dry_run:
+            args.append("--apply")
+
+        sys.argv = args
         
         try:
             # Esegui main di reorder
@@ -168,9 +184,15 @@ def run_reorder():
         sys.exit(1)
 
 def run_fix_prices():
-    """Esegue fix_prices.py per correggere prezzi a zero"""
+    """Esegue fix_prices.py per aggiornamento prezzi massivo"""
     logger.info("")
-    logger.info("🔧 Esecuzione FIX_PRICES - Correzione Prezzi Zero")
+    logger.info("🔧 Esecuzione FIX_PRICES - Aggiornamento Prezzi Massivo")
+    logger.info("")
+
+    # Verifica modalità dry-run
+    dry_run = os.environ.get("DRY_RUN", "").lower() in ("true", "1", "yes")
+    mode_str = "DRY-RUN (nessuna modifica)" if dry_run else "APPLY (applica modifiche)"
+    logger.info(f"Modalità: {mode_str}")
     logger.info("")
 
     # Importa modulo fix_prices
@@ -184,8 +206,12 @@ def run_fix_prices():
     original_argv = sys.argv
 
     try:
-        # Imposta args per fix_prices (--apply forzato, no dry-run)
-        sys.argv = ["fix_prices.py", "--apply"]
+        # Imposta args per fix_prices (aggiungi --apply solo se NON dry-run)
+        args = ["fix_prices.py"]
+        if not dry_run:
+            args.append("--apply")
+
+        sys.argv = args
 
         # Esegui main di fix_prices
         fix_prices.main()

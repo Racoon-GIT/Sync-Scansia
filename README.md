@@ -116,15 +116,29 @@ export MAGAZZINO_LOCATION_ID=8251572336       # O usa MAGAZZINO_LOCATION_NAME
 
 **Entry Point Unificato** (raccomandato per produzione):
 ```bash
-# SYNC workflow
+# SYNC workflow - APPLY (applica modifiche)
 RUN_MODE=SYNC python -m main
 
-# REORDER workflow
+# SYNC workflow - DRY-RUN (solo preview)
+DRY_RUN=true RUN_MODE=SYNC python -m main
+
+# REORDER workflow - APPLY (applica modifiche)
 RUN_MODE=REORDER COLLECTION_ID=262965428289 python -m main
 
-# FIX_PRICES workflow (correzione prezzi a zero)
+# REORDER workflow - DRY-RUN (solo analisi)
+DRY_RUN=true RUN_MODE=REORDER COLLECTION_ID=262965428289 python -m main
+
+# FIX_PRICES workflow - APPLY (applica modifiche)
 RUN_MODE=FIX_PRICES python -m main
+
+# FIX_PRICES workflow - DRY-RUN (solo preview)
+DRY_RUN=true RUN_MODE=FIX_PRICES python -m main
 ```
+
+**⚠️ IMPORTANTE - Variabile DRY_RUN**:
+- `DRY_RUN=true` → Nessuna modifica su Shopify (solo analisi/preview)
+- `DRY_RUN=false` o non impostata → Applica modifiche su Shopify
+- Valori accettati per true: `true`, `1`, `yes` (case-insensitive)
 
 **Esecuzione Diretta** (per sviluppo locale):
 ```bash
@@ -939,7 +953,7 @@ Sync-Scansia/
 
 ## 📜 CHANGELOG
 
-### v2.3 (2026-01-04)
+### v2.3 (2026-01-06)
 - ✨ **NUOVA FEATURE**: Aggiunto workflow FIX_PRICES per aggiornamento prezzi massivo
   - Integrato in main.py con `RUN_MODE=FIX_PRICES`
   - Eseguibile da Render o localmente
@@ -950,6 +964,11 @@ Sync-Scansia/
   - **BREAKING CHANGE**: SYNC ora legge `prezzo_high` (colonna H) per compareAtPrice
   - Colonna I "Prezzo" non più utilizzata nei workflow
   - Uniformata logica prezzi tra SYNC e FIX_PRICES
+- ✨ **NUOVA FEATURE**: Supporto DRY_RUN universale
+  - Variabile `DRY_RUN=true` supportata in SYNC, REORDER e FIX_PRICES
+  - DRY_RUN=true → Solo analisi/preview, nessuna modifica su Shopify
+  - DRY_RUN=false o non impostata → Applica modifiche
+  - Valori accettati: true, 1, yes (case-insensitive)
 - ✅ Documentazione completa: sezione dedicata workflow FIX_PRICES
 - ✅ Debug logging per diagnosi lettura colonne
 
