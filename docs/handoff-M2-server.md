@@ -9,7 +9,9 @@ Scansia Manager = new single-origin FastAPI web service replacing the 3 Sync-Sca
 
 ## Requests (much reduced vs the original CF Access plan)
 
-- [ ] **Hosting**: Render **web service on the FREE tier** (same as the other 7 Render services). No persistent disk, no paid plan. Deploy is **dashboard-driven** (confirmed) → the M3 cron decommission is a manual dashboard delete of the `Sync-Scansia` cron.
+> **STATUS: READY NOW (2026-07-07).** The F1 web layer is built and tested (branch `feat/scansia-manager`, tip `9049c13`, 344 tests in a venv with fastapi). This handoff is fully actionable — nothing left on the SVILUPPO side before deploy.
+
+- [ ] **Hosting**: Render **web service on the FREE tier** (same as the other 7 Render services). No persistent disk, no paid plan. Deploy is **dashboard-driven** (confirmed) → the M3 cron decommission is a manual dashboard delete of the `Sync-Scansia` cron. Deploy config: `buildCommand: pip install -r requirements.txt` · `startCommand: uvicorn backend.app:app --workers 1 --host 0.0.0.0 --port $PORT` · `healthCheckPath: /health` (ungated) · Python 3.12 (runtime.txt).
 - [ ] **Spin-down / keepalive**: the free tier sleeps when idle. Confirm whether to add this service to the existing **Scheduler keepalive layer** (infra §5-bis) or accept the ~30–60s cold start (fine for a 2×/year tool).
 - [ ] **Secrets — REUSE existing (per SERVER's own discovery), nothing to provision**:
   - Shopify: **reuse the shared "Management esterno" token** — already holds all required scopes (8/8, live-verified, incl. `read/write_publications`). **No dedicated custom app. No rotation.**
