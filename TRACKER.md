@@ -22,7 +22,7 @@
 
 **Domande owner aperte** (tracciate nel piano §Open items): Q-oversell (default DENY), Q-bf-storefront (gate M3), Q-prodcollection, Q-modelsrc, Q-nest, Q-nonfootwear, Q-saleschannel (verifico io in M1b).
 
-**Decisioni owner risolte**: hard-delete · titolo=sorgente · motore reorder D/B/A B-over-model · MVP-first · Q-active/freshreturn=**Make append-row = segnale rientro, delta idempotente reconciled, PULL** · Q-roweligibility=filtro legacy `online=SI AND qta>0` · Q-fixprices=rifiuta fill-missing.
+**Decisioni owner risolte**: hard-delete · titolo=sorgente · motore reorder D/B/A B-over-model · MVP-first · Q-active/freshreturn=**Make append-row = segnale rientro, delta idempotente reconciled, PULL** · Q-roweligibility=filtro legacy `online=SI AND qta>0` · Q-fixprices=rifiuta fill-missing · **Q-persistenza (2026-07-06) = Option A "no DB, sheet-centric"** (supera SQLite-on-disk: disco Render a pagamento escluso): confirm-token firmati HMAC stateless, audit + `before_snapshot` delete su tab GSheet, piani ricalcolati all'apply → **Render FREE ok**. Storage dietro Protocol iniettati (`AuditSink`/`TokenService`) → porting a MySQL domani = 1 adapter, no redesign. 2ª sede durevole delete opzionale = Cloudflare R2 (free).
 
 **Layer libreria F1 = COMPLETO** (publish + prezzi + delete + resolver + gsheet + transport/ops). Restano SOLO due item **locali non bloccati**: (a) `docs/business-context.md` (recon fresco, M1a-consolidate); (b) cleanup moduli morti (`src/gsheets.py`, `src/utils.py`, dir `reorder/`, `.DS_Store`). Tutto il resto (endpoint web, audit_sink concreto, confirm-token, deploy) è **M2+ bloccato sui 3 handoff** (SERVER, shared-secrets, AUTOMATE) — **da loggare in `../OPEN-HANDOFFS.md` via /handoff**.
 
