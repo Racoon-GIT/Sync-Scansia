@@ -23,6 +23,21 @@ import sys
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("main")
 
+# FIX2 — DRY_RUN fail-closed. Only an EXPLICIT, allow-listed APPLY token flips a
+# run into mutate mode; anything else (unset, empty, unrecognized, or any of the
+# DRY tokens) resolves to DRY-RUN. The legacy logic was fail-OPEN (unset DRY_RUN
+# -> APPLY), which could mutate the live store on a misconfigured deploy.
+_APPLY_TOKENS = frozenset({"apply", "false", "0", "no", "off"})
+
+
+def _resolve_dry_run() -> bool:
+    """Return True (DRY-RUN) unless DRY_RUN carries an explicit APPLY token."""
+    raw = os.environ.get("DRY_RUN")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _APPLY_TOKENS
+
+
 def main():
     """Entry point unificato"""
     
@@ -65,40 +80,27 @@ def main():
         run_fix_prices()
 
 def run_sync():
-    """Esegue sync.py"""
+    """Esegue la nuova orchestrazione PUBLISH (backend.services.outlet_service).
+
+    Sostituisce il vecchio wrapper su src/sync.py: outlet_service compone
+    gsheet + resolvers + ops (preview sempre; apply solo se NON dry-run).
+    """
     logger.info("")
     logger.info("🔄 Esecuzione SYNC - Creazione/Aggiornamento Outlet")
     logger.info("")
 
-    # Verifica modalità dry-run
-    dry_run = os.environ.get("DRY_RUN", "").lower() in ("true", "1", "yes")
+    # FIX2 — fail-closed: default DRY-RUN salvo token APPLY esplicito.
+    dry_run = _resolve_dry_run()
     mode_str = "DRY-RUN (nessuna modifica)" if dry_run else "APPLY (applica modifiche)"
     logger.info(f"Modalità: {mode_str}")
     logger.info("")
 
     try:
-        # Import e esegui sync
-        from src import sync
+        from backend.services import outlet_service
 
-        # Salva sys.argv originale
-        original_argv = sys.argv
-
-        # Imposta args per sync (aggiungi --apply solo se NON dry-run)
-        args = ["sync.py"]
-        if not dry_run:
-            args.append("--apply")
-
-        sys.argv = args
-        
-        try:
-            # Esegui main di sync
-            sync.main()
-            logger.info("")
-            logger.info("✅ SYNC completato con successo")
-        finally:
-            # Ripristina sys.argv
-            sys.argv = original_argv
-            
+        outlet_service.run(dry_run=dry_run)
+        logger.info("")
+        logger.info("✅ SYNC completato con successo")
     except Exception as e:
         logger.error("")
         logger.error("❌ SYNC fallito: %s", e, exc_info=True)
@@ -149,8 +151,8 @@ def run_reorder():
     logger.info(f"Collection ID: {collection_id}")
     logger.info("")
 
-    # Verifica modalità dry-run
-    dry_run = os.environ.get("DRY_RUN", "").lower() in ("true", "1", "yes")
+    # FIX2 — fail-closed: default DRY-RUN salvo token APPLY esplicito.
+    dry_run = _resolve_dry_run()
     mode_str = "DRY-RUN (nessuna modifica)" if dry_run else "APPLY (applica modifiche)"
     logger.info(f"Modalità: {mode_str}")
     logger.info("")
@@ -189,8 +191,8 @@ def run_fix_prices():
     logger.info("🔧 Esecuzione FIX_PRICES - Aggiornamento Prezzi Massivo")
     logger.info("")
 
-    # Verifica modalità dry-run
-    dry_run = os.environ.get("DRY_RUN", "").lower() in ("true", "1", "yes")
+    # FIX2 — fail-closed: default DRY-RUN salvo token APPLY esplicito.
+    dry_run = _resolve_dry_run()
     mode_str = "DRY-RUN (nessuna modifica)" if dry_run else "APPLY (applica modifiche)"
     logger.info(f"Modalità: {mode_str}")
     logger.info("")
