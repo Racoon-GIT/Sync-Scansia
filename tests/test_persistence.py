@@ -41,17 +41,17 @@ def signing_secret(monkeypatch):
 
 def test_token_mint_verify_happy(signing_secret):
     svc = HmacTokenService()
-    tok = svc.mint("planhash-abc", ttl_s=300)
+    tok = svc.mint("planhash-abc", ttl_s=300, kind="publish")
     assert isinstance(tok, str) and tok.count(".") == 1
-    assert svc.verify(tok, "planhash-abc") is True
+    assert svc.verify(tok, "planhash-abc", kind="publish") is True
 
 
 def test_token_verify_altered_signature_false(signing_secret):
     svc = HmacTokenService()
-    tok = svc.mint("planhash-abc", ttl_s=300)
+    tok = svc.mint("planhash-abc", ttl_s=300, kind="publish")
     payload_b64, sig_b64 = tok.split(".")
     flipped = sig_b64[:-1] + ("A" if sig_b64[-1] != "A" else "B")
-    assert svc.verify(f"{payload_b64}.{flipped}", "planhash-abc") is False
+    assert svc.verify(f"{payload_b64}.{flipped}", "planhash-abc", kind="publish") is False
 
 
 def test_token_verify_tampered_payload_false(signing_secret):
@@ -59,7 +59,7 @@ def test_token_verify_tampered_payload_false(signing_secret):
     import base64
 
     svc = HmacTokenService()
-    tok = svc.mint("planhash-abc", ttl_s=1)
+    tok = svc.mint("planhash-abc", ttl_s=1, kind="publish")
     payload_b64, sig_b64 = tok.split(".")
     pad = "=" * (-len(payload_b64) % 4)
     data = json.loads(base64.urlsafe_b64decode(payload_b64 + pad))
@@ -67,53 +67,63 @@ def test_token_verify_tampered_payload_false(signing_secret):
     forged = base64.urlsafe_b64encode(
         json.dumps(data, separators=(",", ":"), sort_keys=True).encode()
     ).rstrip(b"=").decode()
-    assert svc.verify(f"{forged}.{sig_b64}", "planhash-abc") is False
+    assert svc.verify(f"{forged}.{sig_b64}", "planhash-abc", kind="publish") is False
 
 
 def test_token_verify_expired_false(signing_secret):
     minted = HmacTokenService(now=lambda: 1_000.0)
-    tok = minted.mint("planhash-abc", ttl_s=10)  # exp == 1010
+    tok = minted.mint("planhash-abc", ttl_s=10, kind="publish")  # exp == 1010
     later = HmacTokenService(now=lambda: 5_000.0)
-    assert later.verify(tok, "planhash-abc") is False
+    assert later.verify(tok, "planhash-abc", kind="publish") is False
 
 
 def test_token_verify_not_yet_expired_true(signing_secret):
     minted = HmacTokenService(now=lambda: 1_000.0)
-    tok = minted.mint("planhash-abc", ttl_s=100)  # exp == 1100
+    tok = minted.mint("planhash-abc", ttl_s=100, kind="publish")  # exp == 1100
     still = HmacTokenService(now=lambda: 1_050.0)
-    assert still.verify(tok, "planhash-abc") is True
+    assert still.verify(tok, "planhash-abc", kind="publish") is True
 
 
 def test_token_verify_wrong_plan_hash_false(signing_secret):
     svc = HmacTokenService()
-    tok = svc.mint("planhash-abc", ttl_s=300)
-    assert svc.verify(tok, "planhash-DIFFERENT") is False
+    tok = svc.mint("planhash-abc", ttl_s=300, kind="publish")
+    assert svc.verify(tok, "planhash-DIFFERENT", kind="publish") is False
+
+
+def test_token_verify_wrong_kind_false(signing_secret):
+    """HARDENING (post-review): a token minted for one vertical must NOT verify
+    for another, even when the (opaque) plan_hash string matches."""
+    svc = HmacTokenService()
+    tok = svc.mint("planhash-abc", ttl_s=300, kind="publish")
+    assert svc.verify(tok, "planhash-abc", kind="cleanup") is False
+    assert svc.verify(tok, "planhash-abc", kind="prices") is False
+    assert svc.verify(tok, "planhash-abc", kind="publish") is True  # sanity: correct kind still works
 
 
 def test_token_verify_malformed_false(signing_secret):
     svc = HmacTokenService()
-    assert svc.verify("no-dot-here", "planhash-abc") is False
-    assert svc.verify("!!!.$$$", "planhash-abc") is False
-    assert svc.verify("", "planhash-abc") is False
+    assert svc.verify("no-dot-here", "planhash-abc", kind="publish") is False
+    assert svc.verify("!!!.$$$", "planhash-abc", kind="publish") is False
+    assert svc.verify("", "planhash-abc", kind="publish") is False
 
 
 def test_token_mint_missing_secret_raises(monkeypatch):
     monkeypatch.delenv(_SECRET_ENV, raising=False)
     with pytest.raises(ConfigError, match=_SECRET_ENV):
-        HmacTokenService().mint("planhash-abc", ttl_s=300)
+        HmacTokenService().mint("planhash-abc", ttl_s=300, kind="publish")
 
 
 def test_token_verify_missing_secret_raises(monkeypatch):
     """Fail-closed on verify too: no secret -> ConfigError, not a silent False."""
     monkeypatch.delenv(_SECRET_ENV, raising=False)
     with pytest.raises(ConfigError, match=_SECRET_ENV):
-        HmacTokenService().verify("a.b", "planhash-abc")
+        HmacTokenService().verify("a.b", "planhash-abc", kind="publish")
 
 
 def test_token_blank_secret_is_missing(monkeypatch):
     monkeypatch.setenv(_SECRET_ENV, "   ")
     with pytest.raises(ConfigError, match=_SECRET_ENV):
-        HmacTokenService().mint("planhash-abc", ttl_s=300)
+        HmacTokenService().mint("planhash-abc", ttl_s=300, kind="publish")
 
 
 # ===========================================================================

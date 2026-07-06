@@ -74,14 +74,21 @@ class AuditSink(Protocol):
 
 @runtime_checkable
 class TokenService(Protocol):
-    """Stateless confirm-token boundary: mint at preview, verify at apply."""
+    """Stateless confirm-token boundary: mint at preview, verify at apply.
 
-    def mint(self, plan_hash: str, ttl_s: int) -> str:
-        """Return a signed confirm-token binding ``plan_hash`` for ``ttl_s`` seconds."""
+    ``kind`` (post-review HARDENING) is the id of the calling vertical
+    (``"publish"``/``"cleanup"``/``"prices"``/...), SIGNED into the token so a
+    token minted for one vertical never verifies for another.
+    """
+
+    def mint(self, plan_hash: str, ttl_s: int, *, kind: str) -> str:
+        """Return a signed confirm-token binding ``plan_hash`` + ``kind`` for
+        ``ttl_s`` seconds."""
         ...
 
-    def verify(self, token: str, plan_hash: str) -> bool:
-        """True iff ``token`` is a valid, unexpired signature for ``plan_hash``."""
+    def verify(self, token: str, plan_hash: str, *, kind: str) -> bool:
+        """True iff ``token`` is a valid, unexpired signature for ``plan_hash``
+        AND ``kind`` matches the signed claim."""
         ...
 
 

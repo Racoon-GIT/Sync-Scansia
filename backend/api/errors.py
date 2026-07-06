@@ -22,6 +22,11 @@ from dataclasses import dataclass
 from backend.auth.basic_auth import AuthError, AuthNotConfigured
 from backend.config import ConfigError
 from backend.gsheet.reader import CutoverNotDoneError, GSheetError, SheetIOError
+from backend.services.delete_service import (
+    DeleteConfirmationError,
+    PromoAnchorError,
+    SingleDeleteNotOutletError,
+)
 from backend.shopify.ops import ShopifyUserError
 from backend.shopify.transport import ShopifyTransportError
 
@@ -36,6 +41,9 @@ CODE_SHEET_IO_ERROR = "sheet_io_error"
 CODE_SHEET_ERROR = "sheet_error"
 CODE_SHOPIFY_USER_ERROR = "shopify_user_error"
 CODE_SHOPIFY_TRANSPORT_ERROR = "shopify_transport_error"
+CODE_PROMO_ANCHOR_MISSING = "promo_anchor_missing"
+CODE_DELETE_CONFIRMATION_REQUIRED = "delete_confirmation_required"
+CODE_SINGLE_DELETE_NOT_OUTLET = "single_delete_not_outlet"
 CODE_INTERNAL_ERROR = "internal_error"
 
 
@@ -72,6 +80,20 @@ def map_exception(exc: BaseException) -> ApiError:
         return ApiError(401, CODE_UNAUTHORIZED, "Unauthorized.")
     if isinstance(exc, ConfigError):
         return ApiError(503, CODE_CONFIG_ERROR, "Service configuration error.")
+    if isinstance(exc, PromoAnchorError):
+        # Fail-closed refusal to enumerate outlets without a Promo anchor — a
+        # deployment/precondition error (the anchor is a required config), never a
+        # transient fault; surface it as a service-config 503, not a 500.
+        return ApiError(503, CODE_PROMO_ANCHOR_MISSING, "Promo location anchor not configured.")
+    if isinstance(exc, DeleteConfirmationError):
+        # A required human gesture / second confirmation was missing or wrong. The
+        # endpoint gates this synchronously; this is the belt-and-braces path if a
+        # service raises it from inside a job.
+        return ApiError(409, CODE_DELETE_CONFIRMATION_REQUIRED, "Delete confirmation required.")
+    if isinstance(exc, SingleDeleteNotOutletError):
+        # HARDENING (post-review): the single-delete escape hatch refused a GID
+        # that does not resolve to an outlet — never a delete, always a 409.
+        return ApiError(409, CODE_SINGLE_DELETE_NOT_OUTLET, "Target does not resolve to an outlet product.")
     if isinstance(exc, CutoverNotDoneError):
         return ApiError(409, CODE_CUTOVER_NOT_DONE, "Sheet cutover not completed.")
     if isinstance(exc, SheetIOError):
@@ -108,5 +130,8 @@ __all__ = [
     "CODE_SHEET_ERROR",
     "CODE_SHOPIFY_USER_ERROR",
     "CODE_SHOPIFY_TRANSPORT_ERROR",
+    "CODE_PROMO_ANCHOR_MISSING",
+    "CODE_DELETE_CONFIRMATION_REQUIRED",
+    "CODE_SINGLE_DELETE_NOT_OUTLET",
     "CODE_INTERNAL_ERROR",
 ]

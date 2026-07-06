@@ -197,6 +197,14 @@ def test_truncated_when_has_next_page():
     t = FakeTransport(_products_response([p], has_next=True))
     r = source_resolver(t, "ABC")
     assert "TRUNCATED" in r["warning"]
+    assert r["truncated"] is True  # structured flag mirrors the warning text
+
+
+def test_truncated_flag_false_when_no_next_page():
+    p = _product_node("gid://shopify/Product/P", "Nike", "nike", "ACTIVE", False, ["ABC"])
+    t = FakeTransport(_products_response([p], has_next=False))
+    r = source_resolver(t, "ABC")
+    assert r["truncated"] is False
 
 
 def test_no_candidates_is_clean_empty():

@@ -1,8 +1,14 @@
 """Stateless HMAC confirm-token service (stdlib only — NO PyJWT).
 
 Token layout: ``base64url(payload).base64url(sig)`` where ``payload`` is the
-compact JSON ``{"exp": <unix-seconds>, "plan_hash": <str>}`` and
-``sig = HMAC-SHA256(secret, payload_bytes)``. The signing secret comes ONLY from
+compact JSON ``{"exp": <unix-seconds>, "plan_hash": <str>, "kind": <str>}`` and
+``sig = HMAC-SHA256(secret, payload_bytes)``. ``kind`` is the vertical's id
+(``"publish"``/``"cleanup"``/``"prices"``/...) SIGNED into the payload
+(post-review HARDENING): without it, a token minted for one vertical would
+verify successfully against another vertical's ``plan_hash`` if the two hashes
+ever coincided (e.g. two SHA256-truncated 16-hex digests colliding, or a
+vertical reusing the same opaque string by accident) — ``verify`` now requires
+BOTH the plan_hash AND the kind to match. The signing secret comes ONLY from
 ``TOKEN_SIGNING_SECRET`` in the environment (fail-closed: absent/blank ->
 ``ConfigError``); it is never logged, never embedded in the token, never returned.
 
@@ -59,25 +65,31 @@ class HmacTokenService:
             raise ConfigError(f"Missing required environment variable: {_SECRET_ENV}")
         return secret.encode("utf-8")
 
-    def mint(self, plan_hash: str, ttl_s: int) -> str:
-        """Return a signed token binding ``plan_hash``, valid for ``ttl_s`` seconds."""
+    def mint(self, plan_hash: str, ttl_s: int, *, kind: str) -> str:
+        """Return a signed token binding ``plan_hash`` + ``kind``, valid for
+        ``ttl_s`` seconds. ``kind`` (required, keyword-only) is the id of the
+        vertical minting the token (post-review HARDENING — see module
+        docstring); every call site must pass its own."""
         exp = int(self._now()) + int(ttl_s)
         payload = json.dumps(
-            {"exp": exp, "plan_hash": plan_hash},
+            {"exp": exp, "plan_hash": plan_hash, "kind": kind},
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
         sig = hmac.new(self._secret(), payload, hashlib.sha256).digest()
         return f"{_b64url_encode(payload)}.{_b64url_encode(sig)}"
 
-    def verify(self, token: str, plan_hash: str) -> bool:
-        """True iff ``token`` is a valid, unexpired signature over ``plan_hash``.
+    def verify(self, token: str, plan_hash: str, *, kind: str) -> bool:
+        """True iff ``token`` is a valid, unexpired signature over ``plan_hash``
+        AND ``kind`` matches the SIGNED claim (post-review HARDENING: a token
+        minted for one vertical no longer verifies against another, even if the
+        opaque ``plan_hash`` string happened to coincide).
 
         Fail-closed on CONFIG: a missing/blank ``TOKEN_SIGNING_SECRET`` raises
         ``ConfigError`` (a deployment error must surface, not masquerade as an
         invalid token). Every TOKEN failure mode (bad shape, undecodable, forged
-        signature, wrong plan_hash, expired) returns ``False`` — never raises and
-        never leaks why.
+        signature, wrong plan_hash, wrong kind, expired) returns ``False`` —
+        never raises and never leaks why.
         """
         secret = self._secret()  # fail-closed BEFORE any token parsing
         if not isinstance(token, str) or token.count(".") != 1:
@@ -100,6 +112,8 @@ class HmacTokenService:
         if not isinstance(data, dict):
             return False
         if data.get("plan_hash") != plan_hash:
+            return False
+        if data.get("kind") != kind:
             return False
         try:
             exp = int(data["exp"])

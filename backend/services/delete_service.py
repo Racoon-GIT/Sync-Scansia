@@ -146,6 +146,13 @@ class DeleteConfirmationError(RuntimeError):
     """A required human gesture / second confirmation was missing or wrong."""
 
 
+class SingleDeleteNotOutletError(RuntimeError):
+    """HARDENING (post-review): the single-delete target does not resolve to an
+    OUTLET (collection membership OR title match) — refuse, fail-closed. The
+    single-delete escape hatch exists for a botched CREATE (which IS an outlet
+    duplicate); a mistyped/wrong GID must never delete an arbitrary product."""
+
+
 # =============================================================================
 # Injected audit sink (mocked in tests; the SQLite+GSheet impl arrives with M2)
 # =============================================================================
@@ -439,6 +446,36 @@ def _build_snapshot(transport: Any, product_gid: str) -> BeforeSnapshot:
 # =============================================================================
 
 
+def resolve_is_outlet(transport: Any, product_gid: str) -> bool:
+    """READ-ONLY. True iff ``product_gid`` is a member of the OUTLET collection
+    or its title matches the ``outlet`` substring — the SAME two-signal
+    predicate :func:`resolvers.outlet_resolver` applies by SKU
+    (``is_outlet_member OR title_is_outlet``), reused here directly on a GID:
+    the single-delete escape hatch never has a SKU, only an operator-typed
+    ``product_gid``. One :func:`ops.get_product_core` read; no mutation.
+    """
+    core = ops.get_product_core(transport, product_gid)
+    title = core.get("title") or ""
+    is_member = any(
+        c.get("id") == ops.OUTLET_COLLECTION_GID for c in (core.get("collections") or [])
+    )
+    title_is_outlet = "outlet" in title.casefold()
+    return is_member or title_is_outlet
+
+
+def require_single_delete_target_is_outlet(transport: Any, product_gid: str) -> None:
+    """Fail-closed HARDENING gate (post-review) for the single-delete escape
+    hatch: raises :class:`SingleDeleteNotOutletError` if ``product_gid`` does
+    NOT resolve as an outlet (see :func:`resolve_is_outlet`). Called BOTH
+    synchronously by the API endpoint (before any job/``product_delete`` is
+    reachable) AND, as belt-and-braces, from :func:`delete_single_apply` itself.
+    """
+    if not resolve_is_outlet(transport, product_gid):
+        raise SingleDeleteNotOutletError(
+            f"single-delete target does not resolve to an outlet: {product_gid}"
+        )
+
+
 def _require_gesture(human_gesture: Optional[str], count: int) -> None:
     """Human-gesture gate: the operator types the exact count OR ``CONFERMO``."""
     if human_gesture is None:
@@ -684,9 +721,13 @@ def delete_single_apply(
     Same mandatory-snapshot abort gate as the bulk path. The zero-stock predicate
     is deliberately NOT applied: a crashed CREATE may carry inherited non-Promo
     stock — that is exactly what this escape hatch removes. Human gesture: type
-    ``1`` or ``CONFERMO``.
+    ``1`` or ``CONFERMO``. HARDENING (post-review): ``product_gid`` must resolve
+    to an OUTLET (:func:`require_single_delete_target_is_outlet`) BEFORE the
+    snapshot is even built — a mistyped GID for an arbitrary non-outlet product
+    is refused, never deleted.
     """
     _require_gesture(human_gesture, 1)
+    require_single_delete_target_is_outlet(transport, product_gid)
     gid_rows = _sheet_gid_index(sheet)
     return _delete_one(
         transport, sheet, audit_sink, product_gid, gid_rows,
@@ -713,7 +754,7 @@ def deny_normalize(transport: Any, product_gid: str) -> int:
 
 
 __all__ = [
-    "PromoAnchorError", "DeleteConfirmationError",
+    "PromoAnchorError", "DeleteConfirmationError", "SingleDeleteNotOutletError",
     "CONFIRM_WORD", "DEFAULT_CLEANUP_THRESHOLD", "CLEANUP_HARD_CAP",
     "BUCKET_CANDIDATE", "BUCKET_REVIEW", "BUCKET_IN_STOCK",
     "STATUS_DELETED", "STATUS_ARCHIVED", "STATUS_SNAPSHOT_ABORTED",
@@ -723,5 +764,6 @@ __all__ = [
     "CandidateOutlet", "ReviewOutlet", "ZeroStockReport",
     "CleanupCandidate", "CleanupPlan", "DeleteOutcome", "CleanupReport",
     "zero_stock_candidates", "cleanup_preview", "cleanup_apply",
+    "resolve_is_outlet", "require_single_delete_target_is_outlet",
     "delete_single_apply", "deny_normalize",
 ]

@@ -440,7 +440,9 @@ def test_cleanup_verify_failed_on_drift(monkeypatch):
 def test_single_delete_ignores_predicate(monkeypatch):
     G = "gid://shopify/Product/S1"
     log: List[tuple] = []
-    OpsMock(monkeypatch, log=log, variants_by_gid={G: [_snap_variant()]})
+    OpsMock(monkeypatch, log=log, variants_by_gid={G: [_snap_variant()]},
+            core_by_gid={G: {"id": G, "title": "Sneaker X - Outlet", "handle": "h",
+                             "status": "DRAFT", "tags": [], "collections": []}})
     sheet, audit = FakeSheet(rows=[_row("SKU", G)]), FakeAudit(log=log)
     out = ds.delete_single_apply(object(), sheet, audit, G, human_gesture="CONFERMO")
     assert out.status == ds.STATUS_DELETED
@@ -456,6 +458,40 @@ def test_single_delete_requires_gesture(monkeypatch):
     with pytest.raises(ds.DeleteConfirmationError):
         ds.delete_single_apply(object(), sheet, audit, G, human_gesture="nope")
     assert not any(c[0] == "product_delete" for c in log)
+
+
+def test_single_delete_rejects_non_outlet_target(monkeypatch):
+    """HARDENING (post-review): a mistyped GID that resolves to a NON-outlet
+    product (no OUTLET collection membership, no ``*Outlet*`` title) must be
+    refused BEFORE any snapshot/product_delete — the escape hatch is for a
+    botched CREATE (an outlet duplicate), never an arbitrary product."""
+    G = "gid://shopify/Product/NOTOUTLET"
+    log: List[tuple] = []
+    OpsMock(monkeypatch, log=log, core_by_gid={G: {
+        "id": G, "title": "Air Max 90", "handle": "air-max-90", "status": "ACTIVE",
+        "tags": [], "collections": [],
+    }}, variants_by_gid={G: [_snap_variant()]})
+    sheet, audit = FakeSheet(), FakeAudit(log=log)
+    with pytest.raises(ds.SingleDeleteNotOutletError):
+        ds.delete_single_apply(object(), sheet, audit, G, human_gesture="CONFERMO")
+    assert not any(c[0] == "product_delete" for c in log)
+    assert audit.durable == []  # the gate fires BEFORE the snapshot is even built
+
+
+def test_single_delete_accepts_outlet_by_collection_membership(monkeypatch):
+    """The OUTLET-collection-membership signal alone (no outlet title) is
+    sufficient — mirrors resolvers.outlet_resolver's OR predicate."""
+    G = "gid://shopify/Product/MEMBERONLY"
+    log: List[tuple] = []
+    OpsMock(monkeypatch, log=log, core_by_gid={G: {
+        "id": G, "title": "Plain Title", "handle": "h", "status": "DRAFT", "tags": [],
+        "collections": [{"id": ops.OUTLET_COLLECTION_GID, "title": "OUTLET",
+                         "handle": "outlet", "smart": True}],
+    }}, variants_by_gid={G: [_snap_variant()]})
+    sheet, audit = FakeSheet(), FakeAudit(log=log)
+    out = ds.delete_single_apply(object(), sheet, audit, G, human_gesture="CONFERMO")
+    assert out.status == ds.STATUS_DELETED
+    assert ("product_delete", G) in log
 
 
 # ---------------------------------------------------------------------------

@@ -23,12 +23,14 @@ from backend.api.errors import (
     CODE_SHEET_IO_ERROR,
     CODE_SHOPIFY_TRANSPORT_ERROR,
     CODE_SHOPIFY_USER_ERROR,
+    CODE_SINGLE_DELETE_NOT_OUTLET,
     CODE_UNAUTHORIZED,
     map_exception,
 )
 from backend.auth.basic_auth import AuthError, AuthNotConfigured
 from backend.config import ConfigError
 from backend.gsheet.reader import CutoverNotDoneError, GSheetError, SheetIOError
+from backend.services.delete_service import SingleDeleteNotOutletError
 from backend.shopify.ops import ShopifyUserError
 from backend.shopify.transport import ShopifyTransportError
 
@@ -69,6 +71,11 @@ def test_map_config_error():
     err = map_exception(ConfigError("Missing required environment variable: SHOPIFY_STORE"))
     assert err.status_code == 503 and err.error_code == CODE_CONFIG_ERROR
     assert "SHOPIFY_STORE" not in err.message  # never echo the missing var name
+
+
+def test_map_single_delete_not_outlet_error():
+    err = map_exception(SingleDeleteNotOutletError("gid://shopify/Product/9 not an outlet"))
+    assert err.status_code == 409 and err.error_code == CODE_SINGLE_DELETE_NOT_OUTLET
 
 
 def test_map_auth_errors():

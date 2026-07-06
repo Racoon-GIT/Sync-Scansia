@@ -40,12 +40,16 @@ from fastapi.responses import JSONResponse
 
 from backend.api.errors import log_boundary, map_exception
 from backend.api.jobs import JobStore
+from backend.api.delete_outlet import build_delete_router
+from backend.api.prices import build_prices_router
+from backend.api.publish import build_publish_router
 from backend.api.read import build_read_router
 from backend.auth.basic_auth import AuthError, AuthNotConfigured
 from backend.config import ConfigError, ShopifyConfig, load_shopify_config
 from backend.gsheet import ScansiaSheet
 from backend.gsheet.reader import GSheetError
 from backend.persistence.gsheet_audit import GSheetAuditSink
+from backend.persistence.tokens import HmacTokenService
 from backend.shopify.ops import ShopifyUserError
 from backend.shopify.transport import ShopifyTransport, ShopifyTransportError
 
@@ -87,6 +91,7 @@ def create_app(
     executor: Optional[Any] = None,
     job_store: Optional[JobStore] = None,
     promo_location_id: Optional[str] = None,
+    token_service: Optional[Any] = None,
 ) -> FastAPI:
     """Build the app. All collaborators are injectable (tests pass fakes).
 
@@ -135,6 +140,10 @@ def create_app(
     app.state.executor = executor
     app.state.job_store = job_store or JobStore()
     app.state.promo_location_id = promo_location_id
+    # Stateless HMAC confirm-token service (reads TOKEN_SIGNING_SECRET lazily,
+    # fail-closed, at mint/verify time — never at import). A single instance is
+    # safe: it holds no per-request state.
+    app.state.token_service = token_service or HmacTokenService()
 
     _register_error_handlers(app)
 
@@ -144,6 +153,9 @@ def create_app(
         return {"status": "ok"}
 
     app.include_router(build_read_router())
+    app.include_router(build_publish_router())
+    app.include_router(build_delete_router())
+    app.include_router(build_prices_router())
     return app
 
 
