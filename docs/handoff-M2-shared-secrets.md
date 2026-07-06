@@ -1,10 +1,10 @@
-# Handoff → shared-secrets — dedicated Google SA + Shopify token enumeration (unblocks M2)
+# Handoff → SERVER — Scansia Manager secrets: RESOLVED (reuse existing)
 
-Scansia Manager = new single-origin FastAPI web service replacing the 3 Sync-Scansia cron jobs (already suspended). Branch `feat/scansia-manager`. Library layer complete (175 tests); this handoff unblocks deploy/integration.
+Superseded by SERVER's own discovery (2026-07-06) + the switch to the house auth pattern (HTTP Basic Auth, no network perimeter). **Nothing to provision, nothing to rotate.**
 
-## Requests
+- **Shopify token**: reuse the shared **"Management esterno"** token — live-verified (REST + GraphQL) to hold all 8 required scopes, incl. `read/write_publications`. **No dedicated custom app. No rotation.** Real consumers of this shared token = NoSluts, APP-Shopify_Order_Cleaner, STOCK_Manager, TAX-MANAGER, Price_Bulk-UPDT (5) — coordinate before any future change (registry: `../docs/shared-secrets.md`).
+- **Google SA**: reuse the **Sync-Scansia** Service Account already scoped to the sheet. A dedicated per-sheet SA is optional, only if strict containment is later wanted (not required for M2).
 
-- [ ] **Dedicated Google Service Account for the `Scarpe_in_Scansia` sheet only**: the `spreadsheets` OAuth scope is all-sheets → per-SA sharing is the only containment. Provision a new SA, share ONLY that sheet with it, set `GOOGLE_CREDENTIALS_JSON` on Render. Note: may require Google Workspace admin rights.
-- [ ] **Shopify token**: after cutover to the dedicated custom app, remove the shared "Management esterno" token from THIS service's env ONLY. **Blocking prereq**: first enumerate (via `../docs/shared-secrets.md`) that this is the only consumer of the shared token, or coordinate with the other consumers. **DO NOT rotate** the shared token without the shared-secrets owner.
+No dedicated-SA / dedicated-app / rotation work remains. This row can be **closed** once the env vars are set on the Render service (see `handoff-M2-server.md`).
 
-Blocks: M2
+Blocks: nothing (folded into the server deploy).
