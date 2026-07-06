@@ -44,6 +44,7 @@ from backend.api.delete_outlet import build_delete_router
 from backend.api.prices import build_prices_router
 from backend.api.publish import build_publish_router
 from backend.api.read import build_read_router
+from backend.api.ui import build_ui_router
 from backend.auth.basic_auth import AuthError, AuthNotConfigured
 from backend.config import ConfigError, ShopifyConfig, load_shopify_config
 from backend.gsheet import ScansiaSheet
@@ -156,6 +157,7 @@ def create_app(
     app.include_router(build_publish_router())
     app.include_router(build_delete_router())
     app.include_router(build_prices_router())
+    app.include_router(build_ui_router())
     return app
 
 

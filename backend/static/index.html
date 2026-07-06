@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scansia Manager</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body data-app="scansia-manager">
+<header class="topbar">
+  <h1>Scansia Manager</h1>
+  <nav class="tabs" id="tabs">
+    <button class="tab-btn active" data-tab="scansia">Scansia</button>
+    <button class="tab-btn" data-tab="publish">Publish</button>
+    <button class="tab-btn" data-tab="prices">Prezzi</button>
+    <button class="tab-btn" data-tab="delete">Delete</button>
+    <button class="tab-btn" data-tab="audit">Audit</button>
+  </nav>
+</header>
+
+<main>
+
+  <!-- ============================== SCANSIA ============================== -->
+  <section id="tab-scansia" class="tab-panel active">
+    <div class="toolbar">
+      <button id="btn-scansia-refresh">Aggiorna righe</button>
+      <button id="btn-inventory-run">Aggiorna inventario (join live)</button>
+      <span id="inventory-status" class="status-text"></span>
+    </div>
+    <table class="data-table" id="scansia-table">
+      <thead>
+        <tr>
+          <th>SKU</th><th>Taglia</th><th>Qta</th><th>Online</th>
+          <th>Prezzo High</th><th>Prezzo Outlet</th><th>Sconto</th>
+          <th>Riconciliata</th><th>Anomalie</th><th>Inventario live</th>
+        </tr>
+      </thead>
+      <tbody id="scansia-tbody"></tbody>
+    </table>
+  </section>
+
+  <!-- ============================== PUBLISH ============================== -->
+  <section id="tab-publish" class="tab-panel">
+    <div class="toolbar">
+      <button id="btn-publish-preview">Calcola piano di pubblicazione</button>
+      <span id="publish-status" class="status-text"></span>
+    </div>
+    <div id="publish-plan-panel" class="plan-panel hidden">
+      <h3>Piano proposto</h3>
+      <div id="publish-anomalies" class="anomalies"></div>
+      <table class="data-table">
+        <thead>
+          <tr><th>SKU</th><th>Branch</th><th>Pubblicabile</th><th>Motivo</th>
+              <th>Prezzo</th><th>Compare-at</th><th>Warning</th></tr>
+        </thead>
+        <tbody id="publish-plan-tbody"></tbody>
+      </table>
+      <div class="confirm-row">
+        <button id="btn-publish-confirm" class="btn-confirm">Conferma e applica</button>
+        <span id="publish-apply-status" class="status-text"></span>
+      </div>
+    </div>
+    <div id="publish-outcome-panel" class="plan-panel hidden">
+      <h3>Esito</h3>
+      <table class="data-table">
+        <thead><tr><th>SKU</th><th>Branch</th><th>Stato</th><th>Target</th><th>Warning</th></tr></thead>
+        <tbody id="publish-outcome-tbody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================== PREZZI ============================== -->
+  <section id="tab-prices" class="tab-panel">
+    <form id="prices-form" class="form-panel">
+      <div class="form-row">
+        <label>Modalità
+          <select id="prices-mode">
+            <option value="percent">percent — sconto % per SKU</option>
+            <option value="direct">direct — prezzo esplicito per SKU</option>
+            <option value="bulk">bulk — regole + override</option>
+          </select>
+        </label>
+        <label><input type="checkbox" id="prices-row-override"> row_override</label>
+        <label><input type="checkbox" id="prices-status-override"> status_override</label>
+      </div>
+
+      <div class="form-row mode-percent">
+        <label>SKU=percentuale (uno per riga, frazione es. 0.30)
+          <textarea id="percent-lines" rows="4" placeholder="SKU123=0.30"></textarea>
+        </label>
+      </div>
+
+      <div class="form-row mode-direct hidden">
+        <label>SKU=prezzo (uno per riga)
+          <textarea id="direct-lines" rows="4" placeholder="SKU123=49.90"></textarea>
+        </label>
+      </div>
+
+      <div class="form-row mode-bulk hidden">
+        <label>Regole bulk (JSON array, es. [{"percent":0.2,"scope":{"brand":["Nike"]}}])
+          <textarea id="bulk-rules-json" rows="3" placeholder="[]"></textarea>
+        </label>
+        <label>Override per SKU (JSON, es. {"SKU123":0.15})
+          <textarea id="bulk-override-json" rows="2" placeholder="{}"></textarea>
+        </label>
+      </div>
+
+      <div class="toolbar">
+        <button type="submit" id="btn-prices-preview">Calcola piano prezzi</button>
+        <span id="prices-status" class="status-text"></span>
+      </div>
+    </form>
+
+    <div id="prices-plan-panel" class="plan-panel hidden">
+      <h3>Piano proposto</h3>
+      <div id="prices-anomalies" class="anomalies"></div>
+      <table class="data-table">
+        <thead>
+          <tr><th>SKU</th><th>Stato</th><th>Azionabile</th><th>Prezzo</th><th>Compare-at</th>
+              <th>Prezzo sheet</th><th>Prezzo live</th><th>Warning</th></tr>
+        </thead>
+        <tbody id="prices-plan-tbody"></tbody>
+      </table>
+      <div class="confirm-row">
+        <button id="btn-prices-confirm" class="btn-confirm">Conferma e applica</button>
+        <span id="prices-apply-status" class="status-text"></span>
+      </div>
+    </div>
+    <div id="prices-outcome-panel" class="plan-panel hidden">
+      <h3>Esito applicazione</h3>
+      <p id="prices-intent-id"></p>
+      <table class="data-table">
+        <thead><tr><th>SKU</th><th>Product</th><th>Stato</th><th>Warning</th></tr></thead>
+        <tbody id="prices-outcome-tbody"></tbody>
+      </table>
+    </div>
+
+    <hr>
+
+    <div class="form-panel">
+      <h3>Revert prezzi</h3>
+      <div class="form-row">
+        <label>Intent ID <input type="text" id="revert-intent-id" placeholder="intent id da /audit"></label>
+        <label>Digita CONFERMO <input type="text" id="revert-confirm-word"></label>
+        <button id="btn-prices-revert">Revert</button>
+        <span id="revert-status" class="status-text"></span>
+      </div>
+      <table class="data-table hidden" id="revert-outcome-table">
+        <thead><tr><th>SKU</th><th>Product</th><th>Stato</th><th>Warning</th></tr></thead>
+        <tbody id="revert-outcome-tbody"></tbody>
+      </table>
+    </div>
+
+    <hr>
+
+    <div class="form-panel">
+      <h3>Discharge debt (outlet con prezzi non validi)</h3>
+      <button id="btn-discharge-debt">Calcola discharge-debt</button>
+      <span id="discharge-status" class="status-text"></span>
+      <p id="discharge-result"></p>
+    </div>
+  </section>
+
+  <!-- ============================== DELETE ============================== -->
+  <section id="tab-delete" class="tab-panel">
+    <div class="form-panel">
+      <h3>Zero-stock (ricognizione)</h3>
+      <button id="btn-zero-stock">Calcola zero-stock</button>
+      <span id="zero-stock-status" class="status-text"></span>
+      <table class="data-table hidden" id="zero-stock-table">
+        <thead><tr><th>Product</th><th>Titolo</th><th>Stato</th><th>Varianti</th></tr></thead>
+        <tbody id="zero-stock-tbody"></tbody>
+      </table>
+      <h4>Da rivedere (non candidabili automaticamente)</h4>
+      <table class="data-table hidden" id="zero-stock-review-table">
+        <thead><tr><th>Product</th><th>Titolo</th><th>Stato</th><th>Motivi</th></tr></thead>
+        <tbody id="zero-stock-review-tbody"></tbody>
+      </table>
+    </div>
+
+    <hr>
+
+    <div class="form-panel danger-zone">
+      <h3>Cleanup outlet — AZIONE IRREVERSIBILE</h3>
+      <p class="warning-banner">Elimina definitivamente i prodotti outlet candidati. Non è possibile annullare.</p>
+      <div class="form-row">
+        <label>Soglia (threshold) <input type="number" id="cleanup-threshold" value="25"></label>
+        <label><input type="checkbox" id="cleanup-archive-first"> archive_first</label>
+        <button id="btn-cleanup-preview">Calcola piano cleanup</button>
+        <span id="cleanup-preview-status" class="status-text"></span>
+      </div>
+      <div id="cleanup-plan-panel" class="plan-panel hidden">
+        <p>Candidati: <strong id="cleanup-count"></strong>
+           <span id="cleanup-second-confirm-flag"></span></p>
+        <table class="data-table">
+          <thead><tr><th>Product</th><th>Titolo</th><th>Stato</th></tr></thead>
+          <tbody id="cleanup-candidates-tbody"></tbody>
+        </table>
+        <h4>Da rivedere</h4>
+        <table class="data-table">
+          <thead><tr><th>Product</th><th>Titolo</th><th>Stato</th><th>Motivi</th></tr></thead>
+          <tbody id="cleanup-review-tbody"></tbody>
+        </table>
+        <div class="gesture-panel">
+          <p class="warning-banner">Gesto umano richiesto: digita <code>CONFERMO</code> e ridigita il numero esatto di candidati mostrato sopra.</p>
+          <label>Digita CONFERMO <input type="text" id="cleanup-confirm-word"></label>
+          <label>Ridigita il conteggio <input type="number" id="cleanup-confirm-count"></label>
+          <label id="cleanup-second-confirm-row" class="hidden">
+            <input type="checkbox" id="cleanup-second-confirm"> Confermo di aver rivisto la soglia superata (second_confirm)
+          </label>
+          <button id="btn-cleanup-apply" class="btn-danger">Elimina definitivamente</button>
+          <span id="cleanup-apply-status" class="status-text"></span>
+        </div>
+      </div>
+      <div id="cleanup-outcome-panel" class="plan-panel hidden">
+        <h4>Esito cleanup</h4>
+        <table class="data-table">
+          <thead><tr><th>Product</th><th>Stato</th><th>Deleted ID</th><th>Warning</th></tr></thead>
+          <tbody id="cleanup-outcome-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <hr>
+
+    <div class="form-panel danger-zone">
+      <h3>Delete singolo prodotto — AZIONE IRREVERSIBILE</h3>
+      <p class="warning-banner">Da usare solo per una CREATE fallita/duplicata. Il target deve risolvere a un prodotto outlet.</p>
+      <div class="form-row">
+        <label>Product GID <input type="text" id="single-delete-gid" placeholder="gid://shopify/Product/123"></label>
+        <label>Digita CONFERMO <input type="text" id="single-delete-confirm-word"></label>
+        <button id="btn-single-delete" class="btn-danger">Elimina definitivamente (1 prodotto)</button>
+        <span id="single-delete-status" class="status-text"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== AUDIT ============================== -->
+  <section id="tab-audit" class="tab-panel">
+    <div class="toolbar">
+      <label>Limite <input type="number" id="audit-limit" value="50"></label>
+      <button id="btn-audit-refresh">Aggiorna</button>
+    </div>
+    <table class="data-table" id="audit-table">
+      <thead></thead>
+      <tbody id="audit-tbody"></tbody>
+    </table>
+  </section>
+
+</main>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
