@@ -607,6 +607,8 @@ INVENTORY_LEVELS_PAGE_SIZE = 10
 VARIANT_INVENTORY_PAGE_SIZE = 250
 # Single-page cap for the publications enumeration (a store has a handful).
 PUBLICATIONS_PAGE_SIZE = 50
+# Collection-memberships page size for the M5 delete snapshot read.
+PRODUCT_COLLECTIONS_PAGE_SIZE = 100
 
 
 # -----------------------------------------------------------------------------
@@ -926,3 +928,92 @@ def enumerate_outlet_products(
             break
         after = page["endCursor"]
     return results
+
+
+# -----------------------------------------------------------------------------
+# 5) Product CORE read (title/handle/status/tags + collection memberships)
+# -----------------------------------------------------------------------------
+#
+# NET-NEW for the M5 delete before_snapshot: the reconstructive snapshot needs
+# five fields no existing read op carries — title/handle/status/tags and the set
+# of collections the product belongs to. `enumerate_outlet_products` goes the
+# INVERSE direction (collection -> {id,title,status}); there is no product-GID ->
+# {tags,handle,collections} read anywhere. One product-query covers all five in a
+# single call (all fields stable on Admin 2025-07). READ-ONLY, additive: no
+# existing op changes.
+
+_GET_PRODUCT_CORE = """
+query($id: ID!, $collFirst: Int!, $collAfter: String) {
+  product(id: $id) {
+    id
+    title
+    handle
+    status
+    tags
+    collections(first: $collFirst, after: $collAfter) {
+      pageInfo { hasNextPage endCursor }
+      nodes { id title handle ruleSet { appliedDisjunctively } }
+    }
+  }
+}"""
+
+
+def get_product_core(transport: ShopifyTransport, product_gid: str) -> Dict[str, Any]:
+    """Read a product's core scalars + collection memberships (M5 delete snapshot).
+
+    Returns::
+
+        {
+          "id": <GID>, "title": str|None, "handle": str|None,
+          "status": "ACTIVE"|"DRAFT"|"ARCHIVED"|None,
+          "tags": [str, ...],
+          "collections": [
+            {"id","title","handle","smart": bool}, ...   # smart == has a ruleSet
+          ],
+        }
+
+    ``smart`` distinguishes rule-based (SMART) collections — OUTLET/SALDI re-attach
+    themselves once tag/price are recreated — from MANUAL ones (the only memberships
+    a rebuild must re-assign by hand); it is derived from ``ruleSet`` being non-null.
+    ``collections`` is paginated (``pageInfo``/``endCursor``) for completeness. A
+    null ``product`` (not found) RAISES, matching the other read ops.
+    """
+    collections: List[Dict[str, Any]] = []
+    core: Optional[Dict[str, Any]] = None
+    after: Optional[str] = None
+    while True:
+        data = transport.graphql(
+            _GET_PRODUCT_CORE,
+            {
+                "id": product_gid,
+                "collFirst": PRODUCT_COLLECTIONS_PAGE_SIZE,
+                "collAfter": after,
+            },
+        )
+        product = data.get("product")
+        if product is None:
+            raise RuntimeError(f"Product not found for GID: {product_gid}")
+        if core is None:
+            core = {
+                "id": product["id"],
+                "title": product.get("title"),
+                "handle": product.get("handle"),
+                "status": product.get("status"),
+                "tags": list(product.get("tags") or []),
+            }
+        conn = product["collections"]
+        for n in conn["nodes"]:
+            collections.append(
+                {
+                    "id": n["id"],
+                    "title": n.get("title"),
+                    "handle": n.get("handle"),
+                    "smart": n.get("ruleSet") is not None,
+                }
+            )
+        page = conn["pageInfo"]
+        if not page["hasNextPage"]:
+            break
+        after = page["endCursor"]
+    core["collections"] = collections
+    return core
