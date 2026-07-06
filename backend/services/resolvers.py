@@ -176,6 +176,10 @@ def _build_result(
     NOT ``len(matches) == 0`` — an empty bucket where exact matches exist but all
     landed in the *other* bucket (e.g. source_resolver on a SKU that only has an
     outlet) is a legitimate "none here", not an anomaly.
+
+    The result also carries a structured ``truncated`` bool (mirroring the
+    ``TRUNCATED`` warning text) so a caller can fold it into its own freshness
+    flag instead of parsing the human-readable ``warning`` string.
     """
     matches = [c for c in candidates if predicate(c)]
     warnings: List[str] = []
@@ -211,7 +215,7 @@ def _build_result(
             )
 
     warning: Optional[str] = "; ".join(warnings) if warnings else None
-    return {"matches": matches, "warning": warning}
+    return {"matches": matches, "warning": warning, "truncated": bool(meta["truncated"])}
 
 
 def outlet_resolver(transport: ShopifyTransport, sku: str) -> Dict[str, Any]:
