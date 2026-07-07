@@ -9,14 +9,14 @@ Scansia Manager = new single-origin FastAPI web service replacing the 3 Sync-Sca
 
 ## Requests (much reduced vs the original CF Access plan)
 
-> **STATUS: READY NOW (2026-07-07).** The F1 web layer is built and tested (branch `feat/scansia-manager`, tip `9049c13`, 344 tests in a venv with fastapi). This handoff is fully actionable — nothing left on the SVILUPPO side before deploy.
+> **STATUS: PUSHED & READY (2026-07-07).** F1 web layer built and tested (344 tests in a venv). **Branch `feat/scansia-manager` (tip `2184d03`) is now pushed to GitHub** (`Racoon-GIT/Sync-Scansia`) — Render deploys from GitHub, so this was the real prerequisite (the earlier "READY NOW" note omitted it). Nothing left on the SVILUPPO side before deploy.
 
 - [ ] **Hosting**: Render **web service on the FREE tier** (same as the other 7 Render services). No persistent disk, no paid plan. Deploy is **dashboard-driven** (confirmed) → the M3 cron decommission is a manual dashboard delete of the `Sync-Scansia` cron. Deploy config: `buildCommand: pip install -r requirements.txt` · `startCommand: uvicorn backend.app:app --workers 1 --host 0.0.0.0 --port $PORT` · `healthCheckPath: /health` (ungated) · Python 3.12 (runtime.txt).
 - [ ] **Spin-down / keepalive**: the free tier sleeps when idle. Confirm whether to add this service to the existing **Scheduler keepalive layer** (infra §5-bis) or accept the ~30–60s cold start (fine for a 2×/year tool).
 - [ ] **Secrets — REUSE existing (per SERVER's own discovery), nothing to provision**:
   - Shopify: **reuse the shared "Management esterno" token** — already holds all required scopes (8/8, live-verified, incl. `read/write_publications`). **No dedicated custom app. No rotation.**
   - Google: **reuse the Sync-Scansia Service Account** (dedicated SA only if strict per-sheet containment is later wanted — not required for M2).
-- [ ] **Env vars on Render** (secrets `sync: false`, set in dashboard, NEVER inline in the committed yaml): `SHOPIFY_ADMIN_TOKEN`, `GOOGLE_CREDENTIALS_JSON`, `GSPREAD_SHEET_ID`, `PROMO_LOCATION_ID`, `SHOPIFY_STORE`, `APP_PASSWORD` (Basic Auth), `TOKEN_SIGNING_SECRET` (signed confirm-token); non-secret `SHOPIFY_API_VERSION=2025-07`.
+- [ ] **Env vars on Render** — CORRECTED/COMPLETE list (verified against the code that actually reads them). Secrets (`sync: false`, dashboard, NEVER inline): `SHOPIFY_ADMIN_TOKEN`, `GOOGLE_CREDENTIALS_JSON` (inline SA JSON — OR `GOOGLE_APPLICATION_CREDENTIALS` = file path; one of the two), `PROMO_LOCATION_ID`, `SHOPIFY_STORE`, `APP_PASSWORD` (Basic Auth), `TOKEN_SIGNING_SECRET` (signed confirm-token). Config (not secret, dashboard): `GSPREAD_SHEET_ID`, **`GSPREAD_WORKSHEET_TITLE`** (the sheet TAB name — REQUIRED, was missing from the earlier list; the app raises ConfigError without it), `SHOPIFY_API_VERSION=2025-07`. All required except the API version (defaults to 2025-07) and the two Google-cred alternatives (set exactly one).
 - [ ] **Deploy gate**: the first push that arms the live web service requires **explicit owner confirmation** (Render auto-deploy on push).
 
 ## Dropped from the original brief (do NOT provision)
