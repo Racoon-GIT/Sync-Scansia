@@ -53,7 +53,7 @@ Addressing is **always by normalized header NAME** (`_norm_key` lowercases/trims
 
 ## 3. What Make must do / guarantee
 
-- [x] **Append by HEADER NAME, not fixed column index.** **CONFIRMED FALSE (2026-07-08)** — Make's
+- [x] **Append by HEADER NAME, not fixed column index.** **⚠ SUPERSEDED by §10 (2026-07-08 correction): the module is `includesHeaders: true` = already header-name/reorder-robust; the reading below misread the mapper's internal ordinal slots as positional addressing.** ~~CONFIRMED FALSE (2026-07-08)~~ — Make's
   `google-sheets:addRow` (scenario `2215567`, module `15`) maps `values` by literal numeric column index
   (`"0","1","2"…`), not header name. Today's indices happen to match the live header row, but a column
   insert/reorder in the sheet would silently misalign it with **no way for the tool to detect the drift**.
@@ -136,7 +136,7 @@ Live header row (confirmed with Ale, 2026-07-08):
   - Nuovo Ordine" (the load-bearing order scenario, polling every 900s) also writes to this sheet for
   outlet-matched order lines. Full mechanics in §9 — this is a new, previously-unknown risk surface, not
   a simple confirmation.
-- [x] **Q3 — Column-position / header-vs-index agreement.** **Fixed index, confirmed** — Make's `addRow`
+- [x] **Q3 — Column-position / header-vs-index agreement.** **⚠ SUPERSEDED by §10 (2026-07-08): actually `includesHeaders: true` = header-name stable-id, reorder-robust.** ~~Fixed index, confirmed~~ — Make's `addRow`
   (scenario `2215567`, module `15`) writes `values` keyed `"0".."12"` (skipping 9, 10), matched against
   the live header above. Today the indices happen to line up correctly (e.g. index 7 = "Prezzo High" ✓,
   index 16 = "Product_Id" ✓) — but this is **incidental alignment, not an enforced contract**: nothing
@@ -209,15 +209,15 @@ logic to also use `row_uuid`, which is a Make-scenario change, not a tool change
 
 ## 10. SVILUPPO analysis & resolution (2026-07-08)
 
-Reviewed the `make-operator` findings against the tool code. Two of the three concerns are already neutralized in code; one genuine decision remains for Ale, plus one business question.
+Reviewed the `make-operator` findings against the tool code, then a 2nd make-operator pass re-inspected the Make module schema. **All three concerns resolve to "no Make change needed"**; one business question remains for Ale.
 
 **§9 second-writer race — NEUTRALIZED by a verified tool invariant.** The tool performs **zero row operations** on the sheet: a grep of `backend/gsheet/` + `backend/services/` shows no `insert_row` / `delete_row` / `append_row` / `sort` / `deleteDimension` — every mutation is a single-cell `update_cell`, plus columns appended to the RIGHT (`_ensure_columns`). **Row numbers are therefore stable under all tool operations**, so `678434`'s row-number-based `updateRow` cannot be broken by the tool shifting rows. Reinforcing this: (a) the concurrent poller `678434` writes **disjoint columns** — `Qta`(5), `online`(6), `Ordine in uscita`(13), `Vendute il`(14) — vs the tool's `Product_Id`(16), control cols (18+), price (8/9); per-cell `update_cell` writes are independent; (b) the tool **never derives stock from `Qta`**(5), the only cell `678434` decrements that could matter; (c) `2215567` only *appends* rows at the bottom → no existing row-number shift, no collision with the tool's existing-row cell writes. **Residual**: this rests on the invariant *"the tool never inserts/deletes/reorders sheet rows"* — it must be preserved (a future row-deleting feature would reintroduce the race). Recorded as load-bearing. → **No active race; no Ale decision needed beyond keeping the invariant.**
 
 **`online` reuse — ALREADY handled in code.** `writer.mark_deleted` (`writer.py:153-157`, guard **CI-6**) writes a **parameterized** field, explicitly NOT hardcoded `online` — *"if Make reads the online column, callers pass a tool-private field."* So the make-operator verdict (leave `online` alone — it's a live legacy flag driven by BOTH Make writers) needs only that delete-callers pass **`_scansia_status`**, not a redesign. → **Decision: adopt `_scansia_status=deleted` for delete write-back** (tool creates it to the right; no Make impact; confirm the name with Ale).
 
-**GENUINE OPEN DECISION for Ale — fixed-index append (Q3).** `2215567` appends by numeric index, not header name. Adding the tool's columns at idx 18+ is safe today (doesn't shift idx 0-12) → **not blocking now**. The risk is a **future column insert/reorder left of idx 18** silently misaligning Make, undetectable from the tool side. Options, most-robust first:
-1. **(recommended) Switch `2215567`'s `addRow` to map by header name** — small Make-scenario change (make-operator can do it), removes the whole bug class.
-2. Accept fixed-index + a documented *"never insert/reorder columns in Scarpe_in_Scansia"* rule + an optional **tool-side startup assertion** that known columns sit at expected indices (5=`Qta`, 6=`online`, 16=`Product_Id`) → the tool detects drift and alerts (defense-in-depth for a Make-side fragility).
+**~~GENUINE OPEN DECISION — fixed-index append~~ RESOLVED: this was a MISREAD (corrected 2026-07-08, 2nd make-operator pass — SUPERSEDES §3 item 1, §6, §7 Q3).** `2215567`'s `addRow` (module `15`) has **`includesHeaders: true`** = header-name **stable-id** addressing per Make's documented contract (mappings survive column add / remove / reorder; break **only** on header **rename**). The blueprint's ordinal keys (`"0".."12"`) are the mapper's internal slots, NOT positional addressing — Make's addRow schema *only* accepts ordinal keys, so "map by header name" is not a separate representable mode: `includesHeaders: Yes` **is** that mode and it is already on (confirmed across ~48 google-sheets modules in the account — none key by name; none can). **→ Nothing to switch, no Make change, no Ale decision here.** Values `2215567` writes today: BRAND(A)…Ordine in entrata(M), skipping Prezzo Outlet(J) & Sconto(K); `online="NO"`, `Qta=1`.
+- **Residual (narrow):** the stable-id breaks only if a header is **renamed** → operational rule *"don't rename columns in Scarpe_in_Scansia"* (add / reorder are safe). One community-reported edge case exists (mid-sheet insert with a manually-fixed header range → buffer-column workaround) — low probability, worth watching on this live sheet.
+- Optional defense-in-depth: a tool-side startup assertion that known columns (`Qta`, `online`, `Product_Id`) still resolve by name.
 
 **BUSINESS QUESTION for Ale (not Make-technical) — "Prezzo Outlet"(9) is populated by neither Make scenario.** `2215567` writes current price to `Prezzo`(8). The pricing module reads `prezzo_outlet`(9) → variant `price`. If idx 9 is unpopulated, pricing "repair-from-sheet" (modalità 2) has no source. Shopify prices are already sane (discharge-debt=0), so the store side is fine — but **who fills "Prezzo Outlet" on the sheet** (manual / old fix_prices / nobody)? Determines whether the sheet is a valid price source or the pricing GUI must write it fresh.
 
