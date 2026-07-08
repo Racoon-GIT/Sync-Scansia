@@ -6,6 +6,13 @@ Scansia Manager = new single-origin FastAPI web service replacing the 3 Sync-Sca
 
 > ⛔ **BLOCKING M3.** M3 (publish-live) must not ship until this contract is settled AND the one-time cutover backfill has run. **Without the backfill, the first publish re-inflates the stock of every already-published outlet** — a stock-corruption incident (phantom double stock → oversellable pairs). The schema-position + header-vs-index agreement (§7) is an explicit M3 gate.
 
+> **Verified 2026-07-08** (`make-operator`, live Make REST API — org "My Lab" / team "My Team", zone
+> `eu1.make.com`). No external "Make owner" to ask — it's Racoon's own account, inspected directly:
+> scenario blueprints for `2215567` ("TRELLO - Rientrate", the return-append) and `678434` ("Shopify -
+> Nuovo Ordine") pulled and read module-by-module; live sheet header row confirmed with Ale. All 5 open
+> questions in §7 resolved with evidence. **One net-new, previously-unknown risk found: a second
+> concurrent sheet-writer — see §9.**
+
 ---
 
 ## 1. Context — the return-signal model
@@ -46,9 +53,17 @@ Addressing is **always by normalized header NAME** (`_norm_key` lowercases/trims
 
 ## 3. What Make must do / guarantee
 
-- [ ] **Append by HEADER NAME, not fixed column index.** Fixed-position appends silently misalign the moment any column is inserted/moved. **Must be explicitly confirmed with the Make owner** (load-bearing — see §7).
-- [ ] **Accept that `row_uuid` and `reconciled` are pinned to the RIGHT** of Make's append range (safe default) so their addition cannot shift any Make write target.
-- [ ] **Return-append is Make's ONLY write to the sheet.** The append ⇄ tool write-back race lives **outside** the tool's intra-process mutex (a file/app lock does not reach Make's host); the `row_uuid` + `reconciled` design is what makes concurrent Make-append vs tool-write safe, and only if Make writes nowhere else.
+- [x] **Append by HEADER NAME, not fixed column index.** **CONFIRMED FALSE (2026-07-08)** — Make's
+  `google-sheets:addRow` (scenario `2215567`, module `15`) maps `values` by literal numeric column index
+  (`"0","1","2"…`), not header name. Today's indices happen to match the live header row, but a column
+  insert/reorder in the sheet would silently misalign it with **no way for the tool to detect the drift**.
+  Decision needed from Ale: either edit the Make scenario to append by header name (Make-side change), or
+  accept fixed-index as a standing operational risk to monitor. See §7 Q3 and §9.
+- [ ] **Accept that `row_uuid` and `reconciled` are pinned to the RIGHT** of Make's append range (safe default) so their addition cannot shift any Make write target. **Confirmed safe** — neither Make writer (`2215567` nor `678434`) touches past column index 14 ("Vendute il"); new tool columns from index 18+ (past the existing "Check", index 17) are untouched by Make.
+- [x] **Return-append is Make's ONLY write to the sheet.** **CONFIRMED FALSE (2026-07-08)** — a second
+  writer exists: scenario `678434` "Shopify - Nuovo Ordine" also writes to this sheet for outlet-matched
+  order lines (row-number-based `updateRow`, no CAS). Full detail in §9 — this is a new, load-bearing
+  finding, not just an unconfirmed assumption.
 - [ ] **Never write/overwrite the tool-owned columns** `row_uuid` (tool writes it on first read) and `reconciled` (tool writes it after applying the delta).
 - [ ] **Keep appending one row per physical return; never collapse/dedupe `(SKU,Size)` duplicates** — each duplicate is a distinct legitimate return the tool applies exactly once.
 - [ ] **Never write the tool's internal write-back columns** — `Product_Id` / col Q (published outlet GID) and the delete/status write-back column are tool-private.
@@ -84,24 +99,67 @@ Addressing is **always by normalized header NAME** (`_norm_key` lowercases/trims
 
 ## 6. Acceptance / DoD
 
-- [ ] Make confirmed to **append by header name** (not fixed index) — §7 open Q resolved.
-- [ ] Make confirmed that **return-append is its ONLY sheet write** (or all other writes enumerated and reconciled with §7).
-- [ ] `row_uuid` / `reconciled` positions agreed with the Make owner, pinned to the RIGHT of the append range.
+- [x] Make confirmed to **append by header name** (not fixed index) — §7 Q3 resolved: **it's fixed
+  index, not header name**. Ale to decide: fix the Make scenario, or accept + monitor the risk.
+- [x] Make confirmed that **return-append is its ONLY sheet write** — §7 Q2 resolved: **it is not**.
+  `678434` also writes (§9). Needs a sequencing decision before M3, not just a reconciled assumption.
+- [ ] `row_uuid` / `reconciled` positions — **no Ale action needed**: confirmed safe at index 18+, both
+  Make writers stay within index 0-14.
 - [ ] `backfill_cutover()` executed once on the live sheet; `BackfillReport.rows_stamped` matches the historical row count, `already_done` false on first run / true on re-run.
 - [ ] **Cutover DoD**: first post-cutover run applies **zero** Promo stock delta across all existing outlets.
 - [ ] A post-cutover Make append of `(SKU, Size, qty>0)` produces exactly `+qty` on the Promo location once, then flips that row's `reconciled` to `true`; re-running the flow re-adds nothing.
 - [ ] A duplicate `(SKU, Size)` append is summed (not rejected) and both `row_uuid`s end reconciled.
-- [ ] `online`-column read question (§7) resolved before any `online=NO` delete write-back is enabled.
+- [x] `online`-column read question (§7) resolved: `online` is the **legacy stock-availability flag**
+  driven by both Make writers (NO on append, NO again on sellout) — **never** reuse it for delete
+  write-back; use a tool-private column (`_scansia_status`) as already scoped as the fallback option.
+- [ ] **NEW**: sequencing decision on the second writer (`678434`, §9) — row-number-based, no CAS, races
+  against the tool's own row mutations. Needs Ale's call before M3 go-live.
+- [ ] **NEW**: "Prezzo Outlet" (column index 9) is written by **neither** inspected Make scenario — unclear
+  who populates it, if anyone. Ask Ale; not a Make-technical question.
 
 ---
 
-## 7. Open questions to resolve with the Make owner
+## 7. Open questions — RESOLVED 2026-07-08 (verified live via Make REST API, `make-operator`)
 
-- [ ] **Does Make (or any other consumer) READ the `online` column?** The tool wants to write `online=NO` on delete write-back. If `online` is read downstream, the tool must instead use a tool-private status column (e.g. `_scansia_status=deleted`) and leave `online` untouched. **Blocking prereq** before enabling the `online=NO` write-back. (Delete→publish loop safety needs a reliable per-row "outlet deleted" mark, disambiguated by GID / col Q, since some SKUs map to >1 outlet.)
-- [ ] **Is return-append truly Make's ONLY write to the sheet?** Must be confirmed — the append ⇄ tool write-back race is outside the intra-process mutex and the `row_uuid` + `reconciled` safety model assumes Make writes nowhere else.
-- [ ] **Column-position / header-vs-index agreement (M3 schema gate):** does Make append by header name or fixed index, and where exactly do `row_uuid` and `reconciled` sit? (Default if uncertain/index-based → pin both to the RIGHT.)
-- [ ] **Ownership of the flags:** confirm the tool is the sole writer of `reconciled` and `row_uuid`, and Make never touches them.
-- [ ] **Draft-on-sale mechanics:** when Make drafts a sold-out outlet, does it also write anything to the sheet (e.g. flip `online`), or does it only draft the product on Shopify? This determines whether draft-on-sale is a second Make sheet-write. (Tool reads the resulting DRAFT status **live from Shopify**, never re-sets it from the static `Qta`.)
+Live header row (confirmed with Ale, 2026-07-08):
+`BRAND(0) MODELLO BASE(1) TITOLO(2) SKU(3) TAGLIA(4) Qta(5) online(6) Prezzo High(7) Prezzo(8) Prezzo Outlet(9) Sconto(10) Aggiunte il(11) Ordine in entrata(12) Ordine in uscita(13) Vendute il(14) Note(15) Product_Id(16) Check(17)`
+
+- [x] **Q1 — Does Make (or any other consumer) READ/WRITE the `online` column?** **Both — and it writes
+  it, not just reads it.** `online` is the **legacy per-row stock-availability flag** of the *existing*
+  Make automation, unrelated to any "delete" semantics: (a) scenario `2215567` writes `online="NO"` on
+  every return-append (index 6, literal, in the same `addRow` — a fresh return starts "not yet online");
+  (b) scenario `678434` flips it back to `"NO"` when that specific row's `Qta` is decremented to zero by
+  a matching sale (module `168`, `{{if(146.\`5\`=1;"NO";146.\`6\`)}}`). **Verdict: do NOT reuse `online`
+  for the tool's delete write-back** — it would collide with a still-live legacy accounting flag. Use the
+  already-scoped fallback: a tool-private column (`_scansia_status=deleted`).
+- [x] **Q2 — Is return-append truly Make's ONLY write to the sheet?** **No.** Scenario `678434` "Shopify
+  - Nuovo Ordine" (the load-bearing order scenario, polling every 900s) also writes to this sheet for
+  outlet-matched order lines. Full mechanics in §9 — this is a new, previously-unknown risk surface, not
+  a simple confirmation.
+- [x] **Q3 — Column-position / header-vs-index agreement.** **Fixed index, confirmed** — Make's `addRow`
+  (scenario `2215567`, module `15`) writes `values` keyed `"0".."12"` (skipping 9, 10), matched against
+  the live header above. Today the indices happen to line up correctly (e.g. index 7 = "Prezzo High" ✓,
+  index 16 = "Product_Id" ✓) — but this is **incidental alignment, not an enforced contract**: nothing
+  stops a future column insert from silently breaking it, and the tool has no way to detect that drift
+  from its side. `row_uuid`/`reconciled`/`_scansia_cutover` are safe to pin at index 18+ (past "Check",
+  the last existing column at index 17) — confirmed neither Make writer touches past index 14.
+- [x] **Q4 — Ownership of the flags (row_uuid/reconciled).** Consistent with the tool's assumption: Make
+  does not reference these column names/positions in either inspected scenario (they don't exist in the
+  sheet yet). Both Make writers stay within index 0-14, well clear of where the tool's new columns will
+  live (18+). Low residual risk.
+- [x] **Q5 — Draft-on-sale mechanics.** **Two separate actions happen on sellout, at different
+  granularities.** Scenario `678434` route: when a specific row's `Qta` hits zero from a sale, module
+  `168` flips that row's `online` to `"NO"` (per-row, see Q1). Separately, `shopify:searchProducts`
+  (module `206`) + `shopify:updateProduct` (module `210`) draft the Shopify product when the **aggregate**
+  "Totale_Paia" across the model reaches 0 (per-model, not per-row). The tool's existing design — reading
+  DRAFT status live from Shopify, never re-deriving it from `Qta` — is correct and unaffected by either.
+
+**New, not previously listed:**
+
+- [ ] **"Prezzo Outlet" (index 9) is never written** by either inspected Make scenario. `2215567` writes
+  the current `Price` to index 8 ("Prezzo") instead, one column short of "Prezzo Outlet". Unclear whether
+  a separate manual/other process populates index 9, or if this is a genuine gap. **Ask Ale** — business
+  logic question, not a Make-technical one.
 
 ---
 
@@ -110,5 +168,59 @@ Addressing is **always by normalized header NAME** (`_norm_key` lowercases/trims
 **Blocks M3** (publish-live = "decommission cron; Make return-signal integration completed"). The one-time cutover backfill is explicitly labeled **BLOCKING M3**. Critical path: `M1a → M1b → [SERVER handoff + shared-secrets handoff] → M2 → M3 (gated by this AUTOMATE handoff) → M4 → M5`. AUTOMATE is one of the three external handoffs that drive the schedule (with SERVER for hosting/auth and shared-secrets for the dedicated SA); M1a/M1b are local and proceed in parallel while this matures.
 
 **The tool side is already built and tested** — the reader/writer/service contract described here is implemented (`backend/gsheet/reader.py`, `backend/gsheet/writer.py`, `backend/services/outlet_service.py`; 246 tests local / 344 in a venv). What remains is the **Make-owner coordination in §3/§7 and the one-time `backfill_cutover()` run** before M3 ships.
+
+---
+
+## 9. NEW FINDING (2026-07-08) — second concurrent sheet-writer: `Shopify - Nuovo Ordine` (`678434`)
+
+Verified directly via Make REST API (`make-operator`), not previously known to this handoff. Full blueprint
+walked module-by-module (scenario `678434`, the load-bearing order scenario per `../../system-map.md`,
+trigger: polling every 900s).
+
+**The split (router `93`, gate: last iteration of a per-unit quantity repeat loop):**
+
+- **Route 0 — non-outlet** (filter `"SE NO OUTLET - SI SKU - NO SCANSIA"`: title does NOT contain
+  "Outlet" AND sku exists) → `mysql:StoredProcedure` (module `190`) checks live stock in `racoon` →
+  `shopify:updateInventoryLevel` (out-of-stock → email alert; in-stock → set level). **This is the only
+  MySQL-touching branch — it does NOT run for outlet lines.** (Correction from an earlier draft of this
+  section: outlet orders decrement **nothing** via MySQL — the sheet is the sole ledger for outlet stock,
+  not a third parallel system alongside MySQL. Thank Ale for the catch.)
+- **Route 1 — outlet, matched in Scarpe_in_Scansia** (gated on the earlier `google-sheets:filterRows`,
+  module `146`, finding ≥1 row where `SKU`=order SKU, `TAGLIA`=order variant, `Qta`>0) →
+  `google-sheets:updateRow` (module `168`, filter `"SE SCANSIA aggiorno excel"`) on the row found by
+  `146`, **by row number** (`{{146.__ROW_NUMBER__}}`) — **no stable id, no compare-and-swap**:
+  - `Qta = Qta - 1`
+  - `online = "NO"` **iff** the pre-decrement `Qta` was exactly 1, else unchanged (see §7 Q1)
+  - `"Ordine in uscita"` (index 13) = order name; `"Vendute il"` (index 14) = order `created_at`
+  - Then `shopify:searchProducts`/`updateProduct` (modules `206`/`210`) draft the Shopify product once
+    the **aggregate** "Totale_Paia" across the model reaches 0 (§7 Q5).
+
+**Why this matters for M3.** The tool's row_uuid+reconciled write-back (`writer.py:80-136`) assumes it and
+Make never race on the same row identity. `678434` mutates rows **by row number**, read-then-write, on a
+**15-minute poll** — independent of, and blind to, the tool's own reads/writes. If the tool inserts,
+deletes, or reorders rows (e.g. during `backfill_cutover()`, or a future delete/cleanup pass) between
+`678434`'s `filterRows` and `updateRow` calls, the row-number target can drift and the wrong row gets
+decremented. This is a **standing, load-bearing race** the original contract didn't know to guard against
+— it needs an explicit decision from Ale before M3 go-live (e.g.: accept the residual risk given low
+concurrency odds in practice; add a re-verify-before-write step on the tool side; or migrate this Make
+logic to also use `row_uuid`, which is a Make-scenario change, not a tool change).
+
+---
+
+## 10. SVILUPPO analysis & resolution (2026-07-08)
+
+Reviewed the `make-operator` findings against the tool code. Two of the three concerns are already neutralized in code; one genuine decision remains for Ale, plus one business question.
+
+**§9 second-writer race — NEUTRALIZED by a verified tool invariant.** The tool performs **zero row operations** on the sheet: a grep of `backend/gsheet/` + `backend/services/` shows no `insert_row` / `delete_row` / `append_row` / `sort` / `deleteDimension` — every mutation is a single-cell `update_cell`, plus columns appended to the RIGHT (`_ensure_columns`). **Row numbers are therefore stable under all tool operations**, so `678434`'s row-number-based `updateRow` cannot be broken by the tool shifting rows. Reinforcing this: (a) the concurrent poller `678434` writes **disjoint columns** — `Qta`(5), `online`(6), `Ordine in uscita`(13), `Vendute il`(14) — vs the tool's `Product_Id`(16), control cols (18+), price (8/9); per-cell `update_cell` writes are independent; (b) the tool **never derives stock from `Qta`**(5), the only cell `678434` decrements that could matter; (c) `2215567` only *appends* rows at the bottom → no existing row-number shift, no collision with the tool's existing-row cell writes. **Residual**: this rests on the invariant *"the tool never inserts/deletes/reorders sheet rows"* — it must be preserved (a future row-deleting feature would reintroduce the race). Recorded as load-bearing. → **No active race; no Ale decision needed beyond keeping the invariant.**
+
+**`online` reuse — ALREADY handled in code.** `writer.mark_deleted` (`writer.py:153-157`, guard **CI-6**) writes a **parameterized** field, explicitly NOT hardcoded `online` — *"if Make reads the online column, callers pass a tool-private field."* So the make-operator verdict (leave `online` alone — it's a live legacy flag driven by BOTH Make writers) needs only that delete-callers pass **`_scansia_status`**, not a redesign. → **Decision: adopt `_scansia_status=deleted` for delete write-back** (tool creates it to the right; no Make impact; confirm the name with Ale).
+
+**GENUINE OPEN DECISION for Ale — fixed-index append (Q3).** `2215567` appends by numeric index, not header name. Adding the tool's columns at idx 18+ is safe today (doesn't shift idx 0-12) → **not blocking now**. The risk is a **future column insert/reorder left of idx 18** silently misaligning Make, undetectable from the tool side. Options, most-robust first:
+1. **(recommended) Switch `2215567`'s `addRow` to map by header name** — small Make-scenario change (make-operator can do it), removes the whole bug class.
+2. Accept fixed-index + a documented *"never insert/reorder columns in Scarpe_in_Scansia"* rule + an optional **tool-side startup assertion** that known columns sit at expected indices (5=`Qta`, 6=`online`, 16=`Product_Id`) → the tool detects drift and alerts (defense-in-depth for a Make-side fragility).
+
+**BUSINESS QUESTION for Ale (not Make-technical) — "Prezzo Outlet"(9) is populated by neither Make scenario.** `2215567` writes current price to `Prezzo`(8). The pricing module reads `prezzo_outlet`(9) → variant `price`. If idx 9 is unpopulated, pricing "repair-from-sheet" (modalità 2) has no source. Shopify prices are already sane (discharge-debt=0), so the store side is fine — but **who fills "Prezzo Outlet" on the sheet** (manual / old fix_prices / nobody)? Determines whether the sheet is a valid price source or the pricing GUI must write it fresh.
+
+---
 
 Blocks: M3
