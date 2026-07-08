@@ -41,6 +41,7 @@ from fastapi.responses import JSONResponse
 from backend.api.errors import log_boundary, map_exception
 from backend.api.jobs import JobStore
 from backend.api.delete_outlet import build_delete_router
+from backend.api.init import build_init_router
 from backend.api.prices import build_prices_router
 from backend.api.publish import build_publish_router
 from backend.api.read import build_read_router
@@ -157,6 +158,7 @@ def create_app(
     app.include_router(build_publish_router())
     app.include_router(build_delete_router())
     app.include_router(build_prices_router())
+    app.include_router(build_init_router())
     app.include_router(build_ui_router())
     return app
 

@@ -86,7 +86,7 @@
     if (kind) el.classList.add(kind);
   }
 
-  /** Standard "job failed" / "VERIFY_FAILED" -> human status text. */
+  /** Standard "job failed" / "VERIFY_FAILED" / "gesture_required" -> human status text. */
   function jobFailureMessage(rec) {
     if (rec.status === "failed") {
       return "Operazione non riuscita (" + rec.error_code + ").";
@@ -94,7 +94,143 @@
     if (rec.result && rec.result.status === "VERIFY_FAILED") {
       return "Lo stato è cambiato dal preview: rifai il preview.";
     }
+    if (rec.result && rec.result.status === "gesture_required") {
+      // The job itself succeeded (status "done") but the human-gesture gate
+      // was not satisfied (missing/wrong CONFERMO, or missing second_confirm
+      // above the demote-count threshold) — applied is false, no mutation ran.
+      return "Digita CONFERMO e, se richiesto, spunta la conferma.";
+    }
     return null;
+  }
+
+  // ===========================================================================
+  // INIT banner (first-run "Inizializza") — same preview->store token->echo-on-
+  // apply flow as publish/cleanup. Hidden by default; shown only when
+  // GET /init/status reports cutover_done === false.
+  // ===========================================================================
+  const initState = { pending: null };
+
+  function renderInitDecisionRows(tbodyId, rows, cols) {
+    const tbody = document.getElementById(tbodyId);
+    tbody.innerHTML = "";
+    (rows || []).forEach(function (d) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = cols.map(function (c) { return "<td>" + esc(d[c]) + "</td>"; }).join("");
+      tbody.appendChild(tr);
+    });
+  }
+
+  function renderInitPlan(plan) {
+    const panel = document.getElementById("init-plan-panel");
+    panel.classList.remove("hidden");
+    document.getElementById("init-backfill-count").textContent = plan.backfill_pending_rows;
+    document.getElementById("init-anomalies").textContent =
+      (plan.anomalies && plan.anomalies.length) ? "Anomalie: " + plan.anomalies.join(", ") : "";
+    renderInitDecisionRows("init-kept-online-tbody", plan.kept_online, ["sku", "size", "target_gid"]);
+    renderInitDecisionRows("init-demote-missing-tbody", plan.demote_missing, ["sku", "size"]);
+    renderInitDecisionRows("init-demote-draft-tbody", plan.demote_draft, ["sku", "size", "target_gid", "live_status"]);
+    renderInitDecisionRows("init-demote-soldout-tbody", plan.demote_sold_out_size, ["sku", "size", "target_gid"]);
+    renderInitDecisionRows("init-review-tbody", plan.review_multi_match, ["sku", "size"]);
+    const demoteCount = (plan.demote_missing || []).length + (plan.demote_draft || []).length + (plan.demote_sold_out_size || []).length;
+    document.getElementById("init-second-confirm-row").classList.toggle("hidden", demoteCount <= 25);
+    document.getElementById("init-second-confirm").checked = false;
+    document.getElementById("init-confirm-word").value = "";
+    document.getElementById("init-outcome-panel").classList.add("hidden");
+  }
+
+  async function initPreview() {
+    const statusEl = document.getElementById("init-status");
+    const btn = document.getElementById("btn-init-preview");
+    btn.disabled = true;
+    setStatus(statusEl, "calcolo piano...");
+    try {
+      const sub = await api("POST", "/init/preview", undefined);
+      const rec = await pollJob("/init/preview/" + sub.job_id);
+      if (rec.status === "failed") {
+        setStatus(statusEl, jobFailureMessage(rec), "error");
+        return;
+      }
+      initState.pending = { plan_hash: rec.result.plan_hash, confirm_token: rec.result.confirm_token };
+      renderInitPlan(rec.result.plan);
+      setStatus(statusEl, "piano pronto — verifica e conferma", "ok");
+    } catch (e) {
+      setStatus(statusEl, "errore: " + e.message, "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function renderInitOutcome(report) {
+    const panel = document.getElementById("init-outcome-panel");
+    panel.classList.remove("hidden");
+    const tbody = document.getElementById("init-outcome-tbody");
+    tbody.innerHTML = "";
+    (report.outcomes || []).forEach(function (o) {
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        "<td>" + esc(o.sku) + "</td>" + "<td>" + esc(o.size) + "</td>" +
+        "<td>" + esc(o.bucket) + "</td>" + "<td>" + esc(o.status) + "</td>" +
+        "<td>" + esc(o.target_gid) + "</td>" + "<td>" + esc((o.warnings || []).join(", ")) + "</td>";
+      tbody.appendChild(tr);
+    });
+  }
+
+  async function initApply() {
+    if (!initState.pending) return;
+    const statusEl = document.getElementById("init-apply-status");
+    const btn = document.getElementById("btn-init-apply");
+    const confirmWord = document.getElementById("init-confirm-word").value.trim();
+    const secondConfirm = document.getElementById("init-second-confirm").checked;
+    btn.disabled = true;
+    setStatus(statusEl, "applico...");
+    try {
+      const body = Object.assign({}, initState.pending, { confirm: confirmWord, second_confirm: secondConfirm });
+      const sub = await api("POST", "/init/apply", body);
+      const rec = await pollJob("/init/apply/" + sub.job_id);
+      const failMsg = jobFailureMessage(rec);
+      if (failMsg) {
+        setStatus(statusEl, failMsg, "error");
+        return;
+      }
+      // Defense-in-depth (LOW-c): jobFailureMessage() already maps every known
+      // non-applied result (VERIFY_FAILED, gesture_required) above, but never
+      // call the renderer on an unexpected/missing report — a raw JS crash is
+      // worse than a generic error message.
+      if (!rec.result || !rec.result.report) {
+        setStatus(statusEl, "risposta inattesa dal server.", "error");
+        return;
+      }
+      renderInitOutcome(rec.result.report);
+      setStatus(statusEl, "applicato con successo", "ok");
+      initState.pending = null;
+      await checkInitStatus(); // hides the banner once cutover_done becomes true
+    } catch (e) {
+      // A thrown/rejected `api()` call means the HTTP response itself was non-2xx
+      // (see `api()` above) — in practice ONLY confirm_invalid (bad/expired
+      // confirm_token), which the server answers with a SYNCHRONOUS 409 before
+      // any job exists. A missing/wrong CONFERMO (gesture_required) is NOT a
+      // 409 — the job is created (202) and completes as "done" with
+      // result.status === "gesture_required"; that case is handled above via
+      // jobFailureMessage(), never reaches this catch.
+      setStatus(statusEl, "errore: " + e.message, "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function checkInitStatus() {
+    try {
+      const data = await api("GET", "/init/status");
+      document.getElementById("init-banner").classList.toggle("hidden", !!data.cutover_done);
+    } catch (e) {
+      // banner stays as-is on a transient error; not fatal to the rest of the app.
+    }
+  }
+
+  function initInitBanner() {
+    document.getElementById("btn-init-preview").addEventListener("click", initPreview);
+    document.getElementById("btn-init-apply").addEventListener("click", initApply);
+    checkInitStatus();
   }
 
   // ===========================================================================
@@ -739,6 +875,7 @@
   // Boot
   // ===========================================================================
   document.addEventListener("DOMContentLoaded", function () {
+    initInitBanner();
     initTabs();
     initScansiaTab();
     initPublishTab();

@@ -9,6 +9,8 @@ created on first use if absent:
 * ``AUDIT``        — general outcome/event log (``write_outcome``).
 * ``AUDIT_DELETE`` — delete before-snapshots, written BEFORE ``productDelete``.
 * ``AUDIT_PRICE``  — price before-snapshots (priors), read back by ``load`` for revert.
+* ``AUDIT_INIT``   — init-reconcile before-snapshots (HIGH-2, post-review), written
+  BEFORE the first ``productUpdate status=DRAFT`` / sheet write-back of an init apply.
 
 DURABILITY CAVEAT (deliberate, documented). The ``DeleteAuditSink`` contract asks
 ``write_durable`` to persist to TWO durable sinks. This adapter persists to ONE
@@ -34,6 +36,7 @@ from zoneinfo import ZoneInfo
 
 from backend.gsheet.reader import SheetIOError
 from backend.services.delete_service import BeforeSnapshot, DeleteOutcomeEvent
+from backend.services.init_service import InitBeforeSnapshot
 from backend.services.pricing_service import PriceIntent, ProductPrior, VariantPrior
 
 logger = logging.getLogger("backend.persistence.gsheet_audit")
@@ -43,10 +46,12 @@ _ROME = ZoneInfo("Europe/Rome")
 TAB_AUDIT = "AUDIT"
 TAB_DELETE = "AUDIT_DELETE"
 TAB_PRICE = "AUDIT_PRICE"
+TAB_INIT = "AUDIT_INIT"
 
 _AUDIT_HEADER: Tuple[str, ...] = ("ts", "actor", "action", "target_gids", "plan_hash", "result")
 _DELETE_HEADER: Tuple[str, ...] = ("ts", "product_gid", "snapshot_json")
 _PRICE_HEADER: Tuple[str, ...] = ("ts", "intent_id", "mode", "plan_hash", "priors_json")
+_INIT_HEADER: Tuple[str, ...] = ("ts", "actor", "plan_hash", "rows_json", "targets_json")
 
 # Provisioning size for a freshly created audit tab (append-only; grows as needed).
 _NEW_TAB_ROWS = 1000
@@ -218,6 +223,55 @@ class GSheetAuditSink:
             [self._ts(), self._actor, "product_delete", event.product_gid, "", result],
         )
 
+    # -- init reconcile side (write_init_before) — the ABORT GATE (HIGH-2) --
+    def write_init_before(self, snapshot: InitBeforeSnapshot) -> None:
+        """Append the init before-snapshot to ``AUDIT_INIT`` — mirrors
+        :meth:`write_durable`'s ABORT GATE contract.
+
+        RAISES ``SheetIOError`` on any failure so that ``init_apply`` never
+        reaches its first ``productUpdate status=DRAFT`` / sheet write-back when
+        the snapshot (prior online flag + prior 'Vendute il' per demoted row,
+        prior live_status per target product) could not be durably stored. This
+        includes a pre-append serialization failure (``asdict``/``json.dumps``
+        raising ``TypeError``/``ValueError``), normalized to ``SheetIOError`` too
+        — same rationale as :meth:`write_durable`.
+        """
+        try:
+            # asdict() on the WHOLE snapshot first (mirrors write_durable): a
+            # non-dataclass argument (e.g. a caller bug passing the wrong type)
+            # fails HERE with TypeError, never as a later AttributeError on
+            # ``.rows``/``.targets`` that would slip past this except clause.
+            data = asdict(snapshot)
+            rows_json = json.dumps(
+                data["rows"], separators=(",", ":"), ensure_ascii=False, default=str,
+            )
+            targets_json = json.dumps(
+                data["targets"], separators=(",", ":"), ensure_ascii=False, default=str,
+            )
+        except (TypeError, ValueError) as e:
+            raise SheetIOError(f"audit init snapshot serialization failed: {type(e).__name__}") from e
+        self._append(
+            TAB_INIT, _INIT_HEADER,
+            [self._ts(), self._actor, snapshot.plan_hash, rows_json, targets_json],
+        )
+
+    # -- generic event (init reconcile side) --------------------------------
+    def write_event(
+        self, *, action: str, target_gids: str = "", plan_hash: str = "", result: str = ""
+    ) -> None:
+        """Append a generic audit event to ``AUDIT`` (best-effort at the call site).
+
+        Unlike :meth:`write_outcome` (delete-shaped: hardcodes
+        ``action="product_delete"``), this is the general-purpose writer for any
+        vertical that doesn't need a dedicated event shape — currently the init
+        reconcile flow (``action="init_reconcile"``). Same ``_AUDIT_HEADER`` tab
+        and row shape; the caller supplies every field explicitly.
+        """
+        self._append(
+            TAB_AUDIT, _AUDIT_HEADER,
+            [self._ts(), self._actor, action, target_gids, plan_hash, result],
+        )
+
     # -- read side (GET /audit) ---------------------------------------------
     def read_recent(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Return the most recent ``AUDIT`` rows as header-keyed dicts (READ-ONLY).
@@ -241,4 +295,4 @@ class GSheetAuditSink:
         return [dict(zip(header, row)) for row in body]
 
 
-__all__ = ["GSheetAuditSink", "TAB_AUDIT", "TAB_DELETE", "TAB_PRICE"]
+__all__ = ["GSheetAuditSink", "TAB_AUDIT", "TAB_DELETE", "TAB_PRICE", "TAB_INIT"]

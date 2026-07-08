@@ -20,6 +20,61 @@
 
 <main>
 
+  <!-- ============================== INIT (first-run banner) ============================== -->
+  <section id="init-banner" class="plan-panel hidden">
+    <h3>Inizializza — prima configurazione</h3>
+    <p class="warning-banner">
+      Operazione una tantum: allinea il foglio a Shopify (righe "online" non più
+      vendibili vengono spuntate e i relativi prodotti passati in bozza). Da
+      eseguire UNA VOLTA prima di usare il resto dello strumento.
+    </p>
+    <div class="toolbar">
+      <button id="btn-init-preview">Calcola piano di inizializzazione</button>
+      <span id="init-status" class="status-text"></span>
+    </div>
+    <div id="init-plan-panel" class="plan-panel hidden">
+      <p>Righe da timbrare (backfill): <strong id="init-backfill-count"></strong></p>
+      <div id="init-anomalies" class="anomalies"></div>
+
+      <h4>kept-online</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>Target</th></tr></thead>
+        <tbody id="init-kept-online-tbody"></tbody></table>
+
+      <h4>demote:missing</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th></tr></thead>
+        <tbody id="init-demote-missing-tbody"></tbody></table>
+
+      <h4>demote:draft</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>Target</th><th>Stato live</th></tr></thead>
+        <tbody id="init-demote-draft-tbody"></tbody></table>
+
+      <h4>demote:sold-out-size</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>Target</th></tr></thead>
+        <tbody id="init-demote-soldout-tbody"></tbody></table>
+
+      <h4>review:multi-match</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th></tr></thead>
+        <tbody id="init-review-tbody"></tbody></table>
+
+      <div class="gesture-panel">
+        <p class="warning-banner">Gesto umano richiesto: digita <code>CONFERMO</code> per applicare.</p>
+        <label>Digita CONFERMO <input type="text" id="init-confirm-word"></label>
+        <label id="init-second-confirm-row" class="hidden">
+          <input type="checkbox" id="init-second-confirm"> Confermo di aver rivisto il numero elevato di demote (second_confirm)
+        </label>
+        <button id="btn-init-apply" class="btn-danger">Applica inizializzazione</button>
+        <span id="init-apply-status" class="status-text"></span>
+      </div>
+    </div>
+    <div id="init-outcome-panel" class="plan-panel hidden">
+      <h4>Esito</h4>
+      <table class="data-table">
+        <thead><tr><th>SKU</th><th>Taglia</th><th>Bucket</th><th>Stato</th><th>Target</th><th>Warning</th></tr></thead>
+        <tbody id="init-outcome-tbody"></tbody>
+      </table>
+    </div>
+  </section>
+
   <!-- ============================== SCANSIA ============================== -->
   <section id="tab-scansia" class="tab-panel active">
     <div class="toolbar">

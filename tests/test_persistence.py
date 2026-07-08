@@ -16,6 +16,7 @@ from backend.gsheet.reader import SheetIOError
 from backend.persistence.gsheet_audit import (
     TAB_AUDIT,
     TAB_DELETE,
+    TAB_INIT,
     TAB_PRICE,
     GSheetAuditSink,
 )
@@ -25,6 +26,11 @@ from backend.services.delete_service import (
     DeleteOutcomeEvent,
     SnapshotCollection,
     SnapshotVariant,
+)
+from backend.services.init_service import (
+    InitBeforeSnapshot,
+    InitDemotedRowSnapshot,
+    InitTargetSnapshot,
 )
 from backend.services.pricing_service import PriceIntent, ProductPrior, VariantPrior
 
@@ -200,6 +206,21 @@ def _snapshot(gid="gid://shopify/Product/1"):
     )
 
 
+def _init_before_snapshot():
+    return InitBeforeSnapshot(
+        plan_hash="agg-hash-1",
+        rows=(
+            InitDemotedRowSnapshot(
+                row_uuid="u1", sku="SKU1", size="42",
+                prior_online="SI", prior_vendute_il="",
+            ),
+        ),
+        targets=(
+            InitTargetSnapshot(gid="gid://shopify/Product/1", prior_status="ACTIVE"),
+        ),
+    )
+
+
 def _intent():
     return PriceIntent(
         mode="percent",
@@ -287,6 +308,39 @@ def test_write_durable_raises_sheetioerror_on_unserializable_snapshot():
     ss = FakeSpreadsheet()
     with pytest.raises(SheetIOError):
         GSheetAuditSink(ss).write_durable(object())  # not a dataclass -> asdict() TypeError
+
+
+# --- write_init_before append + RAISE gate (HIGH-2, post-review) ----------
+def test_write_init_before_appends_snapshot_json():
+    ss = FakeSpreadsheet()
+    GSheetAuditSink(ss, actor="racoon").write_init_before(_init_before_snapshot())
+    assert TAB_INIT in ss.titles()
+    rows = ss.tab(TAB_INIT).get_all_values()
+    assert rows[0] == ["ts", "actor", "plan_hash", "rows_json", "targets_json"]
+    body = rows[1]
+    assert body[1] == "racoon"
+    assert body[2] == "agg-hash-1"
+    rows_parsed = json.loads(body[3])
+    assert rows_parsed[0]["sku"] == "SKU1"
+    assert rows_parsed[0]["prior_online"] == "SI"
+    targets_parsed = json.loads(body[4])
+    assert targets_parsed[0]["gid"] == "gid://shopify/Product/1"
+    assert targets_parsed[0]["prior_status"] == "ACTIVE"
+
+
+def test_write_init_before_raises_sheetioerror_on_append_failure():
+    """The abort gate: a failed durable write MUST raise (init_apply never
+    reaches its first productUpdate/write_back for the demoted rows)."""
+    failing = FakeAuditWorksheet(TAB_INIT, fail_append=True)
+    ss = FakeSpreadsheet(worksheets=[failing])
+    with pytest.raises(SheetIOError):
+        GSheetAuditSink(ss).write_init_before(_init_before_snapshot())
+
+
+def test_write_init_before_raises_on_unserializable_snapshot():
+    ss = FakeSpreadsheet()
+    with pytest.raises(SheetIOError):
+        GSheetAuditSink(ss).write_init_before(object())  # asdict() -> TypeError
 
 
 # --- capture_before append + load round-trip -------------------------------

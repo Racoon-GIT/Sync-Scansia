@@ -288,10 +288,30 @@ class ReaderMixin:
             rows.append(m)
         return RawRead(rows, col_index, self.ws)
 
-    # -- canonical read (fail-closed on cutover) ---------------------------
-    def read_canonical(self, *, assign_uuids: bool = True) -> CanonRead:
-        """Canonical read. FAIL-CLOSED: raises ``CutoverNotDoneError`` if the
-        cutover sentinel is absent (never auto-marks historical rows pending).
+    # -- cutover probe (READ-ONLY, cheap) -----------------------------------
+    def cutover_done(self) -> bool:
+        """True iff the ``_scansia_cutover`` sentinel header is present.
+
+        Read-only (one ``get_all_values``, no write). Used by the GUI first-run
+        banner (``GET /init/status``) to decide whether to show the "Inizializza"
+        action — independent of ``read_canonical``'s fail-closed raise.
+        """
+        try:
+            values = self.ws.get_all_values()
+        except Exception as e:  # pragma: no cover
+            raise SheetIOError(f"get_all_values failed: {e}") from e
+        if not values:
+            return False
+        col_index = _build_col_index(values[0])
+        return bool(col_index.get(SENTINEL_HEADER))
+
+    # -- canonical read (fail-closed on cutover, unless opted out) ----------
+    def read_canonical(
+        self, *, assign_uuids: bool = True, require_cutover: bool = True
+    ) -> CanonRead:
+        """Canonical read. FAIL-CLOSED by default: raises ``CutoverNotDoneError``
+        if the cutover sentinel is absent (never auto-marks historical rows
+        pending).
 
         Side-effect (when ``assign_uuids=True``, the default): assigns a
         ``row_uuid`` (and explicit ``reconciled=false``, unless the ``reconciled``
@@ -304,6 +324,15 @@ class ReaderMixin:
         live Sheet. Callers MUST pass ``assign_uuids=False`` whenever DRY_RUN is
         active (project default — see CLAUDE.md rule 2).
 
+        ``require_cutover=False`` (the "Inizializza" preview's ONLY caller): skip
+        BOTH sentinel-absent raises (empty sheet AND sentinel-missing-header) —
+        this is exactly the pre-init state the init preview must be able to read
+        without mutating anything. Every other caller in the codebase keeps the
+        default ``True`` (publish/prices/delete stay fail-closed unaffected).
+        Combine with ``assign_uuids=False`` for a genuinely read-only pre-cutover
+        read (no uuid/reconciled columns are ensured/widened either, since that
+        machinery lives behind the ``assign_uuids`` guard below).
+
         Anti-re-inflate guard: a row whose ``reconciled`` cell is already
         populated (e.g. ``true``) but whose ``row_uuid`` is empty is NEVER forced
         back to ``reconciled=false`` — only a genuinely empty ``reconciled`` cell
@@ -315,15 +344,18 @@ class ReaderMixin:
         except Exception as e:  # pragma: no cover
             raise SheetIOError(f"get_all_values failed: {e}") from e
         if not values:
-            raise CutoverNotDoneError(
-                "empty sheet: cutover sentinel absent — run backfill_cutover() first"
-            )
+            if require_cutover:
+                raise CutoverNotDoneError(
+                    "empty sheet: cutover sentinel absent — run backfill_cutover() first"
+                )
+            return CanonRead([], {}, [])
         header = values[0]
         col_index = _build_col_index(header)
         if not col_index.get(SENTINEL_HEADER):
-            raise CutoverNotDoneError(
-                "cutover sentinel absent — run backfill_cutover() before read_canonical()"
-            )
+            if require_cutover:
+                raise CutoverNotDoneError(
+                    "cutover sentinel absent — run backfill_cutover() before read_canonical()"
+                )
         # Post-cutover these exist; ensure defensively (creates to the right).
         # Skipped entirely in assign_uuids=False mode — no writes allowed there.
         if assign_uuids and (

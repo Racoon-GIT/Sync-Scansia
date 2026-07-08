@@ -426,6 +426,58 @@ def test_read_rows_retro_compat_shape():
     assert rows[0]["prezzo_high"] == "129,90"
 
 
+# ---------------------------------------------------------------------------
+# INIT — read_canonical(require_cutover=False) + cutover_done() probe
+# ---------------------------------------------------------------------------
+def test_read_canonical_require_cutover_false_reads_without_raising_or_writing():
+    """The init preview's ONLY read path: pre-cutover, read-only (no update_cell)."""
+    ws = make_ws(
+        [["Nike", "Air", "SKU1", "129,90", "99,90", "42", "1", "SI", "gid://shopify/Product/111"]]
+    )
+    sheet = ScansiaSheet(ws)
+    before = len(ws.update_cell_calls)
+    result = sheet.read_canonical(assign_uuids=False, require_cutover=False)
+    assert len(ws.update_cell_calls) == before  # zero writes
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert row.sku == "SKU1"
+    assert row.row_uuid  # ephemeral uuid, still usable, never persisted
+
+
+def test_read_canonical_require_cutover_false_on_empty_sheet_returns_empty():
+    sheet = ScansiaSheet(FakeWorksheet([]))
+    result = sheet.read_canonical(assign_uuids=False, require_cutover=False)
+    assert result.rows == []
+
+
+def test_read_canonical_default_still_fail_closed_pre_cutover():
+    """Every OTHER caller (publish/prices/delete) keeps the default fail-closed
+    behaviour — require_cutover=False must not weaken it globally."""
+    ws = make_ws(
+        [["Nike", "Air", "SKU1", "129,90", "99,90", "42", "1", "SI", "gid://shopify/Product/111"]]
+    )
+    sheet = ScansiaSheet(ws)
+    with pytest.raises(CutoverNotDoneError):
+        sheet.read_canonical()
+    with pytest.raises(CutoverNotDoneError):
+        sheet.read_canonical(assign_uuids=False)
+
+
+def test_cutover_done_false_before_true_after_backfill():
+    ws = make_ws(
+        [["Nike", "Air", "SKU1", "129,90", "99,90", "42", "1", "SI", "gid://shopify/Product/111"]]
+    )
+    sheet = ScansiaSheet(ws)
+    assert sheet.cutover_done() is False
+    sheet.backfill_cutover()
+    assert sheet.cutover_done() is True
+
+
+def test_cutover_done_false_on_empty_sheet():
+    sheet = ScansiaSheet(FakeWorksheet([]))
+    assert sheet.cutover_done() is False
+
+
 def test_control_columns_appended_to_the_right():
     ws = make_ws(
         [["Nike", "Air", "SKU1", "129,90", "99,90", "42", "1", "SI", "gid://shopify/Product/111"]]
