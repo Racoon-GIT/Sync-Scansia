@@ -1,0 +1,16 @@
+{
+  "outputStyle": "silent-coder",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/alesap/DATI/Racoon-LAB/IT/SVILUPPO/.claude/hooks/inject-model-policy.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

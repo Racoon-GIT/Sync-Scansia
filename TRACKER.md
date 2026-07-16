@@ -2,6 +2,50 @@
 
 ## Current state
 
+**Phase**: F1 (MVP) — **build complete, service live, mutations not yet enabled**. Branch `feat/scansia-manager`; `origin/main` = `origin/feat/scansia-manager` = `9270741`. Live service: https://scansia-manager.onrender.com (Render free, autoDeploy **OFF** = owner deploy-gate; `/health` 200, `/` 401 Basic Auth — independently verified). Approved plan: `~/.claude/plans/compressed-foraging-stream.md`.
+
+**Milestones** (build history: archived detail below + git log):
+- [x] **M1a** (lib + consolidate) — library layers, 8 fixes, GSheet layer (append-oriented, `row_uuid`+`reconciled`, idempotent `backfill_cutover`), dead-module cleanup. Residue: regression checkpoint CLI-vs-prod (needs live store); orphan deps (`pandas`/`slugify`/`tenacity`) removal deferred to F2.
+- [x] **M1b** — net-new Shopify ops + resolvers; live READ-ONLY verification passed on the real store (all ground-truth anchors match; 182 outlet, 38 CONTINUE). `productDuplicate`→auto-publish check deferred to first APPLY (it's a mutation).
+- [x] **M2** — web foundation (FastAPI, HMAC confirm-tokens, GSheet audit sink, Basic Auth fail-closed, dashboard UI) **deployed live**; SERVER handoff closed.
+- [~] **M3** — publish endpoints complete; **go-live gated** (see Next). "Inizializza" first-run GUI flow built (`3f0617c`): baseline cutover + online-flag reconcile, preview→confirm→apply with durable `AUDIT_INIT` snapshot — unblocks the production GUI.
+- [~] **M4** — pricing endpoints complete. Discharge-debt recon found **N=0** broken prices → acceptance redefined (owner decision): synthetic controlled test at first APPLY (set discount on 1 outlet ACTIVE → verify live → revert).
+- [~] **M5** — delete endpoints complete (exact per-variant predicate, mandatory pre-delete durable snapshot abort-on-failure, human gesture, hard cap 50). First live step: single delete, then bulk cleanup.
+- [ ] **M-docs** — STAND-BY until go-live (operator runbook, README rewrite, cross-repo doc updates — cross-boundary, flag before editing).
+
+**Open handoffs / blockers**:
+- **AUTOMATE** (brief `docs/handoff-M3-automate.md`, verified live via make-operator; 2 owner decisions pending): (1) **sequencing vs concurrent writer `678434`** — "Shopify - Nuovo Ordine" mutates the same sheet rows by row-number, no CAS, every 15 min; row-position race neutralized (load-bearing invariant: the tool never inserts/deletes/reorders rows, columns are disjoint) but the go-live order still needs the decision; (2) **"Prezzo Outlet" column (index 9)**: no Make writer found — who populates it? (3rd scenario `4100540` = dormant duplicate, not a risk.)
+- **SERVER triggers**: notify SERVER on each push to `feat/scansia-manager` (autoDeploy OFF), and at merge→main to re-point the service branch (`docs/handoff-M2-server.md`). shared-secrets RESOLVED: reuse "Management esterno" token + Sync-Scansia SA, no rotation.
+
+**Open owner questions** (plan §Open items): Q-oversell (default DENY) · Q-bf-storefront (**gates M3**) · Q-prodcollection · Q-modelsrc · Q-nest · Q-nonfootwear. Resolved-decision register: archived detail below.
+
+**Next (in order)**:
+1. Ale runs **Inizializza** from the production GUI (preview→confirm) and tries the manual per-product online/offline control.
+2. Mutation go-live behind the deploy-gate: first controlled APPLY (single delete → bulk cleanup; prices = synthetic set+revert).
+3. Publish-live: blocked on the Make return-signal ONGOING flow + Q-bf-storefront + cron decommission.
+
+**Known follow-ups (non-blocking)**: (1) duplicate DRAFT orphan if `read_variant_inventory` fails after `productDuplicate` (resolver re-hooks it next run; TODO per-title reconcile). (2) delete: `urlRedirectCreate` (404/SEO) not implemented → runbook M-docs. (3) delete drift on re-verify aborts the whole batch (by design). (4) `delete_single_apply` doesn't re-apply the zero-stock predicate (by design). (5) `gsheet_audit.capture_before` shares `write_durable`'s serialize-pre-append pattern — benign gap, align for consistency. (6) FastAPI-gated tests skip outside the venv (283 stdlib local / ~393 in venv). (7) the `gesture_required` GUI fix landed only in `initApply`; the helper is shared — check publish/cleanup/prices for the same latent bug and align. (8) `AuditSink` Protocol lacks `write_init_before` (duck-typed, nothing broken).
+
+**Working tree**: F1 backend complete (`backend/{config,shopify,gsheet,services,persistence,auth,api,app.py}` + tests + requirements). Untracked residue: `.claude/settings.local.json` (local perms — do not commit) · `.claude/settings.json` (shared output-style — decide whether to track). Key commits: `3f0617c` Inizializza · `9270741` tracker tip (rest: git log).
+
+---
+
+## Milestone dettaglio & log
+
+*(Historical detail and execution notes below; the Current state section above is REWRITTEN at each session end, never appended.)*
+
+### M1a-lib — 8 fix da portare (con test)
+1. Magazzino cleanup saltato su path ID (`sync.py:868-892`).
+2. DRY_RUN fail-closed (`main.py:74`): unset/non-riconosciuto → DRY-RUN; muta solo con token APPLY in allowlist.
+3. `userErrors` silenziati (`sync.py:562`, `465`) → raise.
+4. Fallback prezzo `0.00/0.00` → blocca.
+5. Size-matching su "Size" + surfacing.
+6. Tag `outlet` + backfill (gated, non M1a) — se adottato, publish SETTA il tag e non azzera gli altri.
+7. Images legacy → `productSet`/`productUpdate` (branch batch/REST-fallback DROPPED).
+8. Batching >250 (F2): attesa `job.done` per-batch + ABORT su timeout/errore.
+
+### Archived Current state — F1 build detail (IT, superseded 2026-07-16)
+
 **Fase**: F1 (MVP) — inizio esecuzione. Branch `feat/scansia-manager`.
 **Piano approvato**: `~/.claude/plans/compressed-foraging-stream.md` (327 righe, 9 giri di critica avversariale, F1≈8 execution-ready; F2 reorder = ciclo di pianificazione dedicato successivo).
 
@@ -29,19 +73,3 @@
 **Known follow-up** (non bloccanti): (1) fallimento di `read_variant_inventory` DOPO `productDuplicate` in CREATE → **duplicato DRAFT orfano** (il resolver lo ri-aggancia al run successivo; TODO reconcile per-titolo). (2) delete: `urlRedirectCreate` (404/SEO su delete ACTIVE) non implementato (nessun op) → runbook M-docs. (3) delete drift a re-verify → abort dell'INTERO batch (più stretto di esclusione per-item; il conteggio umano è vincolato al set). (4) `delete_single_apply` non ri-applica il predicato zero-stock (by design). (5) `gsheet_audit.capture_before` ha lo stesso pattern serialize-pre-append di `write_durable` — gap non-`SheetIOError` benigno (il layer pricing cattura `Exception`); allineare per consistenza. (6) test FastAPI-gated skippano senza `fastapi`/`httpx` nell'interprete (banner nei file); girano su Render/venv — full suite ~393 con Inizializza. (7) **[da Inizializla review]** il gap GUI `gesture_required` (jobFailureMessage ritornava null → crash a valle) è stato corretto SOLO in `initApply`; l'helper è condiviso → **verificare se publish/cleanup/prezzi hanno lo stesso latente** e allineare. (8) `AuditSink` Protocol (`ports.py`) NON include `write_init_before` (sink duck-typed, nessun isinstance rotto) — se un domani si vuole il Protocol come unica fonte per tutti i sink, aggiungerlo.
 
 **Stato working tree**: backend F1 completo. `backend/{config,shopify,gsheet,services,persistence,auth,api(read+3 verticali),app.py}` + tests + requirements. **283 test locali (stdlib, +110 skip FastAPI) / ~393 in venv** (con Inizializza). ⚠ `docs/testing.md`: la full suite richiede fastapi/httpx nel venv. **✅ Pushato 2026-07-09: `origin/main` e `origin/feat/scansia-manager` entrambi a `9270741`** (tip locale = tip remote, verificato via `git fetch`). Commit chiave: `52738ed` M2-foundation · `2d90af6` endpoint · `9049c13` UI · `d84b04f` `.python-version` · `c3b31ee`/`03fcf0b`/`9e46539` handoff-automate + correzioni · `3f0617c` **Inizializza** · `9270741` tracker · `bd409ef` Q2 re-verify (3° scenario dormiente) · `2e2ed1b` handoff-deploy-check-server. In attesa SERVER (v. Current state sopra). Residuo non tracciato: `.claude/settings.local.json` (permessi locali, da non committare) + `.claude/settings.json` (output-style condiviso — valutare se trackarlo).
-
----
-
-## Milestone dettaglio & log
-
-*(Dettaglio storico e note di esecuzione qui sotto; la sezione Current state va RISCRITTA a ogni fine sessione, mai appesa.)*
-
-### M1a-lib — 8 fix da portare (con test)
-1. Magazzino cleanup saltato su path ID (`sync.py:868-892`).
-2. DRY_RUN fail-closed (`main.py:74`): unset/non-riconosciuto → DRY-RUN; muta solo con token APPLY in allowlist.
-3. `userErrors` silenziati (`sync.py:562`, `465`) → raise.
-4. Fallback prezzo `0.00/0.00` → blocca.
-5. Size-matching su "Size" + surfacing.
-6. Tag `outlet` + backfill (gated, non M1a) — se adottato, publish SETTA il tag e non azzera gli altri.
-7. Images legacy → `productSet`/`productUpdate` (branch batch/REST-fallback DROPPED).
-8. Batching >250 (F2): attesa `job.done` per-batch + ABORT su timeout/errore.
