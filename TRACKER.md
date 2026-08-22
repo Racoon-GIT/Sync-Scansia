@@ -2,7 +2,9 @@
 
 ## Current state
 
-**Phase**: F1 (MVP) — **build complete, service live, mutations not yet enabled**. Branch `feat/scansia-manager`; `origin/main` = `origin/feat/scansia-manager` = `9270741`. Live service: https://scansia-manager.onrender.com (Render free, autoDeploy **OFF** = owner deploy-gate; `/health` 200, `/` 401 Basic Auth — independently verified). Approved plan: `~/.claude/plans/compressed-foraging-stream.md`.
+Pipeline: build · item: F1 (MVP) · plan: — (lost, see below) · gate-1: not recorded (pre-pipeline) · gate-2: pending
+
+**Phase**: F1 (MVP) — **build complete, service live, mutations not yet enabled**. Branch `feat/scansia-manager`; `origin/main` = `origin/feat/scansia-manager` = `9270741`. Live service: https://scansia-manager.onrender.com (Render free, autoDeploy **OFF** = owner deploy-gate; `/health` 200, `/` 401 Basic Auth — independently verified). Approved plan: **lost, not reconstructible** — cited as `~/.claude/plans/compressed-foraging-stream.md`, absent from `~/.claude/plans/` (7 files, none of them this one), from the workspace, and from the git history of this repo, of the spine and of `~/.claude` (verified 2026-08-22).
 
 **Milestones** (build history: archived detail below + git log):
 - [x] **M1a** (lib + consolidate) — library layers, 8 fixes, GSheet layer (append-oriented, `row_uuid`+`reconciled`, idempotent `backfill_cutover`), dead-module cleanup. Residue: regression checkpoint CLI-vs-prod (needs live store); orphan deps (`pandas`/`slugify`/`tenacity`) removal deferred to F2.
@@ -47,7 +49,7 @@
 ### Archived Current state — F1 build detail (IT, superseded 2026-07-16)
 
 **Fase**: F1 (MVP) — inizio esecuzione. Branch `feat/scansia-manager`.
-**Piano approvato**: `~/.claude/plans/compressed-foraging-stream.md` (327 righe, 9 giri di critica avversariale, F1≈8 execution-ready; F2 reorder = ciclo di pianificazione dedicato successivo).
+**Piano approvato**: **perso, non ricostruibile** — era citato come `~/.claude/plans/compressed-foraging-stream.md` (327 righe, 9 giri di critica avversariale, F1≈8 execution-ready; F2 reorder = ciclo di pianificazione dedicato successivo). Il file non esiste più da nessuna parte (verificato 2026-08-22).
 
 **Milestone F1** (critical path `M1a→M1b→[handoff SERVER+shared-secrets]→M2→M3→M4→M5→M-docs`):
 - [x] **M1a-lib** — *(layer libreria + 8 fix COMPLETO)* `transport.py` (unificato, fix timeout, retry) · `shopify/ops.py` (+net-new) · `gsheet/` · `services/resolvers.py` · `services/outlet_service.py` (orchestrazione publish CREATE/ACTIVE/DRAFT). **Fix**: 1 (cleanup tutte location≠Promo) ✅ · 2 (DRY_RUN fail-closed main.py) ✅ · 3 (userErrors→raise) ✅ · 4 (blocco prezzo 0/≥compareAt) ✅ · 5 (size-match Size+SKU cross-check) ✅ · 7 (media→productSet) ✅ · **6 (tag) e 8 (batching) = gated/F2, non M1a**. Review avversariale su ogni layer; 2 HIGH phantom-stock/oversell intercettati e corretti (duplicato DRAFT-atomico; DRAFT-revive quarantena). **129 test verdi.**
