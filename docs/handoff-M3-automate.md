@@ -1,5 +1,13 @@
 # Handoff → AUTOMATE (Make) — return-signal integration (unblocks M3)
 
+> **⚠ SUPERSEDED by the F6 cutover (2026-09-21) — historical record, not a live contract.** The sheet
+> `Scarpe_in_Scansia` stopped being the register at 2026-09-21T00:14:38Z; returned pairs live in
+> `racoon.sc_returned_pair*`. Measured 2026-09-28: the sheet has **zero** live writers — `2215567` has
+> been stopped since 2026-09-20T22:38:59Z (permanently), and `678434` v263 replaced modules 146/168
+> with `SP_SCANSIA_LOOKUP`/`SP_SCANSIA_CONSUME` and carries no Scansia-sheet module. Every "live
+> writer", "append", "race" and "sequencing" statement below describes the pre-cutover system. The
+> successor is F7 (MySQL adapter, `IT/_scansia-programme/plan.md` §4).
+
 Scansia Manager = new single-origin FastAPI web service replacing the 3 Sync-Scansia cron jobs (already suspended). Branch `feat/scansia-manager`. Library layer complete and tested (246 tests local / 344 in a venv with fastapi); this handoff defines the Make ⇄ tool sheet contract that M3 (publish-live) depends on.
 
 > AUTOMATE is not one of the 3 IT peers (SVILUPPO/SERVER/CLIENT) → this is an owner/Ale action or a future AUTOMATE session, NOT an `OPEN-HANDOFFS` peer row.
