@@ -8,6 +8,7 @@ from datetime import datetime
 import pytest
 
 from backend.persistence.audit_sink import AuditWriteUnfenced, IntentNotFound, RegisterAuditSink
+from backend.persistence.ports import AuditSink
 from backend.persistence.records import (
     KIND_AUDIT,
     KIND_DELETE,
@@ -45,6 +46,11 @@ def test_every_write_needs_the_pass_lease(be):
     with pytest.raises(AuditWriteUnfenced):
         sink.write_event(action="x")
     assert be.register().audit_rows(KIND_DELETE) == []
+
+
+def test_the_sink_satisfies_the_audit_port(be):
+    _, sink = _sink(be)
+    assert isinstance(sink, AuditSink)          # runtime_checkable: every method the port declares
 
 
 def test_price_intent_round_trip_by_unique_id(be):

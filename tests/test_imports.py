@@ -25,7 +25,7 @@ for name in sys.argv[1:]:
     try:
         importlib.import_module(name)
     except ImportError as e:
-        if "fastapi" in str(e) or "starlette" in str(e) or "mysql" in str(e) or "gspread" in str(e):
+        if "fastapi" in str(e) or "starlette" in str(e) or "mysql" in str(e):
             continue  # a web / driver dependency this interpreter lacks: not an import-order defect
         failed.append(f"{name}: {type(e).__name__}: {e}")
 print("\\n".join(failed))

@@ -45,8 +45,8 @@ from backend.api.mutations import (
     _close,
     _error,
     _run_preview_job,
-    _store_factory,
     poll_job,
+    register_for,
     submit_preview,
 )
 from backend.auth.basic_auth import require_basic_auth
@@ -161,7 +161,6 @@ INIT_VERTICAL = MutationVertical(
     serialize_plan=serialize_plan,
     serialize_report=serialize_report,
     token_kind=TOKEN_KIND_INIT,
-    collaborator="register_factory",
 )
 
 
@@ -241,7 +240,7 @@ def submit_init_apply(request: Request, body: InitApplyRequest, actor: str) -> A
         return _error(409, CODE_JOB_BUSY, "An operation is already in flight.")
     state.executor.submit(
         _run_baseline_job, state.job_store, rec.job_id, state,
-        _store_factory(state, INIT_VERTICAL, actor), state.transport_factory, plan, dlq, actor,
+        register_for(state, actor), state.transport_factory, plan, dlq, actor,
     )
     return {"job_id": rec.job_id, "status": rec.status}
 
@@ -325,7 +324,7 @@ def build_relevel_router() -> APIRouter:
             return plan
 
         state.executor.submit(
-            _run_preview_job, state.job_store, rec.job_id, _store_factory(state, INIT_VERTICAL),
+            _run_preview_job, state.job_store, rec.job_id, register_for(state),
             state.transport_factory, _preview, init_plan_hash, serialize_relevel_plan, state.token_service,
             TOKEN_KIND_RELEVEL, INIT_VERTICAL.ttl_s, None,
         )
@@ -346,7 +345,7 @@ def build_relevel_router() -> APIRouter:
         except JobBusyError:
             return _error(409, CODE_JOB_BUSY, "An operation is already in flight.")
         state.executor.submit(_run_relevel_job, state.job_store, rec.job_id, state,
-                              _store_factory(state, INIT_VERTICAL, actor), state.transport_factory, plan, dlq)
+                              register_for(state, actor), state.transport_factory, plan, dlq)
         return {"job_id": rec.job_id, "status": rec.status}
 
     @router.get("/apply/{job_id}")

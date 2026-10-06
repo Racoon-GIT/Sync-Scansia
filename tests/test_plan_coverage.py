@@ -9,6 +9,7 @@ import time
 import pytest
 
 from backend.persistence.records import (
+    APPLIED,
     CARRIED,
     DONE,
     FAILED,
@@ -78,6 +79,14 @@ def crash_once(op: str, nth: int = 0):
             raise SimulatedCrashInShop(f"killed right before {op} #{nth}")
 
     return hook
+
+
+_WRITES = ("renew", "commit", "insert_audit", "update_audit", "stamp", "update_pairs")
+
+
+def _wrote(db_log) -> bool:
+    """Whether the in-memory store saw a write — the lease's included."""
+    return any(x[0] in _WRITES or x[0].startswith("lease_") for x in db_log)
 
 
 # ---------------------------------------------------------------------------
@@ -1256,9 +1265,12 @@ def test_s9_a_failed_promo_gate_read_runs_no_pass_and_the_next_trigger_does():
     env, out, e = minus_env()
     env.shop.fault("locations", "timeout_before")
     gen = env.register().lease_state().generation
+    env.be.db.log.clear()
     worker = DecrementWorker(env.decrement, spawn=lambda fn: fn())
     worker.trigger("678434")
     assert worker.last["outcome"] == "error" and env.unstamped() == [e] and env.shop.count("adjust") == 0
+    assert worker.last["error"] == "ShopifyOutcomeUnknown"       # RD2: the transport error, kept by its type
+    assert not _wrote(env.be.db.log)                             # no lease write, no RECONCILE / AUDIT row
     assert env.register().lease_state().generation == gen        # the lease never taken
     worker.trigger("net")
     assert worker.last["outcome"] == "done" and env.unstamped() == [] and env.shop.available(out.gid, "42") == 1
@@ -1280,3 +1292,94 @@ def test_s10_a_creates_deactivation_whose_location_reads_gone_applies_and_the_gr
     deact = rows_by(w, L.A_DEACTIVATE)
     assert deact and all(r.status == DONE for r in deact)
     assert [r.outcome.get("already_inactive") for r in deact].count(True) == 1
+
+
+# ---------------------------------------------------------------------------
+# RD1, RD2 — the two readings judged 2026-10-06 21:17Z (D16): a stamp failure waits
+# for the next pass's recovery; a failed `locations` read starts no writing pass
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("retry_fails", [False, True])
+def test_rd1_a_stamp_failure_leaves_its_key_in_flight_and_the_next_pass_recovers_it(retry_fails, monkeypatch):
+    env = Env()
+    out_a = env.shop.product("A - Outlet", sku="A", promo={"42": 1, "43": 0})    # A's −1 takes its last unit
+    out_b = env.shop.product("B - Outlet", sku="B", promo={"42": 2, "43": 1})
+    for sku in ("A", "B"):
+        for _ in range(2):
+            env.be.add_shelf_pair(sku, "42", reconciled=True)
+    e_a, e_b = env.be.consume("A", "42"), env.be.consume("B", "42")
+    real, failures = Register.stamp, []
+
+    def stamp(self, lease, event_ids, **kw):
+        if e_a in set(event_ids) and (retry_fails or not failures):
+            failures.append(1)
+            raise StoreError("the stamp's transaction failed")
+        return real(self, lease, event_ids, **kw)
+
+    monkeypatch.setattr(Register, "stamp", stamp)
+    item_a = env.shop.variant(out_a.gid, "42").item
+
+    def minus_sent_for_a():
+        return [c for c in env.shop.calls if c[0] == "adjust" and c[1]["input"]["changes"][0]["inventoryItemId"] == item_a]
+
+    def pending_ids():
+        return {ev.event_id for ev in env.register().pending_deltas().events}
+
+    rep = env.decrement()
+    assert rep.applied == {"A|42": "error:StoreError", "B|42": "stamped"}      # A's failure never stops B
+    assert e_b not in env.unstamped() and env.shop.available(out_b.gid, "42") == 1
+    (row_a,) = [r for r in env.rows() if r.action == L.A_ADJUST and r.event_ids == {e_a}]
+    assert row_a.status == APPLIED and e_a in env.unstamped() and e_a not in pending_ids()   # in flight: held
+    assert len(minus_sent_for_a()) == 1 and env.shop.products[out_a.gid].status == "ACTIVE"  # the rule not reached
+
+    rep2 = env.decrement()                                       # a fresh lease: recovery first
+    (row_a,) = [r for r in env.rows() if r.row_id == row_a.row_id]
+    assert len(minus_sent_for_a()) == 1                          # recovery never re-sends a landed −Δ
+    assert env.shop.products[out_a.gid].status == "DRAFT"       # the total rule on A's product: its −Δ landed
+    if retry_fails:
+        assert "stamp_failed" in rep2.report.kinds() and row_a.status == APPLIED
+        assert e_a in env.unstamped() and e_a not in pending_ids()
+    else:
+        assert row_a.status == DONE and env.unstamped() == []
+
+
+def _writing_pass(name):
+    """(backend, shop, register handle, the pass) for a person's writing pass, its
+    preview (a read: never gated) taken before the `locations` read fails."""
+    if name == "publish":
+        w = World()
+        w.returned(n=2)
+        _source(w)
+        plan = w.preview()
+        return w.be, w.shop, w.register(), lambda: outlet_service.publish_apply(
+            w.register(), w.shop, plan, promo_location_id=PROMO)
+    env = BaselineEnv()
+    env.imported(price_outlet="50.00", price_high="100.00")
+    env.shop.product("Nike - Outlet", promo={"42": 0, "43": 0})
+    if name == "baseline":
+        plan = env.preview()
+        return env.be, env.shop, env.register(), lambda: env.apply(plan)
+    env.run()                                                    # the whole-register BASELINE
+    if name == "relevel":
+        plan = R.relevel_preview(env.register(), env.shop, [K], promo_location_id=PROMO)
+        return env.be, env.shop, env.register(), lambda: R.relevel_apply(
+            env.register(), env.shop, plan, promo_location_id=PROMO, dlq=env.dlq(plan), sleep=noop)
+    return env.be, env.shop, env.register(), lambda: passes.Holder(
+        env.register(), env.shop, PROMO, "pricing", sleep=noop).start()
+
+
+@pytest.mark.parametrize("name", ["publish", "baseline", "relevel", "holder"])
+def test_rd2_a_failed_locations_read_starts_no_writing_pass_its_transport_error_surfaced(name):
+    from backend.api.errors import map_exception
+    from backend.shopify.transport import ShopifyTransportError
+
+    be, shop, reg, run = _writing_pass(name)
+    gen, before = reg.lease_state().generation, len(shop.calls)
+    be.db.log.clear()
+    shop.fault("locations", "timeout_before")
+    with pytest.raises(ShopifyTransportError) as exc:
+        run()
+    err = map_exception(exc.value)
+    assert (err.status_code, err.error_code) == (502, "shopify_transport_error")   # not promo_anchor_invalid
+    assert not _wrote(be.db.log) and reg.lease_state().generation == gen
+    assert shop.names()[before:] == ["locations"]                # nothing sent after the failed read

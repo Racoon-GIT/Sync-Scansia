@@ -677,9 +677,3 @@ def _fresh_action(ctx: flows.Context, sku: str) -> Optional[PlanAction]:
     if sg is None:
         return None
     return _plan_sku(ctx.register, ctx.transport, ctx.promo, sg)
-
-
-def run(dry_run: bool) -> None:
-    """``RUN_MODE=SYNC`` read the sheet; the register has no cron path. Publish
-    runs from the web app (preview → confirm). Removed with §3.8 (§4 step 5)."""
-    raise RuntimeError("RUN_MODE=SYNC is retired: the register is MySQL (F7); publish from the web app")

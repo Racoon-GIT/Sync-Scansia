@@ -6,7 +6,8 @@ complementary buckets:
 * :func:`outlet_resolver` — the OUTLET products for that SKU;
 * :func:`source_resolver` — the full-price SOURCE products for that SKU.
 
-They replace the fragile legacy heuristics in ``src/sync.py``:
+They replace the fragile legacy heuristics in ``src/sync.py`` (removed with F7 §3.8;
+the lines cited are ``git show 8aab2a3:src/sync.py``):
 ``find_outlet_by_sku`` (297-384), ``find_product_by_sku_non_outlet`` (252-280),
 and make ``find_product_by_handle`` (282-295, no live call-site) and every
 ``handle.endswith('-outlet')`` guess obsolete. Membership in the ground-truth

@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-main.py - Entry point unificato per sync e reorder
+main.py - Entry point del job cron REORDER
 
 Esecuzione:
-    python -m src.main
+    RUN_MODE=REORDER COLLECTION_ID=262965428289 python -m main
 
 ENV Variables:
-    RUN_MODE: "SYNC" o "REORDER" (obbligatorio)
-    
-    Per SYNC:
-        (usa tutte le ENV già configurate)
-    
-    Per REORDER:
-        COLLECTION_ID: ID numerico collection (es: 262965428289)
+    RUN_MODE: "REORDER" (obbligatorio)
+    COLLECTION_ID: ID numerico collection (es: 262965428289)
+    DRY_RUN: DRY-RUN salvo token APPLY esplicito (vedi _resolve_dry_run)
+
+SYNC e FIX_PRICES leggevano il foglio "Scarpe_in_Scansia": ritirati con F7 (il
+registro è MySQL, docs/f7-mysql-adapter-plan.md §3.8). Pubblicazione e prezzi
+girano dalla web app Scansia Manager (backend/app.py).
 """
 
 import logging
@@ -39,72 +39,36 @@ def _resolve_dry_run() -> bool:
 
 
 def main():
-    """Entry point unificato"""
-    
+    """Entry point del job REORDER"""
+
     # Leggi RUN_MODE
     run_mode = os.environ.get("RUN_MODE", "").upper()
-    
+
     if not run_mode:
         logger.error("=" * 70)
         logger.error("ERRORE: ENV variable RUN_MODE non configurata!")
         logger.error("")
         logger.error("Configura RUN_MODE su Render:")
-        logger.error('  - RUN_MODE=SYNC       (per sincronizzazione outlet)')
         logger.error('  - RUN_MODE=REORDER    (per riordino collection)')
         logger.error("=" * 70)
         sys.exit(1)
-    
-    # Valida RUN_MODE
-    if run_mode not in ["SYNC", "REORDER", "FIX_PRICES"]:
+
+    # Valida RUN_MODE (SYNC e FIX_PRICES non esistono più: vedi la docstring)
+    if run_mode != "REORDER":
         logger.error("=" * 70)
         logger.error(f"ERRORE: RUN_MODE='{run_mode}' non valido!")
         logger.error("")
         logger.error("Valori ammessi:")
-        logger.error('  - RUN_MODE=SYNC')
         logger.error('  - RUN_MODE=REORDER')
-        logger.error('  - RUN_MODE=FIX_PRICES')
         logger.error("=" * 70)
         sys.exit(1)
-    
+
     logger.info("=" * 70)
-    logger.info("ENTRY POINT UNIFICATO - Sync-Scansia")
+    logger.info("ENTRY POINT - Sync-Scansia")
     logger.info(f"RUN_MODE: {run_mode}")
     logger.info("=" * 70)
-    
-    # Esegui tool appropriato
-    if run_mode == "SYNC":
-        run_sync()
-    elif run_mode == "REORDER":
-        run_reorder()
-    elif run_mode == "FIX_PRICES":
-        run_fix_prices()
 
-def run_sync():
-    """Esegue la nuova orchestrazione PUBLISH (backend.services.outlet_service).
-
-    Sostituisce il vecchio wrapper su src/sync.py: outlet_service compone
-    gsheet + resolvers + ops (preview sempre; apply solo se NON dry-run).
-    """
-    logger.info("")
-    logger.info("🔄 Esecuzione SYNC - Creazione/Aggiornamento Outlet")
-    logger.info("")
-
-    # FIX2 — fail-closed: default DRY-RUN salvo token APPLY esplicito.
-    dry_run = _resolve_dry_run()
-    mode_str = "DRY-RUN (nessuna modifica)" if dry_run else "APPLY (applica modifiche)"
-    logger.info(f"Modalità: {mode_str}")
-    logger.info("")
-
-    try:
-        from backend.services import outlet_service
-
-        outlet_service.run(dry_run=dry_run)
-        logger.info("")
-        logger.info("✅ SYNC completato con successo")
-    except Exception as e:
-        logger.error("")
-        logger.error("❌ SYNC fallito: %s", e, exc_info=True)
-        sys.exit(1)
+    run_reorder()
 
 def run_reorder():
     """Esegue reorder_collection.py"""
@@ -184,58 +148,6 @@ def run_reorder():
         logger.error("")
         logger.error("❌ REORDER fallito: %s", e, exc_info=True)
         sys.exit(1)
-
-def run_fix_prices():
-    """Esegue fix_prices.py per aggiornamento prezzi massivo"""
-    logger.info("")
-    logger.info("🔧 Esecuzione FIX_PRICES - Aggiornamento Prezzi Massivo")
-    logger.info("")
-
-    # FIX2 — fail-closed: default DRY-RUN salvo token APPLY esplicito.
-    dry_run = _resolve_dry_run()
-    mode_str = "DRY-RUN (nessuna modifica)" if dry_run else "APPLY (applica modifiche)"
-    logger.info(f"Modalità: {mode_str}")
-    logger.info("")
-
-    # Importa modulo fix_prices
-    try:
-        import fix_prices
-    except ImportError as e:
-        logger.error("Errore import fix_prices.py: %s", e)
-        sys.exit(1)
-
-    # Salva sys.argv originale
-    original_argv = sys.argv
-
-    try:
-        # Imposta args per fix_prices (aggiungi --apply solo se NON dry-run)
-        args = ["fix_prices.py"]
-        if not dry_run:
-            args.append("--apply")
-
-        sys.argv = args
-
-        # Esegui main di fix_prices
-        fix_prices.main()
-        logger.info("")
-        logger.info("✅ FIX_PRICES completato con successo")
-
-    except SystemExit as e:
-        # fix_prices.py usa sys.exit(), gestiamo normalmente
-        if e.code != 0:
-            logger.error("")
-            logger.error("❌ FIX_PRICES fallito con exit code %s", e.code)
-            raise
-        else:
-            logger.info("")
-            logger.info("✅ FIX_PRICES completato")
-    except Exception as e:
-        logger.error("")
-        logger.error("❌ FIX_PRICES fallito: %s", e, exc_info=True)
-        sys.exit(1)
-    finally:
-        # Ripristina sys.argv
-        sys.argv = original_argv
 
 if __name__ == "__main__":
     main()

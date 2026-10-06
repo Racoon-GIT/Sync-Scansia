@@ -197,6 +197,13 @@ for the jobs' slot; its own bearer, fail-closed: `trig` ×9. The call's failure 
 | S9 | a wrong anchor → 503, lease not taken, nothing written; a failed `locations` read → no pass, the next trigger runs it | `gate` ×3; `cov` s9 |
 | S10 | a CREATE's deactivation whose location reads gone → APPLIED, the group completes; a lowering → FAILED | `cov` s10; w12_aa1 [level_gone] |
 
+The two readings (`~/.claude/racoon-bus/msg/20261006-2117-scansia-f6-sync-scansia.md`, both accepted; added at §4.5):
+
+| Id | Test case | Pinned by |
+|---|---|---|
+| RD1 | a stamp failure on key A in a pass over A and B: B applied and stamped, A's row `APPLIED`, its events out of `pending_deltas()`, one −Δ; the next pass recovers it — stamp `DONE`, the total rule on A's product, no second call; the retry failing again → `stamp_failed`, A still held, still one −Δ | `cov` rd1 ×2 |
+| RD2 | a failed `locations` read: the decrement takes no lease, writes no row, the worker keeps the error's type, the next trigger runs; publish, baseline, re-level and a `Holder` raise the transport error (502 `shopify_transport_error`, not `promo_anchor_invalid`), nothing written, nothing sent | `cov` s9; rd2 ×4 |
+
 ## 10. What the map changed in code
 
 | Gap found | Change | Pinned by |

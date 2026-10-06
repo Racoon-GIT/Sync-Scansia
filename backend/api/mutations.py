@@ -24,8 +24,8 @@ The contract (per the approved M3-M5 design):
   and apply -> the job resolves ``VERIFY_FAILED`` and the service ``*_apply`` is
   NEVER called; (3) for verticals that require it, a human-gesture gate runs
   against ``fresh_plan``; (4) only then ``*_apply(fresh_plan, audit_sink=...)`` runs
-  and its report is serialized into the job result. Recompute-at-apply is coherent
-  with the sheet-centric persistence (plans are not durably stored).
+  and its report is serialized into the job result. Plans are not durably stored:
+  the apply re-reads the register and Shopify live.
 
 Single-slot: preview and apply share the same ``JobStore`` slot (one operation at a
 time) — correct for the single-operator tool. Secrets (the signing secret behind
@@ -94,8 +94,8 @@ class MutationVertical:
     service kwargs (promo location, mode, params, ...) are closed over per-request
     without this module knowing any service signature:
 
-    * ``make_preview(state) -> (sheet, transport) -> plan``
-    * ``make_apply(state)   -> (sheet, transport, approved_plan, audit_sink) -> report``
+    * ``make_preview(state) -> (register, transport) -> plan``
+    * ``make_apply(state)   -> (register, transport, approved_plan, audit_sink) -> report``
 
     ``plan_hash_fn(plan) -> str`` derives the aggregate TOCTOU key (the token is
     bound to it and the drift gate compares it). ``serialize_plan`` /
@@ -103,7 +103,7 @@ class MutationVertical:
 
     Optional hooks (unused by publish):
 
-    * ``make_audit(state, actor) -> (sheet) -> audit_sink`` — per-request sink for
+    * ``make_audit(state, actor) -> (register) -> audit_sink`` — per-request sink for
       verticals that write audit (delete/prices); the actor is captured here.
     * ``make_gesture(body) -> (fresh_plan) -> Optional[str]`` — human-gesture gate;
       returns a stable failure code (job result status) or ``None`` when satisfied.
@@ -127,19 +127,6 @@ class MutationVertical:
     extra_fn: Optional[Callable[[Any], Dict[str, Any]]] = None
     make_audit: Optional[Callable[[Any, str], Callable[[Any], Any]]] = None
     make_gesture: Optional[Callable[[ApplyRequest], Callable[[Any], Optional[str]]]] = None
-    # The ``app.state`` factory of the store handle the closures receive first:
-    # ``register_factory`` (the register, MySQL) or ``sheet_factory`` (the
-    # verticals not yet moved off the sheet — F7 §4 step 4).
-    collaborator: str = "sheet_factory"
-
-
-def _store_factory(state: Any, spec: "MutationVertical", actor: Optional[str] = None) -> Callable[[], Any]:
-    """The job's store-handle factory; a register is bound to the acting user,
-    whose name every audit row it writes carries."""
-    factory = getattr(state, spec.collaborator)
-    if spec.collaborator == "register_factory" and actor is not None:
-        return lambda: factory(actor=actor)
-    return factory
 
 
 def register_for(state: Any, actor: Optional[str] = None) -> Callable[[], Any]:
@@ -152,8 +139,8 @@ def register_for(state: Any, actor: Optional[str] = None) -> Callable[[], Any]:
 
 
 def _close(handle: Any) -> None:
-    """End a store handle's connection (no connection outlives a job, F7 §3.7
-    rule 4). Handles without ``close`` (the sheet) are left as they are."""
+    """End a register handle's connection (no connection outlives a job, F7 §3.7
+    rule 4). A handle without ``close`` (a test fake) is left as it is."""
     close = getattr(handle, "close", None)
     if callable(close):
         try:
@@ -170,7 +157,7 @@ def _close(handle: Any) -> None:
 def _run_preview_job(
     store: JobStore,
     job_id: str,
-    sheet_factory: Callable[[], Any],
+    register_factory: Callable[[], Any],
     transport_factory: Callable[[], Any],
     preview_fn: Callable[[Any, Any], Any],
     plan_hash_fn: Callable[[Any], str],
@@ -194,11 +181,11 @@ def _run_preview_job(
     from backend.api.errors import map_exception  # local import: keep module light
 
     store.mark_running(job_id)
-    sheet = None
+    register = None
     try:
-        sheet = sheet_factory()
+        register = register_factory()
         transport = transport_factory()
-        plan = preview_fn(sheet, transport)  # READ-ONLY: no mutation
+        plan = preview_fn(register, transport)  # READ-ONLY: no mutation
         plan_hash = plan_hash_fn(plan)
         token_hash = token_binding_fn(plan) if token_binding_fn is not None else plan_hash
         # mint fail-closed on a missing signing secret -> ConfigError -> stable code.
@@ -217,14 +204,14 @@ def _run_preview_job(
         logger.error("preview job %s failed: %s -> %s", job_id, type(e).__name__, err.error_code)
         store.mark_failed(job_id, err.error_code)
     finally:
-        _close(sheet)
+        _close(register)
 
 
 def _run_apply_job(
     store: JobStore,
     job_id: str,
     submitted_plan_hash: str,
-    sheet_factory: Callable[[], Any],
+    register_factory: Callable[[], Any],
     transport_factory: Callable[[], Any],
     audit_builder: Optional[Callable[[Any], Any]],
     preview_fn: Callable[[Any, Any], Any],
@@ -242,12 +229,12 @@ def _run_apply_job(
     from backend.api.errors import map_exception  # local import: keep module light
 
     store.mark_running(job_id)
-    sheet = None
+    register = None
     try:
-        sheet = sheet_factory()
+        register = register_factory()
         transport = transport_factory()
         # (1) recompute the plan against LIVE state (read-only).
-        fresh_plan = preview_fn(sheet, transport)
+        fresh_plan = preview_fn(register, transport)
         fresh_hash = plan_hash_fn(fresh_plan)
         # (2) drift gate: the world changed between preview and apply -> abort clean.
         if fresh_hash != submitted_plan_hash:
@@ -266,8 +253,8 @@ def _run_apply_job(
                 return
         # (4) apply. Build the per-request audit sink (actor-bound) only where the
         # vertical writes audit; publish passes no builder (audit_sink=None).
-        audit_sink = audit_builder(sheet) if audit_builder is not None else None
-        report = apply_fn(sheet, transport, fresh_plan, audit_sink)
+        audit_sink = audit_builder(register) if audit_builder is not None else None
+        report = apply_fn(register, transport, fresh_plan, audit_sink)
         store.mark_done(job_id, {
             "status": APPLY_STATUS_APPLIED,
             "applied": True,
@@ -279,7 +266,7 @@ def _run_apply_job(
         logger.error("apply job %s failed: %s -> %s", job_id, type(e).__name__, err.error_code)
         store.mark_failed(job_id, err.error_code)
     finally:
-        _close(sheet)
+        _close(register)
 
 
 def _run_readonly_job(
@@ -292,7 +279,7 @@ def _run_readonly_job(
     """Worker: a slow READ-ONLY Shopify recon (zero-stock / discharge-debt).
 
     Mints NO token (nothing to apply), so it runs even when the signing secret is
-    unset. Builds only the transport (these recons never touch the sheet). Same
+    unset. Builds only the transport (these recons never touch the register). Same
     top-level guard: a whole-job failure -> ``JOB_FAILED`` with a STABLE code (a
     missing Promo anchor -> ``promo_anchor_missing``, etc.), never a raw message.
     """
@@ -312,7 +299,7 @@ def _run_readonly_job(
 def _run_mutation_job(
     store: JobStore,
     job_id: str,
-    sheet_factory: Callable[[], Any],
+    register_factory: Callable[[], Any],
     transport_factory: Callable[[], Any],
     audit_builder: Optional[Callable[[Any], Any]],
     mutate_fn: Callable[[Any, Any, Any], Any],
@@ -331,19 +318,19 @@ def _run_mutation_job(
     from backend.api.errors import map_exception  # local import: keep module light
 
     store.mark_running(job_id)
-    sheet = None
+    register = None
     try:
-        sheet = sheet_factory()
+        register = register_factory()
         transport = transport_factory()
-        audit_sink = audit_builder(sheet) if audit_builder is not None else None
-        result = mutate_fn(sheet, transport, audit_sink)
+        audit_sink = audit_builder(register) if audit_builder is not None else None
+        result = mutate_fn(register, transport, audit_sink)
         store.mark_done(job_id, serialize_fn(result))
     except Exception as e:  # noqa: BLE001 - top-level job guard; bounded code only
         err = map_exception(e)
         logger.error("mutation job %s failed: %s -> %s", job_id, type(e).__name__, err.error_code)
         store.mark_failed(job_id, err.error_code)
     finally:
-        _close(sheet)
+        _close(register)
 
 
 # =============================================================================
@@ -366,7 +353,7 @@ def submit_preview(request: Request, spec: MutationVertical) -> Any:
         _run_preview_job,
         state.job_store,
         rec.job_id,
-        _store_factory(state, spec),
+        register_for(state),
         state.transport_factory,
         preview_fn,
         spec.plan_hash_fn,
@@ -405,7 +392,7 @@ def submit_apply(request: Request, spec: MutationVertical, body: ApplyRequest, a
         state.job_store,
         rec.job_id,
         body.plan_hash,
-        _store_factory(state, spec, actor),
+        register_for(state, actor),
         state.transport_factory,
         audit_builder,
         preview_fn,

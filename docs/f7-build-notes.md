@@ -271,6 +271,18 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   groups the shelf by SKU, prefers the pairs' `OUTLET_PRODUCT_ID`, matches sizes exactly (twins surfaced, §3.2),
   never counts customisation-only units; `GET /audit` = the newest `AUDIT` rows.
 
+## §4.5 — the removal of §3.8 (what went, what stays)
+
+- Gone: `backend/gsheet/`, `persistence/gsheet_audit.py`, `src/sync.py`, `fix_prices.py`, `outlet_service.run`, the
+  app's `sheet_factory` / `audit_factory`, the sheet error codes (`cutover_not_done`, `sheet_io_error`,
+  `sheet_error`) and their tests. `requirements.txt` loses `gspread`, the Google auth packages (the sheet's
+  credentials) and `pandas`, `python-slugify`, `tenacity` (imported by nothing). The mutation workers take the
+  register factory only (`register_for`; `MutationVertical.collaborator` is gone).
+- Stays: `RUN_MODE=REORDER` (`main.py` + `src/reorder_collection.py`, not in §3.8). `SYNC` and `FIX_PRICES` are
+  unknown modes now: exit 1, nothing run — the suspended cron of `render.yaml` still names `SYNC`. `render.yaml`
+  itself stays: the cron's deletion is SERVER/Ale's Render change (§3.8), and so is dropping the web service's
+  `GSPREAD_*` / Google env vars (F7.3) — no code reads them now.
+
 ## Parameters the plan proposes, fixed here (each one tested)
 
 - The `/dlqs` precondition (§3.4): the typed instant (ISO 8601; no offset → Europe/Rome) and `dlqCount`, which must

@@ -140,8 +140,8 @@ class World:
         self.be.seed_baseline()
         self.shop = FakeShop()
         app = create_app(config=ShopifyConfig("t.myshopify.com", "shpat_x", "2026-10", PROMO),
-                         sheet_factory=lambda: None, register_factory=lambda **kw: self.be.register(**kw),
-                         transport_factory=lambda: self.shop, audit_factory=lambda: None,
+                         register_factory=lambda **kw: self.be.register(**kw),
+                         transport_factory=lambda: self.shop,
                          executor=executor or SynchronousExecutor(), promo_location_id=PROMO)
         self.client = TestClient(app)
 

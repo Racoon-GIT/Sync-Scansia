@@ -228,8 +228,8 @@ def _client(monkeypatch, *, executor=None):
     monkeypatch.setenv("APP_PASSWORD", "s3cret-pw")
     be, shop = MemoryBackend(), FakeShop()
     app = create_app(config=ShopifyConfig("t.myshopify.com", "shpat_x", "2026-10", PROMO),
-                     sheet_factory=lambda: None, register_factory=lambda **kw: be.register(**kw),
-                     transport_factory=lambda: shop, audit_factory=lambda: None,
+                     register_factory=lambda **kw: be.register(**kw),
+                     transport_factory=lambda: shop,
                      executor=executor or SynchronousExecutor(), promo_location_id=PROMO)
     return TestClient(app), be, shop
 

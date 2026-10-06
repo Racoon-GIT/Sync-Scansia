@@ -6,7 +6,8 @@ operation. The first argument is always a ``ShopifyTransport`` (see
 ``transport.graphql(query, variables)`` and shapes the result. No module-level
 state, no HTTP session ownership, no secrets — those all live in the transport.
 
-M1a migration notes (authoritative source: ``src/sync.py`` legacy methods):
+M1a migration notes (authoritative source: ``src/sync.py`` legacy methods — removed
+with F7 §3.8; the lines cited are ``git show 8aab2a3:src/sync.py``):
 
 * API version: PINNED at 2026-10 (``backend.config.PINNED_API_VERSION``, F7
   §7): every document here is written against it — ``@idempotent`` and

@@ -139,7 +139,6 @@ PUBLISH_VERTICAL = MutationVertical(
     serialize_plan=serialize_plan,
     serialize_report=serialize_report,
     token_kind="publish",
-    collaborator="register_factory",
 )
 
 

@@ -257,7 +257,6 @@ def _make_client(monkeypatch, svc: _MockService):
         config=cfg,
         register_factory=lambda **kw: FakeRegister(**kw),
         transport_factory=lambda: FakeTransport(),
-        audit_factory=lambda: None,
         executor=SynchronousExecutor(),  # POST completes the job inline
         promo_location_id=PROMO,
     )
@@ -440,8 +439,8 @@ def test_publish_without_a_configured_register_fails_closed(monkeypatch):
         monkeypatch.delenv(var, raising=False)
     app = create_app(
         config=ShopifyConfig("t.myshopify.com", "shpat_x", "2025-07", PROMO),
-        sheet_factory=lambda: object(), transport_factory=lambda: FakeTransport(),
-        audit_factory=lambda: None, executor=SynchronousExecutor(), promo_location_id=PROMO,
+        transport_factory=lambda: FakeTransport(),
+        executor=SynchronousExecutor(), promo_location_id=PROMO,
     )
     with TestClient(app) as client:
         sub = client.post("/outlet/publish/preview", headers=_auth())

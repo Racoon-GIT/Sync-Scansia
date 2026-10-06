@@ -1,12 +1,4 @@
-# Pinned to avoid build-from-source on Render with Python 3.12 (runtime.txt provided).
-pandas==2.2.3,<3.0
 requests>=2.31.0
-python-slugify>=8.0.4
-tenacity>=8.2.3
-gspread>=6.0.0
-google-auth>=2.28.0
-google-auth-httplib2>=0.2.0
-google-auth-oauthlib>=1.2.0
 pytest>=8.0.0
 
 # --- Scansia Manager web foundation (M-foundation) -------------------------
@@ -22,4 +14,6 @@ httpx>=0.27,<0.28       # TestClient transport for the FastAPI dependency tests
 # --- F7: the register on MySQL racoon (plan docs/f7-mysql-adapter-plan.md §4 step 3) ---
 # Same pin as shopify-mysql-sync, ADV-Dashboard/ingest and Feed-Exporter; verifies the
 # in-house CA by IP (SVILUPPO/docs/shared-database.md §TLS).
+# F7 §3.8 removed the sheet stack (gspread + google-auth*) and the deps nothing imported
+# (pandas, python-slugify, tenacity).
 mysql-connector-python==9.6.0

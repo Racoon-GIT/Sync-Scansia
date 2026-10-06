@@ -1,4 +1,4 @@
-# Testing — local pytest and the FastAPI skip gap
+# Testing — local pytest, the FastAPI skip gap, the staging opt-in
 
 This is a house pattern, not a CI pipeline: `pytest` is run locally (pre-commit)
 in the developer's own environment. There is no configured CI service for this
@@ -9,20 +9,19 @@ repo today.
 The Scansia Manager web layer (`backend/api/*`, `backend/app.py`) imports
 `fastapi`/`httpx`. Those two packages are listed in `requirements.txt` but are
 NOT required by the compute core (`backend/services/*`, `backend/shopify/*`,
-`backend/gsheet/*`), which is deliberately importable and testable on a bare
-interpreter (see the module docstrings — e.g. `backend/api/mutations.py`:
-"imports FastAPI, so it loads ONLY where the web deps are installed").
+`backend/persistence/*` — the MySQL driver is imported lazily, at the first
+connect), which is deliberately importable and testable on a bare interpreter
+(see the module docstrings — e.g. `backend/api/mutations.py`: "imports FastAPI,
+so it loads ONLY where the web deps are installed").
 
 Every test module that exercises the web layer gates itself with
 `pytest.importorskip("fastapi")` / `pytest.importorskip("httpx")`. If those
 packages are not installed in the interpreter running `pytest`, those tests
 report as **SKIPPED**, not failed — this is intentional, not a masked failure.
-As of this writing that gap is roughly 80 tests (TestClient tier of
-`test_api_delete.py`, `test_api_prices.py`, `test_api_publish.py`, `test_app.py`,
-plus the worker-tier tests in those same files that only need `fastapi` for the
-import).
+Measured 2026-10-06 on a bare Python 3.13 (pytest + requests, no fastapi): 642
+passed, 131 skipped for `fastapi`, 28 for the staging opt-in below.
 
-## Running the full suite (0 skips)
+## Running the full offline suite (no fastapi skips)
 
 Use a throwaway virtualenv OUTSIDE the repo so the project's own
 `requirements.txt` workflow (no `pip install` inside the repo — see root
@@ -38,7 +37,21 @@ deactivate
 rm -rf /tmp/scansia-test-venv
 ```
 
-With `fastapi`/`httpx` present, every previously-skipped test executes for
+With `fastapi`/`httpx` present, every previously-skipped web test executes for
 real. A partial local run (fastapi/httpx absent) is still a valid signal for
 everything OUTSIDE the web layer — it is just not a complete signal for the
 API routes themselves.
+
+## The staging opt-in (28 tests)
+
+The register store's contract (`tests/test_register_store.py`) runs on the
+in-memory fake always, and on MySQL `racoon_staging` only when
+`SCANSIA_STAGING=1` is set; `tests/test_consume_beside_f7.py` runs on staging
+only. The fixture refuses any schema but `racoon_staging`, marks its rows
+(`f7test`) and deletes them at each start; credentials are SERVER's option files
+(`~/.config/racoon-scansia/<user>.cred`), read by the driver only. Harness and
+facts: `docs/f7-build-notes.md` §Code layering.
+
+```bash
+SCANSIA_STAGING=1 pytest tests/test_register_store.py tests/test_consume_beside_f7.py -k "mysql or consume_beside"
+```

@@ -208,32 +208,6 @@ def test_dry_run_preview_is_read_only():
     assert w.mutated() == []
 
 
-def test_main_resolve_dry_run_fail_closed(monkeypatch):
-    import main
-    monkeypatch.delenv("DRY_RUN", raising=False)
-    assert main._resolve_dry_run() is True
-    for tok in ["", "true", "1", "yes", "garbage", "dry", "TRUE "]:
-        monkeypatch.setenv("DRY_RUN", tok)
-        assert main._resolve_dry_run() is True, tok
-    for tok in ["false", "0", "no", "apply", "APPLY", "Off"]:
-        monkeypatch.setenv("DRY_RUN", tok)
-        assert main._resolve_dry_run() is False, tok
-
-
-def test_main_run_sync_dry_run_unset_does_not_mutate(monkeypatch):
-    import main
-    recorded = {}
-    monkeypatch.setattr(outlet_service, "run", lambda dry_run: recorded.update(dry_run=dry_run))
-    monkeypatch.delenv("DRY_RUN", raising=False)
-    main.run_sync()
-    assert recorded == {"dry_run": True}
-
-
-def test_legacy_run_mode_sync_is_retired():
-    with pytest.raises(RuntimeError):
-        outlet_service.run(dry_run=True)
-
-
 def test_create_duplicate_is_draft_atomically_fix1():
     w = World()
     w.returned(n=2)

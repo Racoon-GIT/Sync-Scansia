@@ -33,9 +33,7 @@ def _app(monkeypatch):
     cfg = ShopifyConfig("t.myshopify.com", "shpat_x", "2025-07", "gid://shopify/Location/PROMO")
     return create_app(
         config=cfg,
-        sheet_factory=lambda: None,
         transport_factory=lambda: None,
-        audit_factory=lambda: None,
         promo_location_id="gid://shopify/Location/PROMO",
     )
 

@@ -159,10 +159,8 @@ def _make_client(monkeypatch, svc: _MockPricingService):
 
     app = create_app(
         config=cfg,
-        sheet_factory=lambda: None,
         register_factory=lambda actor="": FakeRegister(actor),
         transport_factory=lambda: FakeTransport(),
-        audit_factory=lambda: None,
         executor=SynchronousExecutor(),
         promo_location_id=PROMO,
     )
@@ -348,8 +346,8 @@ def _real_client(monkeypatch):
     pid, _e = be.add_shelf_pair("SKU1", "42", reconciled=True, price_high=Decimal("100.00"),
                                 outlet_product_id=flows.product_number(out.gid))
     app = create_app(config=ShopifyConfig("t.myshopify.com", "shpat_x", "2026-10", SHOP_PROMO),
-                     sheet_factory=lambda: None, register_factory=lambda **kw: be.register(**kw),
-                     transport_factory=lambda: shop, audit_factory=lambda: None,
+                     register_factory=lambda **kw: be.register(**kw),
+                     transport_factory=lambda: shop,
                      executor=SynchronousExecutor(), promo_location_id=SHOP_PROMO)
     return TestClient(app), be, shop, out, pid
 

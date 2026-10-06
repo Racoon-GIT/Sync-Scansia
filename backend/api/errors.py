@@ -9,10 +9,10 @@ crashed job without leaking anything.
 
 Cross-project invariant (parent CLAUDE.md "Errors at the API boundary"): NEVER
 leak a raw ``Error.message``, stack trace, GraphQL ``userErrors`` payload, or
-gspread error text to the client. Every branch below returns a FIXED, generic
+database driver text to the client. Every branch below returns a FIXED, generic
 safe message keyed by a stable ``error_code``; the only thing logged internally is
 the exception TYPE name + the error_code (never ``str(exc)``, which could carry a
-SKU search string, a GraphQL fragment, or a sheet cell value).
+SKU search string, a GraphQL fragment, or a register value).
 """
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ from dataclasses import dataclass
 
 from backend.auth.basic_auth import AuthError, AuthNotConfigured
 from backend.config import ConfigError
-from backend.gsheet.reader import CutoverNotDoneError, GSheetError, SheetIOError
 from backend.persistence.audit_sink import IntentNotFound
 from backend.persistence.records import BaselineMissing, LeaseLost, StoreError
 from backend.services.lease import LeaseUnavailable
@@ -40,9 +39,6 @@ logger = logging.getLogger("backend.api.errors")
 CODE_AUTH_NOT_CONFIGURED = "auth_not_configured"
 CODE_UNAUTHORIZED = "unauthorized"
 CODE_CONFIG_ERROR = "config_error"
-CODE_CUTOVER_NOT_DONE = "cutover_not_done"
-CODE_SHEET_IO_ERROR = "sheet_io_error"
-CODE_SHEET_ERROR = "sheet_error"
 CODE_SHOPIFY_USER_ERROR = "shopify_user_error"
 CODE_SHOPIFY_TRANSPORT_ERROR = "shopify_transport_error"
 CODE_PROMO_ANCHOR_MISSING = "promo_anchor_missing"
@@ -72,7 +68,7 @@ class ApiError:
 
 # Fixed, generic, secret-free messages. Order of the isinstance checks in
 # :func:`map_exception` matters: the most specific subclass is tested first
-# (SheetIOError / CutoverNotDoneError before their GSheetError base).
+# (BaselineMissing / LeaseLost / IntentNotFound before their StoreError base).
 _INTERNAL = ApiError(500, CODE_INTERNAL_ERROR, "Internal server error.")
 
 
@@ -120,12 +116,6 @@ def map_exception(exc: BaseException) -> ApiError:
         return ApiError(404, CODE_INTENT_NOT_FOUND, "Price intent not found.")
     if isinstance(exc, StoreError):
         return ApiError(502, CODE_REGISTER_ERROR, "Register database error.")
-    if isinstance(exc, CutoverNotDoneError):
-        return ApiError(409, CODE_CUTOVER_NOT_DONE, "Sheet cutover not completed.")
-    if isinstance(exc, SheetIOError):
-        return ApiError(502, CODE_SHEET_IO_ERROR, "Spreadsheet I/O error.")
-    if isinstance(exc, GSheetError):
-        return ApiError(502, CODE_SHEET_ERROR, "Spreadsheet error.")
     if isinstance(exc, ShopifyUserError):
         return ApiError(422, CODE_SHOPIFY_USER_ERROR, "Shopify rejected the operation.")
     if isinstance(exc, ShopifyTransportError):
@@ -137,7 +127,7 @@ def log_boundary(exc: BaseException, err: ApiError) -> None:
     """Log a boundary hit with TYPE name + error_code ONLY (never the message).
 
     Deliberately avoids ``str(exc)``: a raw exception string can carry a SKU
-    search token, a GraphQL fragment, or a sheet cell value. A 5xx is logged at
+    search token, a GraphQL fragment, or a register value. A 5xx is logged at
     ERROR, a client-side 4xx at INFO.
     """
     level = logging.ERROR if err.status_code >= 500 else logging.INFO
@@ -151,9 +141,6 @@ __all__ = [
     "CODE_AUTH_NOT_CONFIGURED",
     "CODE_UNAUTHORIZED",
     "CODE_CONFIG_ERROR",
-    "CODE_CUTOVER_NOT_DONE",
-    "CODE_SHEET_IO_ERROR",
-    "CODE_SHEET_ERROR",
     "CODE_SHOPIFY_USER_ERROR",
     "CODE_SHOPIFY_TRANSPORT_ERROR",
     "CODE_PROMO_ANCHOR_MISSING",
