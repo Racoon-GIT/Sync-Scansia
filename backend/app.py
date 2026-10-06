@@ -40,6 +40,7 @@ from fastapi.responses import JSONResponse
 
 from backend.api.errors import log_boundary, map_exception
 from backend.api.jobs import JobStore
+from backend.api.decrement import build_decrement_router
 from backend.api.delete_outlet import build_delete_router
 from backend.api.init import build_init_router, build_relevel_router
 from backend.api.prices import build_prices_router
@@ -53,6 +54,7 @@ from backend.gsheet.reader import GSheetError
 from backend.persistence.gsheet_audit import GSheetAuditSink
 from backend.persistence.mysql_store import make_register_factory
 from backend.persistence.tokens import HmacTokenService
+from backend.services.decrement_worker import DecrementWorker, make_run_pass
 from backend.shopify.ops import ShopifyUserError
 from backend.shopify.transport import ShopifyTransport, ShopifyTransportError
 
@@ -96,6 +98,7 @@ def create_app(
     job_store: Optional[JobStore] = None,
     promo_location_id: Optional[str] = None,
     token_service: Optional[Any] = None,
+    decrement_worker: Optional[Any] = None,
 ) -> FastAPI:
     """Build the app. All collaborators are injectable (tests pass fakes).
 
@@ -127,6 +130,12 @@ def create_app(
             state.audit_factory = lambda: GSheetAuditSink.from_scansia_sheet(state.sheet_factory())
         if state.executor is None:
             state.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scansia-job")
+        if state.decrement_worker is None:
+            # B-3 (D23): the decrement on its own thread, never on the jobs' executor
+            state.decrement_worker = DecrementWorker(make_run_pass(state))
+        # B-3's boot pass: whoever woke the instance (678434's call, a person, a
+        # restart), what is pending is applied. Never blocks the startup.
+        state.decrement_worker.trigger("boot")
         yield
         # Shutdown: release the worker pool (only if we own a real one).
         ex = app.state.executor
@@ -153,6 +162,7 @@ def create_app(
     # fail-closed, at mint/verify time — never at import). A single instance is
     # safe: it holds no per-request state.
     app.state.token_service = token_service or HmacTokenService()
+    app.state.decrement_worker = decrement_worker
 
     _register_error_handlers(app)
 
@@ -163,6 +173,7 @@ def create_app(
 
     app.include_router(build_read_router())
     app.include_router(build_publish_router())
+    app.include_router(build_decrement_router())
     app.include_router(build_delete_router())
     app.include_router(build_prices_router())
     app.include_router(build_init_router())

@@ -173,6 +173,22 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
 - `outlet_service._settled` accepts a group "closed" (no event to stamp: a re-level of a key whose events were
   all stamped) as settled.
 
+## B-3 — the trigger, the boot pass, the worker (D23, the lane's mechanism)
+
+- `services/decrement_worker.py` `DecrementWorker`: the decrement pass on a daemon thread of its own (never the
+  jobs' single-worker executor, never the event loop); one pass at a time; a trigger during a pass coalesces into
+  at most one more; a failed pass (lease not handed over, `BaselineMissing`, a store or Shopify error) is logged
+  and kept as `last`, never raised. Each pass opens its own register handle (actor `decrement`) and closes it.
+- `api/decrement.py`: `POST /outlet/decrement/trigger`, outside Basic Auth, guarded by its own bearer in the
+  workspace's Render trigger shape (`IT/SVILUPPO/docs/shared-secrets.md` §TRIGGER_SECRET): env `TRIGGER_SECRET`,
+  `Authorization: Bearer` (primary) or `X-Trigger-Secret`, constant-time compare, never URL-borne; unset → 503
+  `trigger_not_configured`, nothing runs. No payload trusted; 202 at once (`{accepted, coalesced}`).
+  `GET /outlet/decrement/status` (Basic Auth): `running`, `runs`, `last`.
+- The boot pass: the app's startup triggers one pass (`app.py` lifespan) — never blocking the startup.
+- For F7.3 / F7.5 (not done here): Render sets `TRIGGER_SECRET`; its two consumers are 678434's HTTP module
+  (route 1 after 168: 5 s timeout, `onerror` Ignore — AUTOMATE, `GATE:live`) and the working-window Scheduler
+  job (`*/15 8-19 * * 1-5` Europe/Rome); `shared-secrets.md` gains the service's entry when the value exists.
+
 ## Parameters the plan proposes, fixed here (each one tested)
 
 - The `/dlqs` precondition (§3.4): the typed instant (ISO 8601; no offset → Europe/Rome) and `dlqCount`, which must
