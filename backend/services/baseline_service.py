@@ -110,6 +110,7 @@ RULE_LEVEL = "level"
 # The per-key decision of the preview (the apply re-checks each one).
 ACT_LEVEL = "level"     # (a)
 ACT_ZERO = "zero"       # (b)
+ACT_PARKED = "parked"   # (b), DRAFT-parked at N: nothing written, listed for a re-level (§3.4's preview list)
 ACT_NONE = "none"       # (c)
 ACT_STAMP = "stamp"     # no shelf pair, no variant titled SIZE: the events stamped, nothing written
 ACT_LOWER = "lower"     # no shelf pair, no event: a stale unit lowered to 0, never held
@@ -218,7 +219,7 @@ class KeyPlan:
         """What the key stamps when it ends as planned (§3.4: an explicit list)."""
         if self.action in (ACT_LEVEL, ACT_STAMP):
             return self.event_ids
-        if self.action in (ACT_ZERO, ACT_NONE):
+        if self.action in (ACT_ZERO, ACT_PARKED, ACT_NONE):
             return self.departed_event_ids
         return ()
 
@@ -572,7 +573,7 @@ def _decide(k: Key, shelf: Sequence[PairRow], events: Sequence[EventRow], on_she
         if pending_on_shelf == n:
             return KeyPlan(**base, action=ACT_ZERO, outlets=facts, target=0, delta=-f.p)
         if f.p + pending_on_shelf == n:               # DRAFT-parked: the invariant holds as it is (a re-level exposes it)
-            return KeyPlan(**base, action=ACT_ZERO, outlets=facts, target=0, delta=0)
+            return KeyPlan(**base, action=ACT_PARKED, outlets=facts)
         return hold(R_PENDING)
     return hold(f"{R_STATUS}:{o.status or 'NONE'}")
 
@@ -911,6 +912,8 @@ class _Run:
             self._level(kp)
         elif kp.action == ACT_ZERO:
             self._zero(kp)
+        elif kp.action == ACT_PARKED:
+            self._done(kp, "parked")
         elif kp.action == ACT_NONE:
             self._done(kp, "none")
         elif kp.action == ACT_STAMP:
@@ -964,7 +967,7 @@ class _Run:
     def _zero(self, kp: KeyPlan) -> None:
         f = kp.outlets[0]
         if kp.delta == 0:
-            self._done(kp, "zeroed")        # nothing to lower (a negative is never raised), or parked at N
+            self._done(kp, "zeroed")        # nothing to lower (a negative is never raised)
             return
         (row,) = self.led.write_group([L.RowSpec(
             action=L.A_ADJUST, keys=(kp.key,), purpose=L.P_ZERO, target=0, inventory_item_id=f.inventory_item_id,
@@ -1140,7 +1143,7 @@ def baseline_apply(
 
 
 __all__ = [
-    "RULE_LEVEL", "ACT_LEVEL", "ACT_ZERO", "ACT_NONE", "ACT_STAMP", "ACT_LOWER", "ACT_HOLD",
+    "RULE_LEVEL", "ACT_LEVEL", "ACT_ZERO", "ACT_PARKED", "ACT_NONE", "ACT_STAMP", "ACT_LOWER", "ACT_HOLD",
     "R_BLANK_SKU", "R_HELD_BEFORE", "R_UNRESOLVED", "R_UNREADABLE", "R_MULTI_OUTLET", "R_SIZE_ABSENT",
     "R_STATUS", "R_COMMITTED", "R_MOVED", "R_NORMALISE", "R_WRITE", "R_PENDING", "R_UNIT_HELD",
     "SEED", "SEED_CONFLICT", "SEED_UNPARSEABLE", "SEED_INVALID", "SEED_PRICED",

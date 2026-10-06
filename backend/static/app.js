@@ -136,7 +136,7 @@
     document.getElementById("init-counts").textContent = plan.already_done
       ? "Inizializzazione già eseguita."
       : "Chiavi " + (c.keys || 0) + ": allineate " + (c.level || 0) + ", bozze azzerate " + (c.zero || 0) +
-        ", senza outlet " + (c.none || 0) + ", solo timbro " + (c.stamp || 0) + ", unità a 0 " + (c.lower || 0) +
+        ", bozze già a N " + (c.parked || 0) + ", senza outlet " + (c.none || 0) + ", solo timbro " + (c.stamp || 0) + ", unità a 0 " + (c.lower || 0) +
         ", trattenute " + (c.hold || 0) + ". Unità Promo +" + (c.units_up || 0) + " / -" + (c.units_down || 0) +
         ". Eventi da timbrare " + (c.events_to_stamp || 0) + ", trattenuti " + (c.events_held || 0) + ".";
     const notes = (plan.anomalies || []).concat(
@@ -145,6 +145,7 @@
     renderRows("init-level-tbody", keysOf(plan, "level"), function (k) {
       return [k.sku, k.size, k.n, k.delta, k.activate ? "sì" : ""]; });
     renderRows("init-zero-tbody", keysOf(plan, "zero"), function (k) { return [k.sku, k.size, k.n, k.delta]; });
+    renderRows("init-parked-tbody", keysOf(plan, "parked"), function (k) { return [k.sku, k.size, k.n]; });
     renderRows("init-none-tbody", keysOf(plan, "none"), function (k) { return [k.sku, k.size, k.n]; });
     renderRows("init-lower-tbody", keysOf(plan, "lower"), function (k) { return [k.sku, k.size, k.delta]; });
     renderRows("init-hold-tbody", keysOf(plan, "hold"), function (k) {

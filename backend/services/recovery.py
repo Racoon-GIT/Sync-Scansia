@@ -5,8 +5,9 @@ after another holder) BEFORE anything else, and after any stamp failure.
 It never infers from live stock whether its own write landed: a sale between
 the crash and the recovery moves the level too. Per row not closed, terminal
 path (ii) is read first (its product / inventory item reads gone), then the
-row's own bullet; finally every touched group is settled (stamp + ``DONE``, or
-``CARRIED`` beside a ``FAILED`` / ``HELD`` sibling).
+row's own bullet; then every touched group is settled (stamp + ``DONE``, or
+``CARRIED`` beside a ``FAILED`` / ``HELD`` sibling); finally the product-total
+rule runs on every product a recovered −Δ lowered (re-sent or re-applied).
 
 **Recovery classes.** A publish-class holder (publish, baseline, re-level, the
 normalisation at a re-level's confirm) runs every bullet. A decrement-class
@@ -52,6 +53,7 @@ class RecoveryResult:
     statuses: Dict[int, str] = field(default_factory=dict)  # row id → status after recovery
     settled: Dict[int, str] = field(default_factory=dict)   # group id → settle result
     left_open: List[int] = field(default_factory=list)
+    lowered: Dict[int, str] = field(default_factory=dict)   # product id → SKU a recovered −Δ lowered
 
 
 def recover(ctx: "flows.Context", klass: str) -> RecoveryResult:
@@ -69,6 +71,8 @@ def recover(ctx: "flows.Context", klass: str) -> RecoveryResult:
         row = ctx.ledger.reload(row)  # an earlier bullet may have superseded it
         if row.status == APPLIED:
             _applied_gone(ctx, row, out)
+            if row.row_id not in out.statuses and L.is_minus(row) and row.product_id is not None and row.keys:
+                out.lowered[row.product_id] = row.keys[0][0]   # a stamp retry: its pass never reached the rule
             continue
         if row.status != OPEN:
             continue
@@ -82,6 +86,8 @@ def recover(ctx: "flows.Context", klass: str) -> RecoveryResult:
         out.statuses[row.row_id] = status
         if status == OPEN:
             out.left_open.append(row.row_id)
+        elif status == APPLIED and L.is_minus(row) and row.product_id is not None and row.keys:
+            out.lowered[row.product_id] = row.keys[0][0]   # re-sent or re-applied: it landed now
     for gid in groups:
         try:
             out.settled[gid] = ctx.ledger.settle(gid)
@@ -89,7 +95,25 @@ def recover(ctx: "flows.Context", klass: str) -> RecoveryResult:
             raise
         except StoreError as e:
             ctx.report.surface("stamp_failed", group_id=gid, error=type(e).__name__)
+    for num, sku in out.lowered.items():
+        _total_rule(ctx, num, sku)
     return out
+
+
+def _total_rule(ctx: "flows.Context", num: int, sku: str) -> None:
+    """A −Δ recovery landed (§3.3 rule 2, the ``OPEN``, sent, −Δ bullet: "then
+    stamp + close, run the product-total rule"): an ACTIVE outlet whose real-size
+    Promo total now reads 0 is drafted, as after a first send (rule 1)."""
+    gid = flows.product_gid(num)
+    try:
+        core = ops.get_product_core(ctx.transport, gid)
+        flows.total_rule(ctx, gid, (core.get("status") or "").upper(), sku)
+    except LeaseLost:
+        raise
+    except ProductNotFound:
+        return
+    except (ShopifyUserError, ShopifyTransportError, StoreError, RuntimeError) as e:
+        ctx.report.surface("recovery_error", product_id=num, step="total_rule", error=type(e).__name__)
 
 
 def _applied_gone(ctx: "flows.Context", row: AuditRow, out: RecoveryResult) -> None:

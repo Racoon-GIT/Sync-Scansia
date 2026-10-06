@@ -102,6 +102,31 @@ def test_the_driver_trap_is_real_negative_control():
         substitute("SELECT DATE_FORMAT(x, '%%Y-%%s') FROM t WHERE a = %s", (5,))
 
 
+def test_no_locking_read_and_every_update_by_primary_key():
+    """§3.7 (§4 item 4): no locking read — a ``FOR UPDATE`` / ``FOR SHARE`` would
+    queue ``SP_SCANSIA_CONSUME`` behind F7 — and every ``UPDATE`` names its rows by
+    PRIMARY KEY: the static templates and every statement the store sends."""
+    drv, _, s = _store()
+    s.fenced_write(FENCE, [
+        InsertAudit(kind=KIND_RECONCILE, actor="a", action="x", status=OPEN, payload={}),
+        UpdateAudit(9, OPEN, mark_sent=True, first_send=True, sent_available=2, request="{}"),
+        UpdateAudit(9, OPEN, status=APPLIED, outcome={"a": 1}, product_id=5, step="s1"),
+        UpdatePairs((1, 2), {"ONLINE": 1}, require_state=SHELF),
+    ])
+    s.fenced_write(FENCE, [UpdateAudit(9, APPLIED, status=DONE), StampEvents((5, 6))])
+    s.read_pairs(states=(SHELF,), sku="A", pair_ids=[3], outlet_product_id=4)
+    s.read_audit(KIND_RECONCILE, statuses=[OPEN], row_ids=[1], group_id=2, product_id=3, intent_id="i")
+    s.read_unstamped_events()
+    sent = list(drv.statements)
+    assert any(x.startswith("UPDATE sc_returned_pair ") for x in sent)          # the dynamic ones were exercised
+    assert any(x.startswith("UPDATE sm_outlet_audit ") for x in sent)
+    for sql in sent + list(STATEMENTS):
+        up = " ".join(sql.upper().split())
+        assert not any(lock in up for lock in ("FOR UPDATE", "FOR SHARE", "LOCK IN SHARE MODE")), sql
+        if up.startswith("UPDATE "):                       # a template's IN list is appended when it is sent
+            assert re.match(r"ID (= |IN( \(|$))", up.split(" WHERE ", 1)[1]), sql
+
+
 def test_every_dynamic_statement_substitutes_cleanly():
     drv, _, s = _store()
     s.fenced_write(FENCE, [

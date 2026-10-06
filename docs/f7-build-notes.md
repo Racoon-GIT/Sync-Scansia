@@ -89,6 +89,14 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   + `DONE`; beside `FAILED` / `HELD` → `APPLIED` rows `CARRIED` (`OUTCOME.moved` = what they moved).
 - Interpretation recorded: terminal path (ii) on a row never sent closes it `FAILED` "never sent", whatever its
   kind (nothing sent → nothing landed; (ii)'s `HELD` protects a landed +Δ, which a never-sent row cannot be).
+- After the settle, recovery runs the product-total rule on every product a recovered −Δ lowered (an in-window
+  re-send or a re-apply that landed) or re-stamped (a stamp retry: its pass never reached the rule) — rule 2's
+  "then stamp + close, run the product-total rule". "After any stamp failure" is read as the next pass's recovery:
+  the failing pass goes on (the row's key stays in flight), every pass's first take recovers.
+- "A CREATE's rows follow the CREATE path" (rule 2's Groups): once `flows.orphan` has drafted and zeroed the
+  orphan from live, the CREATE's own step rows still `OPEN` are closed, never sent again — never sent → `FAILED`;
+  a sent +Δ → `HELD` (a stalled one may still land; the N-0 release waits out its retention); any other sent row →
+  `FAILED` — in the live abort path and in recovery alike (a re-sent add would land on the drafted orphan).
 - A preview is a read and runs no recovery: a key held in flight by an `OPEN` row plans nothing (listed
   `held_positive`) until an apply's prologue resolves the row; the next preview then plans it.
 - `referenceDocumentUri` of every inventory write: `gid://scansia-manager/OutletReconcile/<row id>` (Shopify's
@@ -112,7 +120,8 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   (anomaly listed, its keys held `unresolved`, the product untouched).
 - Keys: shelf keys ∪ keys of unstamped events ∪ real-size variants with Promo > 0 and no pair, no event, on any
   outlet (a stale unit: `lower` to 0, never held — a hold with no event keeps nothing, and the N-0 release never
-  sees a key with no event). Decision: `level` (a), `zero` (b), `none` (c), `stamp` (no shelf pair, no variant
+  sees a key with no event). Decision: `level` (a), `zero` (b), `parked` (b's DRAFT-parked key: P + Σ pending = N,
+  nothing written, listed for a re-level — §3.4's preview list), `none` (c), `stamp` (no shelf pair, no variant
   titled SIZE: the events stamped), `hold`. Hold reasons: `blank_sku`; `held_before_baseline:<kinds>` (a key
   already held — in flight, recovery `HELD`, a `HOLD` row — stays held, all its snapshot events; a re-level
   releases it); `unresolved`; `outlet_unreadable` (levels truncated, a quantity unread); `multi_outlet`;
@@ -172,7 +181,7 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
 - Refused (nothing written, listed): blank SKU, a row of the key not closed (an in-flight hold ends with its row),
   unclean / unreadable, multi-outlet with N > 0 (its exit first), no variant titled SIZE with N > 0, an upward
   write meeting `committed` > 0, N 0 with a `committed` unit (`n0_committed_unit`, D33), FIX4 (`price_conflict` / the price checks /
-  a shelf pair of the key with no compare-at, D25), no single source holding the size. At confirm a key whose N,
+  a shelf pair of the key with no compare-at, D25 — `fix4:no_compare_at:<pair ids>`), no single source holding the size. At confirm a key whose N,
   max event id, events or live level moved is held — a `HOLD` row (`relevel-moved`, the snapshot's events) when
   it was not — and the newly held keys are lowered by their excess.
 - `outlet_service._settled` accepts a group "closed" (no event to stamp: a re-level of a key whose events were
@@ -253,8 +262,9 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
 - The Promo gate (E18, `services/promo_gate.py`): `PROMO_LOCATION_ID` is normalised to the location GID in config
   (a numeric id accepted; anything else refuses to boot); before every pass that writes — publish, decrement,
   baseline, re-level, every `Holder` — one `locations` read: the id must be the active location named "Promo", else
-  `PromoAnchorInvalid` (503 `promo_anchor_invalid`), the lease not taken, nothing written. Read-only recons are not
-  gated. Location gone (AB16): a Promo row's location → the gate stops every pass first; a non-Promo row (a CREATE
+  `PromoAnchorInvalid` (503 `promo_anchor_invalid`), the lease not taken, nothing written. A failed `locations` read
+  is not that refusal's code but has its effect: the pass does not start (the transport error surfaces, the lease
+  untouched, nothing written) and the next trigger or net sweep runs it. Read-only recons are not gated. Location gone (AB16): a Promo row's location → the gate stops every pass first; a non-Promo row (a CREATE
   orphan's disconnect) reads its level absent — a deactivation `APPLIED`, a lowering `FAILED` (nothing to lower).
 - Recovery reads terminal path (ii) first for `APPLIED` rows too (a read, no write): a target gone → `CARRIED`.
 - The read verticals on the register: `GET /scansia` = the shelf (B-2's compare-at per pair); the inventory join

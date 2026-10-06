@@ -202,7 +202,8 @@ def _plan_key(register: Any, transport: Any, reader: BS.OutletReader, k: Key, ho
     pr = OS.sku_prices(shelf)
     ok, why = OS.validate_price(pr.price, pr.compare_at)
     lacking = set(base["shelf_pair_ids"]) & set(pr.no_compare_at_pairs)
-    problem = pr.blocked or (None if ok else why) or ("no_compare_at" if lacking else None)
+    problem = pr.blocked or (None if ok else why) or (
+        "no_compare_at:" + ",".join(str(i) for i in sorted(lacking)) if lacking else None)   # D25: the pairs named
     if problem:
         return refuse(f"{F_PRICE}:{problem}", outlets=facts)
     prices = dict(price=pr.price, compare_at=pr.compare_at)

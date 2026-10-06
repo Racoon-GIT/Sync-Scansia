@@ -577,14 +577,33 @@ def orphan(ctx: Context, create_row: AuditRow, gid: str) -> None:
     try:
         inv = ctx.inventory(gid)
     except ProductNotFound:
-        return
+        return  # gone: nothing to zero; its step rows close by terminal path (ii)
     specs = zero_rows_for(ctx, inv, keys=create_row.keys, product=product_number(gid),
                           purpose=L.P_ORPHAN, include_nonpromo=True)
     if specs:
         rows = ctx.ledger.write_group(specs)
         run_rows_in_order(ctx, rows)
         ctx.ledger.settle(rows[0].group_id)
+    _close_create_rows(ctx, create_row)
     ctx.report.surface("orphan_drafted_and_zeroed", product_id=product_number(gid), keys=[list(k) for k in create_row.keys])
+
+
+def _close_create_rows(ctx: Context, create_row: AuditRow) -> None:
+    """"A CREATE's rows follow the CREATE path" (§3.3 rule 2's Groups): once its
+    orphan is drafted and zeroed from live, the CREATE's own step rows still open
+    are closed, never sent again — a re-sent add would land on the drafted orphan.
+    Never sent → ``FAILED`` "never sent"; a sent +Δ → ``HELD`` (a stalled one may
+    still land: its key stays held, the N-0 release waits out its retention);
+    any other sent row → ``FAILED`` (the orphan path re-read live and acted)."""
+    for r in ctx.register.reconcile_rows(group_id=create_row.group_id, statuses=(OPEN,)):
+        if r.row_id == create_row.row_id:
+            continue
+        if r.sent_at is None:
+            ctx.ledger.never_sent(r, "create_unfinished")
+        elif L.is_plus(r):
+            ctx.ledger.close(r, HELD, reason="create_unfinished")
+        else:
+            ctx.ledger.close(r, FAILED, reason="create_unfinished")
 
 
 __all__ = [

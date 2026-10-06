@@ -211,8 +211,10 @@ def test_b_a_draft_parked_key_is_left_at_n_not_held():
     out = env.shop.product("Nike - Outlet", status="DRAFT", promo={"42": 1})
     env.be.add_shelf_pair("SKU1", "42", reconciled=True)          # N 1, its unit parked, nothing pending
     plan = env.preview()
-    assert (by_key(plan)[("SKU1", "42")].action, by_key(plan)[("SKU1", "42")].delta) == (B.ACT_ZERO, 0)
-    env.apply(plan)
+    kp = by_key(plan)[("SKU1", "42")]
+    assert (kp.action, kp.delta) == (B.ACT_PARKED, 0) and plan.counts()["parked"] == 1   # listed: a re-level each
+    rep = env.apply(plan)
+    assert outcome(rep, "SKU1", "42").result == "parked"
     assert env.mutations() == [] and env.shop.available(out.gid, "42") == 1 and env.held() == {}
     assert env.invariant() == {}
 
