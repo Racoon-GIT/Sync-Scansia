@@ -31,6 +31,7 @@ class MemoryBackend:
     """The in-memory fake behind the fixture API."""
 
     name = "memory"
+    scale = 1   # time margins of the liveness tests
 
     def __init__(self) -> None:
         self.clock = FakeClock()
@@ -86,6 +87,7 @@ class MySQLBackend:
     """
 
     name = "mysql"
+    scale = 5   # WAN round trips (a TLS connect took 0.3–1 s, 2026-10-06): liveness margins ×5
     HOST = "78.46.244.227"
     PORT = 3306
     DATABASE = "racoon_staging"
@@ -129,12 +131,19 @@ class MySQLBackend:
         import mysql.connector
         from mysql.connector.constants import ClientFlag
 
-        self._fx = mysql.connector.connect(
-            option_files=self.cred("scansia_fixture_stg"), option_groups=["client"],
-            host=self.HOST, port=self.PORT, database=self.DATABASE,
-            ssl_ca=self.ca_path(), ssl_verify_cert=True, ssl_verify_identity=True,
-            client_flags=[ClientFlag.FOUND_ROWS], autocommit=True, charset="utf8mb4",
-        )
+        for attempt in (1, 2):  # one retry of a lost connect, as the store does (CONNECT_ATTEMPTS)
+            try:
+                self._fx = mysql.connector.connect(
+                    option_files=self.cred("scansia_fixture_stg"), option_groups=["client"],
+                    host=self.HOST, port=self.PORT, database=self.DATABASE,
+                    ssl_ca=self.ca_path(), ssl_verify_cert=True, ssl_verify_identity=True,
+                    client_flags=[ClientFlag.FOUND_ROWS], autocommit=True, charset="utf8mb4",
+                    connection_timeout=10,
+                )
+                break
+            except mysql.connector.errors.DatabaseError as e:
+                if e.errno != 2003 or attempt == 2:
+                    raise
         db = self._q("SELECT DATABASE()")[0][0]
         if db != self.DATABASE:  # the fixture refuses to run anywhere else
             self._fx.close()
@@ -173,11 +182,19 @@ class MySQLBackend:
         self._fx.close()
 
     # -- the fixture API ------------------------------------------------------------
-    def store(self) -> Any:
+    def store(self, tap: Optional["Tap"] = None) -> Any:
         from backend.persistence.mysql_store import DBConfig, MySQLStore
 
-        return MySQLStore(DBConfig(host=self.HOST, port=self.PORT, database=self.DATABASE,
-                                   ca_path=self.ca_path(), option_file=self.cred("scansia_mgr_stg")))
+        cfg = DBConfig(host=self.HOST, port=self.PORT, database=self.DATABASE,
+                       ca_path=self.ca_path(), option_file=self.cred("scansia_mgr_stg"))
+        if tap is None:
+            return MySQLStore(cfg)
+        import mysql.connector
+
+        return MySQLStore(cfg, connect=lambda **kw: tap.wrap(mysql.connector.connect(**kw)))
+
+    def event_type(self, event_id: int) -> str:
+        return self._q("SELECT EVENT_TYPE FROM sc_returned_pair_event WHERE ID = %s", (event_id,))[0][0]
 
     def register(self, actor: str = ACTOR) -> Register:
         return Register(self.store(), actor=actor if actor.startswith(self.ACTOR) else self.ACTOR)
@@ -204,14 +221,16 @@ class MySQLBackend:
         )
 
     def add_event(self, pair_id: Optional[int], delta: int, *, event_type: str = "IMPORTED",
-                  actor: str = "IMPORT", reconciled: bool = False) -> int:
+                  actor: str = "IMPORT", reconciled: bool = False, payload: Optional[dict] = None) -> int:
+        import json
         import uuid
 
         return self._x(
             "INSERT INTO sc_returned_pair_event (PAIR_ID, EVENT_TYPE, DEDUP_KEY, ACTOR, OUTLET_DELTA, "
-            "OUTLET_RECONCILED_AT, CREATED_AT) VALUES (%s, %s, %s, %s, %s, "
-            "IF(%s, UTC_TIMESTAMP(3), NULL), UTC_TIMESTAMP(3))",
-            (pair_id, event_type, f"f7test:{uuid.uuid4().hex}", actor, int(delta), 1 if reconciled else 0),
+            "OUTLET_RECONCILED_AT, PAYLOAD, CREATED_AT) VALUES (%s, %s, %s, %s, %s, "
+            "IF(%s, UTC_TIMESTAMP(3), NULL), %s, UTC_TIMESTAMP(3))",
+            (pair_id, event_type, f"f7test:{uuid.uuid4().hex}", actor, int(delta), 1 if reconciled else 0,
+             None if payload is None else json.dumps(payload)),
         )
 
     def add_shelf_pair(self, sku: str, size: str, *, event_type: str = "ARRIVE", actor: str = "GATE",
@@ -267,6 +286,70 @@ class MySQLBackend:
             kind=KIND_BASELINE, actor=self.ACTOR, action="baseline",
             payload={"scope": SCOPE_REGISTER, "held": list(held), "stamped": list(stamped)},
         ))
+
+
+class Tap:
+    """Two seams on the app's real connection (staging only): every statement the
+    store sends is recorded, and an armed COMMIT pauses with the transaction's
+    locks still held — what a concurrent ``SP_SCANSIA_CONSUME`` would meet."""
+
+    def __init__(self) -> None:
+        import threading
+
+        self.statements: list = []
+        self.pause_s = 0.0
+        self.commit_entered = threading.Event()
+        self.commit_sent = 0.0
+        self.conn: Any = None
+
+    def arm(self, pause_s: float) -> None:
+        self.pause_s = pause_s
+        self.commit_entered.clear()
+
+    def wrap(self, conn: Any) -> Any:
+        self.conn = conn
+        return _TapConnection(conn, self)
+
+    def explain(self, sql: str, params: tuple) -> list:
+        cur = self.conn.cursor(dictionary=True)
+        try:
+            cur.execute("EXPLAIN " + sql, params)
+            return cur.fetchall()
+        finally:
+            cur.close()
+
+
+class _TapCursor:
+    def __init__(self, cur: Any, tap: Tap) -> None:
+        self._cur, self._tap = cur, tap
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cur, name)
+
+    def execute(self, sql: str, params: Any = ()) -> Any:
+        self._tap.statements.append((sql, tuple(params or ())))
+        return self._cur.execute(sql, params)
+
+
+class _TapConnection:
+    def __init__(self, conn: Any, tap: Tap) -> None:
+        self._conn, self._tap = conn, tap
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+    def cursor(self, *a: Any, **k: Any) -> Any:
+        return _TapCursor(self._conn.cursor(*a, **k), self._tap)
+
+    def commit(self) -> None:
+        import time
+
+        if self._tap.pause_s > 0:
+            pause, self._tap.pause_s = self._tap.pause_s, 0.0
+            self._tap.commit_entered.set()
+            time.sleep(pause)
+        self._tap.commit_sent = time.monotonic()
+        self._conn.commit()
 
 
 class StubLease:

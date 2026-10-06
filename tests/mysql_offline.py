@@ -95,6 +95,7 @@ class OfflineConnection:
         self.commits = 0
         self.rollbacks = 0
         self.transactions = 0
+        self.txn_kwargs: List[Dict[str, Any]] = []
 
     def cursor(self) -> OfflineCursor:
         return OfflineCursor(self)
@@ -103,6 +104,7 @@ class OfflineConnection:
         if self.closed:
             raise mysql_connector.errors.OperationalError(errno=2055, msg="Lost connection")
         self.transactions += 1
+        self.txn_kwargs.append(kw)
         self.log.append("START TRANSACTION")
 
     def commit(self) -> None:

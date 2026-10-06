@@ -48,6 +48,7 @@ from backend.persistence.records import (  # noqa: E402
     LockWaitTimeout,
     StampEvents,
     StoreClosed,
+    StoreError,
     UpdateAudit,
     UpdatePairs,
 )
@@ -145,12 +146,39 @@ def test_refuses_an_unexpected_schema():
 
 
 def test_connect_failure_is_bounded():
+    calls = []
+
     def boom(**kw):
+        calls.append(1)
         raise driver_error(2003, "InterfaceError")
 
     with pytest.raises(DatabaseUnavailable) as ei:
         MySQLStore(CFG, connect=boom)
     assert "simulated" not in str(ei.value)          # never the driver's text
+    assert len(calls) == 2                           # one retry, then the failure
+
+
+def test_a_lost_connect_is_retried_once_and_a_refusal_never():
+    drv = OfflineDriver(lambda sql, c: ok(0))
+    calls = []
+
+    def flaky(**kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise driver_error(2003, "InterfaceError")  # the SYN never answered
+        return drv.connect(**kw)
+
+    MySQLStore(CFG, connect=flaky)
+    assert len(calls) == 2 and len(drv.connections) == 1
+    denied = []
+
+    def refuse(**kw):
+        denied.append(1)
+        raise driver_error(1045, "ProgrammingError")  # access denied: fail2ban counts these
+
+    with pytest.raises(StoreError) as ei:
+        MySQLStore(CFG, connect=refuse)
+    assert not isinstance(ei.value, DatabaseUnavailable) and len(denied) == 1
 
 
 def test_an_idle_session_is_reopened_before_the_next_statement():
@@ -292,6 +320,33 @@ def test_a_connection_lost_before_commit_is_retried_once_on_a_fresh_session():
     assert s.fenced_write(FENCE, [InsertAudit(kind=KIND_AUDIT, actor="a", action="x")]) == [41]
     assert len(drv.connections) == 2
     assert drv.connections[0].rollbacks == 1 and drv.connections[1].commits == 1
+
+
+def test_the_snapshot_is_one_read_only_consistent_transaction_retried_once_if_lost():
+    seen = {"n": 0}
+    drv, _, s = _store(lambda sql, c: ok(0, rows=[]))
+
+    def lose_first_max(sql):
+        if sql.startswith("SELECT p.SKU, p.SIZE, MAX(e.ID)"):
+            seen["n"] += 1
+            if seen["n"] == 1:
+                return driver_error(2013, "OperationalError")
+        return None
+
+    drv.fail_on = lose_first_max
+    snap = s.read_snapshot(("A", "42"))
+    assert snap.pairs == () and snap.unstamped == () and dict(snap.max_event_id) == {}
+    c0, c1 = drv.connections
+    assert c0.txn_kwargs == [{"consistent_snapshot": True, "readonly": True}] and c0.rollbacks == 1
+    assert [x.split(" ")[0] for x in c1.log[-5:]] == ["START", "SELECT", "SELECT", "SELECT", "COMMIT"]
+    assert "SKU = 'A' AND SIZE = '42'" in c1.log[-4] and "GROUP BY p.SKU, p.SIZE" in c1.log[-2]
+
+
+def test_an_unparseable_import_payload_seeds_nothing():
+    drv, _, s = _store(lambda sql, c: ok(2, rows=[(5, '{"raw": {"J": {"v": "89,00"}}}'), (6, "{not json")]))
+    assert s.read_import_payloads([6, 5, 5]) == [(5, {"raw": {"J": {"v": "89,00"}}}), (6, None)]
+    assert "e.PAIR_ID IN (5, 6)" in drv.statements[-1]
+    assert s.read_import_payloads([]) == []
 
 
 # ---------------------------------------------------------------------------

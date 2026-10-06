@@ -375,15 +375,26 @@ def test_the_n0_release_is_refused_inside_a_held_rows_retention():
     assert env.unstamped() == []
 
 
-def test_the_n0_release_waits_while_a_unit_is_only_committed():
-    """Rule 4 + the N-0 release (the lane's reading, reported): a unit held by a
-    draft order reads 0 and returns when the hold ends — its −1 stays pending."""
+@pytest.mark.parametrize("hold_ends", ["unit_back", "shipped"])
+def test_d33_n0_held_unit_no_stamp_then_unit_back_minus_applied_or_shipped_release_stamps(hold_ends):
+    """D33 (rule 4 + the N-0 release): "N 0, held unit (committed > 0) → no stamp;
+    hold ends with unit back → −1 applied; hold ends shipped (committed 0,
+    available ≤ 0) → release stamps"."""
     env = Env()
     out_p = env.shop.product("Nike - Outlet", promo={"42": 0}, committed={"42": 1})
     e = env.sold()                                             # N 0
     env.decrement()
-    assert env.unstamped() == [e]
+    assert env.unstamped() == [e] and env.shop.count("adjust") == 0
     lvl = env.shop.promo(out_p.gid, "42")
-    lvl.committed, lvl.available = 0, 1                        # the draft order is cancelled
-    env.decrement()
-    assert env.shop.available(out_p.gid, "42") == 0 and env.unstamped() == []
+    if hold_ends == "unit_back":
+        lvl.committed, lvl.available = 0, 1                    # the draft order is cancelled
+        env.decrement()
+        assert env.shop.available(out_p.gid, "42") == 0 and env.unstamped() == []
+        assert env.shop.count("adjust") == 1
+    else:
+        lvl.committed = 0                                      # the draft order ships: the unit leaves
+        rep = env.decrement()
+        assert env.unstamped() == [] and env.shop.count("adjust") == 0
+        (rel,) = [b for b in env.register().audit_rows(KIND_BASELINE) if (b.payload or {}).get("scope") == SCOPE_KEY]
+        assert rel.payload["reason"] == "N 0" and rel.payload["stamped"] == [e] and rel.payload["released"] is False
+        assert "n0_released" in rep.report.kinds()

@@ -343,6 +343,20 @@ class Hold:
 
 
 @dataclass(frozen=True)
+class Snapshot:
+    """One non-locking consistent read (the baseline's / a re-level's, §3.4):
+    shelf pairs, every unstamped event (held ones included) and each key's
+    max event id (any Δ, stamped or not)."""
+
+    pairs: Tuple[PairRow, ...]
+    unstamped: Tuple[EventRow, ...]
+    max_event_id: Mapping[Key, int]
+
+    def shelf_count(self, key: Key) -> int:
+        return sum(1 for p in self.pairs if p.key == key)
+
+
+@dataclass(frozen=True)
 class PendingDeltas:
     """``pending_deltas()``: the events F7 may read now.
 
@@ -430,7 +444,7 @@ __all__ = [
     "PAIR_WRITABLE", "MAX_STAMP_IDS", "Key",
     "PairRow", "EventRow", "AuditRow", "LeaseRow", "Fence",
     "InsertAudit", "InsertedId", "resolve_inserted", "UpdateAudit", "StampEvents", "UpdatePairs", "WriteOp", "REGISTER_OPS",
-    "check_op_order", "Hold", "PendingDeltas",
+    "check_op_order", "Hold", "Snapshot", "PendingDeltas",
     "StoreError", "LeaseLost", "GuardMismatch", "BaselineMissing", "DuplicateKey",
     "StoreClosed", "DatabaseUnavailable", "CommitUnknown", "LockWaitTimeout", "Deadlock",
 ]

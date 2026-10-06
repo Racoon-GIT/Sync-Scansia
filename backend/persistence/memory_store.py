@@ -45,6 +45,7 @@ from backend.persistence.records import (
     LeaseLost,
     LeaseRow,
     PairRow,
+    Snapshot,
     StampEvents,
     StoreClosed,
     UpdateAudit,
@@ -178,6 +179,7 @@ class MemoryDB:
         event_type: str = "IMPORTED",
         actor: str = "IMPORT",
         reconciled: bool = False,
+        payload: Optional[Dict[str, Any]] = None,
     ) -> int:
         with self.lock:
             eid = self._next("event")
@@ -190,6 +192,7 @@ class MemoryDB:
                 "OUTLET_DELTA": int(delta),
                 "OUTLET_RECONCILED_AT": now if reconciled else None,
                 "CREATED_AT": now,
+                "PAYLOAD": payload,
             }
             return eid
 
@@ -387,6 +390,33 @@ class MemoryStore:
                 waiter=L["WAITER"], waiter_expires_at=L["WAITER_EXPIRES_AT"],
                 updated_at=L["UPDATED_AT"],
             )
+
+    def read_snapshot(self, key: Optional[Tuple[str, str]] = None) -> "Snapshot":
+        db = self._open()
+        with db.lock:
+            db.log.append(("snapshot",))
+            pairs = tuple(_pair_row(p) for p in sorted(db.state.pairs.values(), key=lambda r: r["ID"])
+                          if p["STATE"] == SHELF and (key is None or (p["SKU"], p["SIZE"]) == tuple(key)))
+            unstamped = []
+            maxima: Dict[Tuple[str, str], int] = {}
+            for e in sorted(db.state.events.values(), key=lambda r: r["ID"]):
+                p = db.state.pairs.get(e["PAIR_ID"]) if e["PAIR_ID"] is not None else None
+                k = (p["SKU"], p["SIZE"]) if p else None
+                if key is not None and k != tuple(key):
+                    continue
+                if k is not None:
+                    maxima[k] = max(maxima.get(k, 0), e["ID"])
+                if e["OUTLET_RECONCILED_AT"] is None:
+                    unstamped.append(_event_row(e, p))
+            return Snapshot(pairs=pairs, unstamped=tuple(unstamped), max_event_id=maxima)
+
+    def read_import_payloads(self, pair_ids: Sequence[int]) -> List[Tuple[int, Any]]:
+        db = self._open()
+        with db.lock:
+            ids = set(pair_ids)
+            return [(e["PAIR_ID"], _mysql_json(e.get("PAYLOAD")) if e.get("PAYLOAD") is not None else None)
+                    for e in sorted(db.state.events.values(), key=lambda r: r["ID"])
+                    if e["PAIR_ID"] in ids and e["EVENT_TYPE"] == "IMPORTED"]
 
     def server_now(self) -> datetime:
         return self._open().clock()

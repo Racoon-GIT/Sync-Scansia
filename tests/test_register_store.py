@@ -109,6 +109,47 @@ def test_an_outlet_line_sale_records_delta_zero(backend):
     assert row.delta == 0 and row.pair_state == "VENDUTO"
 
 
+def test_a_snapshot_reads_the_shelf_every_unstamped_event_and_each_keys_max_event(backend):
+    a, ea = backend.add_shelf_pair("F7T-SNAP", "42")                       # unstamped +1
+    b, eb = backend.add_shelf_pair("F7T-SNAP", "42", reconciled=True)
+    c = backend.add_pair("F7T-SNAP", "43", state="SOLD")
+    ec = backend.add_event(c, -1, event_type="CONSUME", actor="SHOPIFY", reconciled=True)
+    s = backend.store()
+    snap = s.read_snapshot()
+    assert [p.pair_id for p in snap.pairs if p.sku == "F7T-SNAP"] == [a, b]
+    assert [e.event_id for e in snap.unstamped if e.event_id in {ea, eb, ec}] == [ea]
+    assert snap.max_event_id[("F7T-SNAP", "42")] == eb                     # stamped or not
+    assert snap.max_event_id[("F7T-SNAP", "43")] == ec                     # off the shelf too
+    assert snap.shelf_count(("F7T-SNAP", "42")) == 2
+    one = s.read_snapshot(("F7T-SNAP", "43"))                              # one key
+    assert one.pairs == () and one.unstamped == () and dict(one.max_event_id) == {("F7T-SNAP", "43"): ec}
+    s.close()
+
+
+def test_a_snapshot_is_one_transaction_and_holds_no_lock(backend):
+    s = backend.store()
+    s.read_snapshot()
+    p, e = backend.add_shelf_pair("F7T-SNAP2", "40")                        # a writer right after
+    assert [x.pair_id for x in s.read_snapshot(("F7T-SNAP2", "40")).pairs] == [p]
+    gen = s.lease_take("f7test-snap", 1000)                                 # the store is free to write
+    assert gen is not None
+    s.close()
+
+
+def test_import_payloads_come_back_per_pair_for_imported_events_only(backend):
+    a = backend.add_pair("F7T-PAY", "42")
+    backend.add_event(a, +1, event_type="IMPORTED", payload={"raw": {"J": {"v": "89,00"}, "K": {"v": 30}}})
+    backend.add_event(a, -1, event_type="CONSUME", actor="SHOPIFY", payload={"raw": {"J": {"v": "1"}}})
+    b = backend.add_pair("F7T-PAY", "43")
+    backend.add_event(b, +1, event_type="IMPORTED")                        # no payload
+    s = backend.store()
+    got = s.read_import_payloads([a, b])
+    assert [pid for pid, _ in got] == [a, b]
+    assert got[0][1]["raw"]["J"]["v"] == "89,00" and got[1][1] is None
+    assert s.read_import_payloads([]) == []
+    s.close()
+
+
 def test_sizes_are_exact_not_normalised(backend):
     backend.add_shelf_pair("F7T-AR-K-33PC", "42L")
     backend.add_shelf_pair("F7T-AR-K-33PC", "42 L")
@@ -170,12 +211,13 @@ def test_an_expired_waiter_blocks_nobody(backend):
 
 def test_fenced_write_renews_first_and_refuses_a_lost_lease(backend):
     s = backend.store()
-    f = _take(s, ttl=1_000)
-    backend.advance(600)
+    k = backend.scale
+    f = _take(s, ttl=1_000 * k)
+    backend.advance(600 * k)
     s.fenced_write(f, [])                                   # a renew alone
-    backend.advance(600)                                    # 1200 since take, 600 since renew
+    backend.advance(600 * k)                                # 1200 since take, 600 since renew
     (rid,) = s.fenced_write(f, [_recon()])                  # still ours
-    backend.advance(1_001)                                  # expired
+    backend.advance(1_001 * k)                              # expired
     with pytest.raises(LeaseLost):
         s.fenced_write(f, [_recon(action="late")])
     assert [r.action for r in s.read_audit(KIND_RECONCILE) if r.actor == ACTOR] == ["adjust"]

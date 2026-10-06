@@ -65,6 +65,7 @@ from backend.persistence.records import (
     LeaseRow,
     LockWaitTimeout,
     PairRow,
+    Snapshot,
     StampEvents,
     StoreClosed,
     StoreError,
@@ -81,6 +82,9 @@ SESSION_WAIT_TIMEOUT_S = 60
 SESSION_LOCK_WAIT_TIMEOUT_S = 5
 IDLE_REOPEN_S = 45  # < SESSION_WAIT_TIMEOUT_S: re-open before the server drops the session
 CONNECT_TIMEOUT_S = 10
+# One retry of a connect that never reached the server (TCP timeouts, errno 60, seen
+# on staging 2026-10-06) — never of a refusal: a wrong password is not retried.
+CONNECT_ATTEMPTS = 2
 
 # MySQL / client error numbers (mysql.connector.errorcode).
 _ER_DUP_ENTRY = 1062
@@ -116,6 +120,14 @@ _AUDIT_COLS = (
     "OUTCOME, PAYLOAD, CLOSED_AT"
 )
 SQL_AUDIT = f"SELECT {_AUDIT_COLS} FROM sm_outlet_audit WHERE KIND = %s"
+SQL_SNAP_PAIRS = f"SELECT {_PAIR_COLS} FROM sc_returned_pair WHERE STATE = 'IN_SCANSIA'"
+SQL_SNAP_MAX = (
+    "SELECT p.SKU, p.SIZE, MAX(e.ID) FROM sc_returned_pair_event e "
+    "JOIN sc_returned_pair p ON p.ID = e.PAIR_ID"
+)
+SQL_IMPORT_PAYLOADS = (
+    "SELECT e.PAIR_ID, e.PAYLOAD FROM sc_returned_pair_event e WHERE e.EVENT_TYPE = 'IMPORTED' AND e.PAIR_ID IN "
+)
 SQL_LEASE = (
     "SELECT HOLDER, GENERATION, EXPIRES_AT, WAITER, WAITER_EXPIRES_AT, UPDATED_AT "
     "FROM sm_outlet_lease WHERE ID = 1"
@@ -159,6 +171,7 @@ SQL_STAMP_HEAD = (
 
 STATEMENTS = (
     SQL_SESSION, SQL_SESSION_CHECK, SQL_NOW, SQL_PAIRS, SQL_UNSTAMPED, SQL_AUDIT, SQL_LEASE,
+    SQL_SNAP_PAIRS, SQL_SNAP_MAX, SQL_IMPORT_PAYLOADS,
     SQL_LEASE_TAKE, SQL_LAST_ID, SQL_LEASE_RENEW, SQL_LEASE_RELEASE, SQL_LEASE_WAIT,
     SQL_INSERT_AUDIT, SQL_STAMP_HEAD,
 )
@@ -347,10 +360,14 @@ class MySQLStore:
         return kw
 
     def _open(self) -> None:
-        try:
-            conn = self._connect_fn(**self._connect_kwargs())
-        except Exception as e:  # noqa: BLE001 - bounded, never the driver's text
-            raise _translate(e) from None
+        for attempt in range(1, CONNECT_ATTEMPTS + 1):
+            try:
+                conn = self._connect_fn(**self._connect_kwargs())
+                break
+            except Exception as e:  # noqa: BLE001 - bounded, never the driver's text
+                err = _translate(e)
+                if not (isinstance(err, DatabaseUnavailable) and attempt < CONNECT_ATTEMPTS):
+                    raise err from None
         try:
             cur = conn.cursor()
             cur.execute(SQL_SESSION)
@@ -506,6 +523,51 @@ class MySQLStore:
 
     def server_now(self) -> datetime:
         return self._select(SQL_NOW)[0][0]
+
+    def read_snapshot(self, key: Optional[Tuple[str, str]] = None) -> Snapshot:
+        """``START TRANSACTION READ ONLY WITH CONSISTENT SNAPSHOT`` — three plain
+        SELECTs — ``COMMIT`` (a read: nothing to roll back, nothing locked)."""
+        for attempt in (1, 2):
+            conn = self._ready()
+            cur = conn.cursor()
+            try:
+                conn.start_transaction(consistent_snapshot=True, readonly=True)
+                kp: Tuple[Any, ...] = tuple(key) if key is not None else ()
+                cur.execute(SQL_SNAP_PAIRS + (" AND SKU = %s AND SIZE = %s" if key else "") + " ORDER BY ID", kp)
+                pairs = tuple(_pair(r) for r in cur.fetchall())
+                cur.execute(SQL_UNSTAMPED.replace(" ORDER BY e.ID", "")
+                            + (" AND p.SKU = %s AND p.SIZE = %s" if key else "") + " ORDER BY e.ID", kp)
+                unstamped = tuple(_event(r) for r in cur.fetchall())
+                cur.execute(SQL_SNAP_MAX + (" WHERE p.SKU = %s AND p.SIZE = %s" if key else "")
+                            + " GROUP BY p.SKU, p.SIZE", kp)
+                maxima = {(_text(s), _text(z)): int(m) for s, z, m in cur.fetchall()}
+                conn.commit()
+                self._last_used = self._clock()
+                return Snapshot(pairs=pairs, unstamped=unstamped, max_event_id=maxima)
+            except Exception as e:  # noqa: BLE001
+                _quiet_rollback(conn)
+                err = _translate(e)
+                if isinstance(err, DatabaseUnavailable):
+                    self._conn_lost()
+                    if attempt == 1:
+                        continue
+                raise err from None
+            finally:
+                _quiet_close(cur)
+        raise DatabaseUnavailable("unreachable")  # pragma: no cover
+
+    def read_import_payloads(self, pair_ids: Sequence[int]) -> List[Tuple[int, Any]]:
+        ids = sorted({int(i) for i in pair_ids})
+        if not ids:
+            return []
+        rows = self._select(SQL_IMPORT_PAYLOADS + _in_list(len(ids)) + " ORDER BY e.ID", ids)
+        out = []
+        for pid, payload in rows:
+            try:
+                out.append((int(pid), _json(payload)))
+            except ValueError:
+                out.append((int(pid), None))   # an unparseable payload: no seed for that pair
+        return out
 
     # -- the lease statements ---------------------------------------------------
     def lease_take(self, holder: str, ttl_ms: int) -> Optional[int]:

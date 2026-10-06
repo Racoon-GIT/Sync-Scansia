@@ -86,6 +86,16 @@ class RegisterStore(Protocol):
 
     def read_lease(self) -> LeaseRow: ...
 
+    def read_snapshot(self, key: Optional[Any] = None) -> Any:
+        """One READ ONLY consistent-snapshot transaction (the stated exception
+        to §3.7 rule 1), closed before returning: shelf pairs, every unstamped
+        event, each key's max event id — all keys, or one."""
+        ...
+
+    def read_import_payloads(self, pair_ids: Sequence[int]) -> List[Any]:
+        """``(pair_id, PAYLOAD)`` of the pairs' ``IMPORTED`` events (B-2's J seed)."""
+        ...
+
     def server_now(self) -> datetime: ...
 
     # --- the lease: one guarded statement each, atomic on its own ----------
