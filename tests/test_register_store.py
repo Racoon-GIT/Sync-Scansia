@@ -85,6 +85,14 @@ def test_read_pairs_filters_and_orders_by_id(backend):
     assert s.read_pairs(pair_ids=[]) == []
 
 
+def test_read_pairs_carries_the_model_columns_bulk_pricing_scopes_on(backend):
+    a = backend.add_pair("F7T-SKU1", "42", brand="Nike", product_title="Air Max")
+    b = backend.add_pair("F7T-SKU1", "43")
+    got = {p.pair_id: p for p in backend.store().read_pairs(pair_ids=[a, b])}
+    assert (got[a].brand, got[a].product_title) == ("Nike", "Air Max")
+    assert (got[b].brand, got[b].product_title) == (None, None)
+
+
 def test_unstamped_events_join_key_and_state_and_keep_the_keyless_miss(backend):
     p, e1 = backend.add_shelf_pair("F7T-SKU1", "42")
     e0 = backend.add_event(p, 1, reconciled=True)  # stamped: never returned

@@ -95,6 +95,7 @@ from backend.services import flows
 from backend.services import ledger as L
 from backend.services import resolvers, variants
 from backend.services.lease import HOLDER_BASELINE, LeaseUnavailable, PassLease
+from backend.services.promo_gate import require_promo_location
 from backend.services.recovery import CLASS_PUBLISH, recover
 from backend.shopify import ops
 from backend.shopify.ops import ProductNotFound, ShopifyUserError
@@ -1096,6 +1097,7 @@ def baseline_apply(
     if why is not None:
         return BaselineReport(status=ST_PRECONDITION_REFUSED, reason=why)
     assert dlq is not None
+    require_promo_location(transport, promo_location_id)          # E18: before the lease, nothing written
     pass_lease = lease or PassLease(register, HOLDER_BASELINE, sleep=sleep)
     try:
         pass_lease.take(bound_s=take_bound_s)

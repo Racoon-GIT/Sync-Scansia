@@ -46,6 +46,7 @@ from backend.api.init import build_init_router, build_relevel_router
 from backend.api.prices import build_prices_router
 from backend.api.publish import build_publish_router
 from backend.api.read import build_read_router
+from backend.api.reconcile import build_reconcile_router
 from backend.api.ui import build_ui_router
 from backend.auth.basic_auth import AuthError, AuthNotConfigured
 from backend.config import ConfigError, ShopifyConfig, load_shopify_config
@@ -180,6 +181,7 @@ def create_app(
     app.include_router(build_prices_router())
     app.include_router(build_init_router())
     app.include_router(build_relevel_router())
+    app.include_router(build_reconcile_router())
     app.include_router(build_ui_router())
     return app
 

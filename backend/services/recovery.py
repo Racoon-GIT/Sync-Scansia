@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from backend.persistence.records import (
     APPLIED,
+    CARRIED,
     FAILED,
     HELD,
     OPEN,
@@ -65,9 +66,10 @@ def recover(ctx: "flows.Context", klass: str) -> RecoveryResult:
     for row in rows:  # id order: a revive's zeroing rows precede its tail
         if row.group_id is not None and row.group_id not in groups:
             groups.append(row.group_id)
-        if row.status != OPEN:
-            continue
         row = ctx.ledger.reload(row)  # an earlier bullet may have superseded it
+        if row.status == APPLIED:
+            _applied_gone(ctx, row, out)
+            continue
         if row.status != OPEN:
             continue
         try:
@@ -88,6 +90,22 @@ def recover(ctx: "flows.Context", klass: str) -> RecoveryResult:
         except StoreError as e:
             ctx.report.surface("stamp_failed", group_id=gid, error=type(e).__name__)
     return out
+
+
+def _applied_gone(ctx: "flows.Context", row: AuditRow, out: RecoveryResult) -> None:
+    """Terminal path (ii) binds every row kind and is read first (§3.3 rule 2):
+    an ``APPLIED`` row whose target reads gone closes ``CARRIED`` — what it moved
+    stays netted (Groups) — instead of waiting for, or taking, its group's stamp.
+    Otherwise the ``APPLIED`` bullet: nothing on Shopify, the settle below."""
+    try:
+        what = _gone(ctx, row)
+        if what:
+            ctx.report.surface("target_gone", row_id=row.row_id, what=what)
+            out.statuses[row.row_id] = ctx.ledger.close(row, CARRIED, carried=True, reason=f"{what}_gone")
+    except LeaseLost:
+        raise
+    except (ShopifyUserError, ShopifyTransportError, StoreError, RuntimeError) as e:
+        ctx.report.surface("recovery_error", row_id=row.row_id, error=type(e).__name__)
 
 
 # --- terminal path (ii) --------------------------------------------------------

@@ -1,546 +1,388 @@
-"""backend.services.delete_service — IRREVERSIBLE outlet delete/cleanup (M5).
-
-Every collaborator is mocked in-memory (ops, ScansiaSheet, DeleteAuditSink) — NO
-HTTP, NO live store, NO live Sheet, per project rules. A single shared call log
-records the exact op order so the load-bearing safety invariant
-("write_durable BEFORE product_delete, and if write_durable raises product_delete
-is NEVER reached") is asserted mechanically.
-
-Coverage: the exact per-variant predicate (candidate + every REVIEW route);
-Promo anchor fail-closed gate; abort-on-snapshot-failure; human-gesture gate;
-over-threshold second confirm; live re-verify (plan_hash drift); col-Q write-back;
-reconstructive snapshot fields; single-delete predicate-skip; deny_normalize.
-"""
+"""Deletion on the register (plan §3.5's deletion order, the bulk cleanup; §3.3 rule
+2's terminal path (iii)) — end to end: the real ``ops`` documents against the
+stateful fake Shopify, the register and its audit rows on the in-memory store.
+The predicate and the snapshot's fields: ``tests/test_delete_predicate.py``."""
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from decimal import Decimal
+from typing import Any, Dict, List
 
 import pytest
 
-from backend.gsheet.reader import CanonRead, CanonRow
-from backend.gsheet.writer import WriteResult
+from backend.persistence.audit_sink import RegisterAuditSink
+from backend.persistence.records import (
+    APPLIED,
+    CARRIED,
+    FAILED,
+    HOLD_ROW,
+    KIND_AUDIT,
+    KIND_DELETE,
+    KIND_HOLD,
+    OPEN,
+)
 from backend.services import delete_service as ds
-from backend.shopify import ops
+from backend.services import flows
+from backend.services import ledger as L
+from backend.services.lease import PassLease
 
-PROMO = "gid://shopify/Location/PROMO"
-MAG = "gid://shopify/Location/MAG"
-
-
-# ---------------------------------------------------------------------------
-# Builders
-# ---------------------------------------------------------------------------
-
-def _inv_variant(vid, *, policy="DENY", promo_available=0, promo_committed=0,
-                 promo_present=True, non_promo=None, truncated=False) -> Dict[str, Any]:
-    """One read_variant_inventory row. ``promo_present=False`` => Promo level ABSENT."""
-    levels: List[Dict[str, Any]] = []
-    if promo_present:
-        levels.append({
-            "location_id": PROMO, "location_name": "Promo",
-            "available": promo_available, "committed": promo_committed,
-            "on_hand": max(promo_available, 0),
-        })
-    for loc, av in (non_promo or {}).items():
-        levels.append({"location_id": loc, "location_name": loc,
-                       "available": av, "committed": 0, "on_hand": av})
-    return {
-        "id": vid, "sku": "SKU", "inventoryPolicy": policy,
-        "selectedOptions": [{"name": "Size", "value": "42"}],
-        "inventoryItemId": vid + "/i", "levels": levels, "levels_truncated": truncated,
-    }
+from tests.fake_shop import PROMO, FakeShop
+from tests.register_fixtures import MemoryBackend, seed_reconcile
 
 
-def _snap_variant(vid="v1", sku="SKU-42", size="42") -> Dict[str, Any]:
-    return {"id": vid, "sku": sku, "price": "50.00", "compareAtPrice": "100.00",
-            "inventoryItem": {"id": vid + "/i"},
-            "selectedOptions": [{"name": "Size", "value": size}]}
+class Env:
+    def __init__(self, *, baseline: bool = True) -> None:
+        self.be = MemoryBackend()
+        if baseline:
+            self.be.seed_baseline()
+        self.shop = FakeShop()
+        self.leases: List[PassLease] = []
+
+    def register(self):
+        return self.be.register(actor="tester")
+
+    def lease(self, reg, kind="delete"):
+        lease = PassLease(reg, kind, sleep=lambda s: None)
+        self.leases.append(lease)
+        return lease
+
+    def outlet(self, sku="SKU1", status="DRAFT", **kw):
+        kw.setdefault("sizes", ("42", "43"))
+        return self.shop.product(f"{sku} - Outlet", status=status, sku=sku, **kw)
+
+    def pair(self, sku="SKU1", size="42", *, product=None, **kw) -> int:
+        if product is not None:
+            kw["outlet_product_id"] = flows.product_number(product.gid)
+        pid, _e = self.be.add_shelf_pair(sku, size, reconciled=True, **kw)
+        return pid
+
+    def single(self, product, *, plan=None, gesture="CONFERMO", sink=None):
+        reg = self.register()
+        plan = plan or ds.single_delete_preview(reg, self.shop, product.gid)
+        return ds.delete_single_apply(reg, self.shop, sink or RegisterAuditSink(reg, actor="tester"), plan,
+                                      human_gesture=gesture, promo_location_id=PROMO, lease=self.lease(reg),
+                                      sleep=lambda s: None)
+
+    def cleanup(self, *, plan=None, gesture=None, second_confirm=False, sink=None, threshold=25, archive_first=False):
+        reg = self.register()
+        plan = plan or ds.cleanup_preview(reg, self.shop, promo_location_id=PROMO, threshold=threshold,
+                                          archive_first=archive_first)
+        return ds.cleanup_apply(reg, self.shop, sink or RegisterAuditSink(reg, actor="tester"), plan,
+                                human_gesture=gesture if gesture is not None else "CONFERMO",
+                                promo_location_id=PROMO, second_confirm=second_confirm,
+                                lease=self.lease(reg, "cleanup"), sleep=lambda s: None)
+
+    def audit(self, kind):
+        return self.register().audit_rows(kind)
+
+    def pairs(self) -> Dict[int, Any]:
+        return {p.pair_id: p for p in self.register().pairs()}
 
 
-def _row(sku, gid, *, size="42", uuid=None) -> CanonRow:
-    return CanonRow(
-        row_uuid=uuid or f"u-{sku}", sku=sku, size=size, product_id=gid,
-        prezzo_high="100.00", prezzo_outlet="50.00", qta=1, qta_raw="1",
-        online="SI", sconto="", reconciled=False, row_index=0, anomalies=[],
-        raw={"sku": sku},
-    )
-
-
-class FakeSheet:
-    def __init__(self, rows=None):
-        self.rows = rows or []
-        self.deletes: List[tuple] = []
-
-    def read_canonical(self, *, assign_uuids=True) -> CanonRead:
-        return CanonRead(list(self.rows), {}, [])
-
-    def write_delete_state(self, row_uuid, gid, *, expected_sku, field, value) -> WriteResult:
-        self.deletes.append((row_uuid, gid, expected_sku, field, value))
-        return WriteResult(True, 1, None)
-
-
-class FakeAudit:
-    """Injected delete audit sink; write_durable raise-on-fail is the abort gate."""
-
-    def __init__(self, *, durable_raises=False, log=None):
-        self.log = log
-        self.durable: List[ds.BeforeSnapshot] = []
-        self.outcomes: List[ds.DeleteOutcomeEvent] = []
-        self.durable_raises = durable_raises
-
-    def write_durable(self, snapshot: ds.BeforeSnapshot) -> None:
-        if self.log is not None:
-            self.log.append(("write_durable", snapshot.product_gid))
-        if self.durable_raises:
-            raise RuntimeError("durable sink down")
-        self.durable.append(snapshot)
-
-    def write_outcome(self, event: ds.DeleteOutcomeEvent) -> None:
-        self.outcomes.append(event)
-
-
-class OpsMock:
-    """Patch ops.* used by delete_service; record calls into a shared log."""
-
-    def __init__(self, monkeypatch, *, members=None, inv_by_gid=None, variants_by_gid=None,
-                 core_by_gid=None, mf_by_gid=None, media_by_gid=None, log=None):
-        self.log: List[tuple] = log if log is not None else []
-        self.members = members or []
-        self.inv_by_gid = inv_by_gid or {}
-        self.variants_by_gid = variants_by_gid or {}
-        self.core_by_gid = core_by_gid or {}
-        self.mf_by_gid = mf_by_gid or {}
-        self.media_by_gid = media_by_gid or {}
-        monkeypatch.setattr(ops, "enumerate_outlet_products", self._enumerate)
-        monkeypatch.setattr(ops, "read_variant_inventory", self._read_inv)
-        monkeypatch.setattr(ops, "product_delete", self._delete)
-        monkeypatch.setattr(ops, "product_variants_bulk_update", self._bulk)
-        monkeypatch.setattr(ops, "product_update_status", self._status)
-        monkeypatch.setattr(ops, "get_product_core", self._core)
-        monkeypatch.setattr(ops, "get_product_variants", self._variants)
-        monkeypatch.setattr(ops, "get_product_metafields", self._mf)
-        monkeypatch.setattr(ops, "get_product_media", self._media)
-
-    def _enumerate(self, t, collection_gid=ops.OUTLET_COLLECTION_GID):
-        self.log.append(("enumerate", collection_gid))
-        return list(self.members)
-
-    def _read_inv(self, t, gid):
-        self.log.append(("read_inv", gid))
-        return [dict(v) for v in self.inv_by_gid.get(gid, [])]
-
-    def _delete(self, t, gid):
-        self.log.append(("product_delete", gid))
-        return "gid-del/" + gid
-
-    def _bulk(self, t, gid, variants):
-        self.log.append(("bulk", gid, variants))
-        return {}
-
-    def _status(self, t, gid, status):
-        self.log.append(("status", gid, status))
-        return {}
-
-    def _core(self, t, gid):
-        self.log.append(("core", gid))
-        return self.core_by_gid.get(gid, {
-            "id": gid, "title": "T", "handle": "h", "status": "DRAFT",
-            "tags": [], "collections": [],
-        })
-
-    def _variants(self, t, gid):
-        self.log.append(("variants", gid))
-        return [dict(v) for v in self.variants_by_gid.get(gid, [])]
-
-    def _mf(self, t, gid):
-        self.log.append(("mf", gid))
-        return list(self.mf_by_gid.get(gid, []))
-
-    def _media(self, t, gid):
-        self.log.append(("media", gid))
-        return list(self.media_by_gid.get(gid, []))
+def num(product) -> int:
+    return flows.product_number(product.gid)
 
 
 # ---------------------------------------------------------------------------
-# Predicate (per-variant, exact)
+# The single delete: step (0)'s preview and hold, steps (1)–(4)
 # ---------------------------------------------------------------------------
 
-def test_predicate_all_zero_deny_is_candidate(monkeypatch):
-    G = "gid://shopify/Product/C"
-    OpsMock(monkeypatch, members=[{"id": G, "title": "c", "status": "DRAFT"}],
-            inv_by_gid={G: [_inv_variant("v1", promo_available=0),
-                            _inv_variant("v2", promo_available=0)]})
-    z = ds.zero_stock_candidates(object(), promo_location_id=PROMO)
-    assert [c.product_gid for c in z.candidates] == [G]
-    assert z.review == () and z.in_stock == 0
+def test_single_delete_preview_lists_the_skus_shelf_pairs_and_the_keys_it_will_hold():
+    env = Env()
+    out = env.outlet(status="ACTIVE", extra_variants=(("Solo Personalizzazione", "SKU1"),))
+    a = env.pair("SKU1", "42", product=out)
+    b = env.pair("SKU1", "44")
+    env.pair("SKU2", "42")
+    plan = ds.single_delete_preview(env.register(), env.shop, out.gid)
+    assert plan.skus == ("SKU1",) and plan.shelf_pairs == (a, b)
+    assert plan.keys == (("SKU1", "42"), ("SKU1", "44")) and plan.status == "ACTIVE"
+    assert env.shop.count("delete") == 0 and env.audit(KIND_HOLD) == []
 
 
-def test_predicate_missing_promo_level_is_review(monkeypatch):
-    G = "gid://shopify/Product/M"
-    OpsMock(monkeypatch, members=[{"id": G, "title": "m", "status": "DRAFT"}],
-            inv_by_gid={G: [_inv_variant("v1", promo_available=0),
-                            _inv_variant("v2", promo_present=False)]})
-    z = ds.zero_stock_candidates(object(), promo_location_id=PROMO)
-    assert z.candidates == ()
-    assert z.review[0].reasons == ("promo_level_absent",)
-
-
-def test_predicate_one_continue_is_review(monkeypatch):
-    G = "gid://shopify/Product/K"
-    OpsMock(monkeypatch, members=[{"id": G, "title": "k", "status": "DRAFT"}],
-            inv_by_gid={G: [_inv_variant("v1", promo_available=0),
-                            _inv_variant("v2", promo_available=0, policy="CONTINUE")]})
-    z = ds.zero_stock_candidates(object(), promo_location_id=PROMO)
-    assert z.candidates == ()
-    assert z.review[0].reasons == ("continue_policy",)
-
-
-def test_predicate_committed_is_review(monkeypatch):
-    G = "gid://shopify/Product/CM"
-    OpsMock(monkeypatch, members=[{"id": G, "title": "cm", "status": "DRAFT"}],
-            inv_by_gid={G: [_inv_variant("v1", promo_available=0, promo_committed=2)]})
-    z = ds.zero_stock_candidates(object(), promo_location_id=PROMO)
-    assert z.review[0].reasons == ("promo_committed",)
-
-
-def test_predicate_oversell_is_review(monkeypatch):
-    G = "gid://shopify/Product/O"
-    OpsMock(monkeypatch, members=[{"id": G, "title": "o", "status": "DRAFT"}],
-            inv_by_gid={G: [_inv_variant("v1", promo_available=-1)]})
-    z = ds.zero_stock_candidates(object(), promo_location_id=PROMO)
-    assert z.review[0].reasons == ("promo_oversell",)
-
-
-def test_predicate_non_promo_stock_is_review(monkeypatch):
-    G = "gid://shopify/Product/NP"
-    OpsMock(monkeypatch, members=[{"id": G, "title": "np", "status": "DRAFT"}],
-            inv_by_gid={G: [_inv_variant("v1", promo_available=0, non_promo={MAG: 3})]})
-    z = ds.zero_stock_candidates(object(), promo_location_id=PROMO)
-    assert z.review[0].reasons == ("non_promo_stock",)
-
-
-def test_predicate_truncated_is_review(monkeypatch):
-    G = "gid://shopify/Product/TR"
-    OpsMock(monkeypatch, members=[{"id": G, "title": "tr", "status": "DRAFT"}],
-            inv_by_gid={G: [_inv_variant("v1", promo_available=0, truncated=True)]})
-    z = ds.zero_stock_candidates(object(), promo_location_id=PROMO)
-    assert z.review[0].reasons == ("levels_truncated_unknown",)
-
-
-def test_predicate_in_stock_is_skipped(monkeypatch):
-    G = "gid://shopify/Product/S"
-    OpsMock(monkeypatch, members=[{"id": G, "title": "s", "status": "ACTIVE"}],
-            inv_by_gid={G: [_inv_variant("v1", promo_available=5)]})
-    z = ds.zero_stock_candidates(object(), promo_location_id=PROMO)
-    assert z.candidates == () and z.review == () and z.in_stock == 1
-
-
-def test_predicate_read_error_isolated_to_review(monkeypatch):
-    G = "gid://shopify/Product/E"
-    m = OpsMock(monkeypatch, members=[{"id": G, "title": "e", "status": "DRAFT"}])
-
-    def _boom(t, gid):
-        raise RuntimeError("Product not found for GID")
-    monkeypatch.setattr(ops, "read_variant_inventory", _boom)
-    z = ds.zero_stock_candidates(object(), promo_location_id=PROMO)
-    assert z.candidates == () and z.review[0].reasons[0].startswith("read_error:")
-
-
-def test_predicate_no_variants_is_review(monkeypatch):
-    G = "gid://shopify/Product/NV"
-    OpsMock(monkeypatch, members=[{"id": G, "title": "nv", "status": "DRAFT"}],
-            inv_by_gid={G: []})
-    z = ds.zero_stock_candidates(object(), promo_location_id=PROMO)
-    assert z.candidates == ()
-    assert z.review[0].reasons == ("no_variants",)
-
-
-def test_predicate_promo_available_unknown_is_review(monkeypatch):
-    """HARDENING (D3): a PRESENT Promo level whose ``available`` is None/UNKNOWN
-    must route to REVIEW, never CANDIDATE — even though the shared
-    ``outlet_service._promo_available`` helper would collapse it to 0."""
-    G = "gid://shopify/Product/PU"
-    variant = _inv_variant("v1", promo_available=0)
-    variant["levels"][0]["available"] = None  # Promo level PRESENT but UNKNOWN
-    OpsMock(monkeypatch, members=[{"id": G, "title": "pu", "status": "DRAFT"}],
-            inv_by_gid={G: [variant]})
-    z = ds.zero_stock_candidates(object(), promo_location_id=PROMO)
-    assert z.candidates == ()
-    assert z.review[0].reasons == ("promo_available_unknown",)
-
-
-# ---------------------------------------------------------------------------
-# Promo anchor fail-closed gate
-# ---------------------------------------------------------------------------
-
-def test_promo_anchor_gate_aborts_before_enumeration(monkeypatch):
-    m = OpsMock(monkeypatch, members=[{"id": "g", "title": "x", "status": "DRAFT"}])
-    with pytest.raises(ds.PromoAnchorError):
-        ds.zero_stock_candidates(object(), promo_location_id="")
-    assert m.log == []  # never enumerated
-
-
-# ---------------------------------------------------------------------------
-# Cleanup apply — happy path: delete + col-Q write-back + snapshot-before-delete
-# ---------------------------------------------------------------------------
-
-def test_cleanup_apply_deletes_and_writes_back(monkeypatch):
-    G = "gid://shopify/Product/D1"
-    log: List[tuple] = []
-    OpsMock(monkeypatch, log=log, members=[{"id": G, "title": "d", "status": "DRAFT"}],
-            inv_by_gid={G: [_inv_variant("v1", promo_available=0)]},
-            variants_by_gid={G: [_snap_variant()]})
-    sheet, audit = FakeSheet(rows=[_row("SKU", G)]), FakeAudit(log=log)
-
-    plan = ds.cleanup_preview(object(), promo_location_id=PROMO)
-    assert plan.count == 1 and plan.candidates[0].product_gid == G
-
-    report = ds.cleanup_apply(object(), sheet, audit, plan, human_gesture="1", promo_location_id=PROMO)
-    assert report.deleted == 1
-    assert ("product_delete", G) in log
-    # write-back keyed by col-Q gid (guard), default field online=NO (DoD).
-    assert sheet.deletes == [("u-SKU", G, "SKU", "online", "NO")]
-    # durable snapshot written BEFORE the delete.
-    di = next(i for i, c in enumerate(log) if c[0] == "write_durable")
-    pi = next(i for i, c in enumerate(log) if c[0] == "product_delete")
-    assert di < pi
-    assert audit.durable[0].product_gid == G
-
-
-# ---------------------------------------------------------------------------
-# ABORT-on-snapshot-failure — write_durable raises => product_delete NOT called
-# ---------------------------------------------------------------------------
-
-def test_cleanup_abort_on_snapshot_failure_never_deletes(monkeypatch):
-    G = "gid://shopify/Product/D2"
-    log: List[tuple] = []
-    OpsMock(monkeypatch, log=log, members=[{"id": G, "title": "d", "status": "DRAFT"}],
-            inv_by_gid={G: [_inv_variant("v1", promo_available=0)]},
-            variants_by_gid={G: [_snap_variant()]})
-    sheet = FakeSheet(rows=[_row("SKU", G)])
-    audit = FakeAudit(log=log, durable_raises=True)
-
-    plan = ds.cleanup_preview(object(), promo_location_id=PROMO)
-    report = ds.cleanup_apply(object(), sheet, audit, plan, human_gesture="1", promo_location_id=PROMO)
-
-    assert report.deleted == 0
-    assert report.outcomes[0].status == ds.STATUS_SNAPSHOT_ABORTED
-    assert not any(c[0] == "product_delete" for c in log)  # KEY invariant
-    assert sheet.deletes == []
-
-
-def test_cleanup_snapshot_build_failed_skips_never_deletes(monkeypatch):
-    """A read op for the snapshot itself (e.g. get_product_core) raising ->
-    STATUS_SNAPSHOT_BUILD_FAILED, product_delete NEVER called (PRE-delete, safe
-    per-outlet skip)."""
-    G = "gid://shopify/Product/D2b"
-    log: List[tuple] = []
-    OpsMock(monkeypatch, log=log, members=[{"id": G, "title": "d", "status": "DRAFT"}],
-            inv_by_gid={G: [_inv_variant("v1", promo_available=0)]},
-            variants_by_gid={G: [_snap_variant()]})
-
-    def _boom_core(t, gid):
-        raise RuntimeError("core read failed")
-    monkeypatch.setattr(ops, "get_product_core", _boom_core)
-
-    sheet, audit = FakeSheet(rows=[_row("SKU", G)]), FakeAudit(log=log)
-    plan = ds.cleanup_preview(object(), promo_location_id=PROMO)
-    report = ds.cleanup_apply(object(), sheet, audit, plan, human_gesture="1", promo_location_id=PROMO)
-
-    assert report.deleted == 0
-    assert report.outcomes[0].status == ds.STATUS_SNAPSHOT_BUILD_FAILED
-    assert not any(c[0] == "product_delete" for c in log)
-
-
-# ---------------------------------------------------------------------------
-# Human gesture gate
-# ---------------------------------------------------------------------------
-
-def test_cleanup_missing_human_gesture_refused(monkeypatch):
-    G = "gid://shopify/Product/D3"
-    log: List[tuple] = []
-    OpsMock(monkeypatch, log=log, members=[{"id": G, "title": "d", "status": "DRAFT"}],
-            inv_by_gid={G: [_inv_variant("v1", promo_available=0)]})
-    sheet, audit = FakeSheet(rows=[_row("SKU", G)]), FakeAudit(log=log)
-    plan = ds.cleanup_preview(object(), promo_location_id=PROMO)
-    with pytest.raises(ds.DeleteConfirmationError):
-        ds.cleanup_apply(object(), sheet, audit, plan, human_gesture=None, promo_location_id=PROMO)
-    assert not any(c[0] == "product_delete" for c in log)
-
-
-def test_cleanup_wrong_count_gesture_refused(monkeypatch):
-    G = "gid://shopify/Product/D3b"
-    OpsMock(monkeypatch, members=[{"id": G, "title": "d", "status": "DRAFT"}],
-            inv_by_gid={G: [_inv_variant("v1", promo_available=0)]})
-    sheet, audit = FakeSheet(rows=[_row("SKU", G)]), FakeAudit()
-    plan = ds.cleanup_preview(object(), promo_location_id=PROMO)  # count == 1
-    with pytest.raises(ds.DeleteConfirmationError):
-        ds.cleanup_apply(object(), sheet, audit, plan, human_gesture="9", promo_location_id=PROMO)
-
-
-# ---------------------------------------------------------------------------
-# Over-threshold second confirmation
-# ---------------------------------------------------------------------------
-
-def test_cleanup_threshold_requires_second_confirm(monkeypatch):
-    G = "gid://shopify/Product/D4"
-    OpsMock(monkeypatch, members=[{"id": G, "title": "d", "status": "DRAFT"}],
-            inv_by_gid={G: [_inv_variant("v1", promo_available=0)]},
-            variants_by_gid={G: [_snap_variant()]})
-    sheet, audit = FakeSheet(rows=[_row("SKU", G)]), FakeAudit()
-
-    plan = ds.cleanup_preview(object(), promo_location_id=PROMO, threshold=0)
-    assert plan.requires_second_confirm is True
-    with pytest.raises(ds.DeleteConfirmationError):
-        ds.cleanup_apply(object(), sheet, audit, plan, human_gesture="1", promo_location_id=PROMO)
-    # with the second confirmation it proceeds.
-    report = ds.cleanup_apply(object(), sheet, audit, plan, human_gesture="1",
-                              promo_location_id=PROMO, second_confirm=True)
-    assert report.deleted == 1
-
-
-def test_cleanup_hard_cap_requires_second_confirm_despite_high_threshold(monkeypatch):
-    """An operator-supplied threshold (e.g. 10000) can never silently disable the
-    second-confirm gate above CLEANUP_HARD_CAP: count=60 > cap -> still requires
-    second_confirm even though count < threshold."""
-    G = "gid://shopify/Product/CAP"
-    OpsMock(monkeypatch, members=[{"id": G, "title": "d", "status": "DRAFT"}],
-            inv_by_gid={G: [_inv_variant("v1", promo_available=0)]})
-    sheet, audit = FakeSheet(), FakeAudit()
-    fake_plan = ds.CleanupPlan(
-        dry_run=True, candidates=(), review=(), count=60, threshold=10000,
-        archive_first=False, requires_second_confirm=False, plan_hash="deadbeef",
-    )
-    with pytest.raises(ds.DeleteConfirmationError):
-        ds.cleanup_apply(object(), sheet, audit, fake_plan, human_gesture="60",
-                         promo_location_id=PROMO)
-
-
-# ---------------------------------------------------------------------------
-# Live re-verify — plan_hash drift aborts the whole batch
-# ---------------------------------------------------------------------------
-
-def test_cleanup_verify_failed_on_drift(monkeypatch):
-    G = "gid://shopify/Product/D5"
-    m = OpsMock(monkeypatch, members=[{"id": G, "title": "d", "status": "DRAFT"}],
-                inv_by_gid={G: [_inv_variant("v1", promo_available=0)]},
-                variants_by_gid={G: [_snap_variant()]})
-    sheet, audit = FakeSheet(rows=[_row("SKU", G)]), FakeAudit()
-    plan = ds.cleanup_preview(object(), promo_location_id=PROMO)
-    # the outlet gains stock between preview and apply -> no longer a candidate.
-    m.inv_by_gid[G] = [_inv_variant("v1", promo_available=3)]
-    report = ds.cleanup_apply(object(), sheet, audit, plan, human_gesture="1", promo_location_id=PROMO)
-    assert report.verify_failed is True and report.deleted == 0
-    assert audit.durable == [] and sheet.deletes == []
-
-
-# ---------------------------------------------------------------------------
-# Single delete (creation errors) — predicate deliberately NOT applied
-# ---------------------------------------------------------------------------
-
-def test_single_delete_ignores_predicate(monkeypatch):
-    G = "gid://shopify/Product/S1"
-    log: List[tuple] = []
-    OpsMock(monkeypatch, log=log, variants_by_gid={G: [_snap_variant()]},
-            core_by_gid={G: {"id": G, "title": "Sneaker X - Outlet", "handle": "h",
-                             "status": "DRAFT", "tags": [], "collections": []}})
-    sheet, audit = FakeSheet(rows=[_row("SKU", G)]), FakeAudit(log=log)
-    out = ds.delete_single_apply(object(), sheet, audit, G, human_gesture="CONFERMO")
-    assert out.status == ds.STATUS_DELETED
-    assert ("product_delete", G) in log
-    assert sheet.deletes[0][1] == G
-
-
-def test_single_delete_requires_gesture(monkeypatch):
-    G = "gid://shopify/Product/S2"
-    log: List[tuple] = []
-    OpsMock(monkeypatch, log=log)
-    sheet, audit = FakeSheet(), FakeAudit(log=log)
-    with pytest.raises(ds.DeleteConfirmationError):
-        ds.delete_single_apply(object(), sheet, audit, G, human_gesture="nope")
-    assert not any(c[0] == "product_delete" for c in log)
-
-
-def test_single_delete_rejects_non_outlet_target(monkeypatch):
-    """HARDENING (post-review): a mistyped GID that resolves to a NON-outlet
-    product (no OUTLET collection membership, no ``*Outlet*`` title) must be
-    refused BEFORE any snapshot/product_delete — the escape hatch is for a
-    botched CREATE (an outlet duplicate), never an arbitrary product."""
-    G = "gid://shopify/Product/NOTOUTLET"
-    log: List[tuple] = []
-    OpsMock(monkeypatch, log=log, core_by_gid={G: {
-        "id": G, "title": "Air Max 90", "handle": "air-max-90", "status": "ACTIVE",
-        "tags": [], "collections": [],
-    }}, variants_by_gid={G: [_snap_variant()]})
-    sheet, audit = FakeSheet(), FakeAudit(log=log)
+def test_single_delete_refuses_a_target_that_is_not_an_outlet():
+    env = Env()
+    source = env.shop.product("Full price", outlet=False)
     with pytest.raises(ds.SingleDeleteNotOutletError):
-        ds.delete_single_apply(object(), sheet, audit, G, human_gesture="CONFERMO")
-    assert not any(c[0] == "product_delete" for c in log)
-    assert audit.durable == []  # the gate fires BEFORE the snapshot is even built
+        ds.single_delete_preview(env.register(), env.shop, source.gid)
 
 
-def test_single_delete_accepts_outlet_by_collection_membership(monkeypatch):
-    """The OUTLET-collection-membership signal alone (no outlet title) is
-    sufficient — mirrors resolvers.outlet_resolver's OR predicate."""
-    G = "gid://shopify/Product/MEMBERONLY"
-    log: List[tuple] = []
-    OpsMock(monkeypatch, log=log, core_by_gid={G: {
-        "id": G, "title": "Plain Title", "handle": "h", "status": "DRAFT", "tags": [],
-        "collections": [{"id": ops.OUTLET_COLLECTION_GID, "title": "OUTLET",
-                         "handle": "outlet", "smart": True}],
-    }}, variants_by_gid={G: [_snap_variant()]})
-    sheet, audit = FakeSheet(), FakeAudit(log=log)
-    out = ds.delete_single_apply(object(), sheet, audit, G, human_gesture="CONFERMO")
-    assert out.status == ds.STATUS_DELETED
-    assert ("product_delete", G) in log
+def test_single_delete_holds_clears_snapshots_deletes_then_offlines_in_that_order():
+    env = Env()
+    out = env.outlet(status="ACTIVE", promo={"42": 1})
+    sold = env.be.add_pair("SKU1", "42", state="VENDUTO", outlet_product_id=num(out))
+    on_shelf = env.pair("SKU1", "42", product=out, online=True)
+    seen: Dict[str, Any] = {}
+
+    def at_delete(shop):
+        reg = env.register()
+        seen["hold"] = [h for h in reg.held_keys() if h.kind == HOLD_ROW]
+        seen["delete_rows"] = reg.audit_rows(KIND_DELETE)
+        seen["ids"] = {p.pair_id: p.outlet_product_id for p in reg.pairs()}
+
+    env.shop.on("delete", at_delete)
+    rep = env.single(out)
+    assert rep.status == ds.STATUS_DELETED and out.gid not in env.shop.products
+    (hold,) = seen["hold"]                                      # (0) before the delete
+    assert hold.key == ("SKU1", "42") and hold.reason == ds.REASON_OUTLET_DELETED and hold.event_ids == frozenset()
+    assert seen["ids"] == {sold: None, on_shelf: None}          # (1): any state, before the delete
+    (snap,) = seen["delete_rows"]                               # (2): the gate, before the delete
+    assert snap.product_id == num(out) and snap.payload["title"] == "SKU1 - Outlet"
+    assert env.pairs()[on_shelf].online is False                # (4)
+    assert rep.held_keys == (("SKU1", "42"),)
+    assert any(r.action == "product_delete" for r in env.audit(KIND_AUDIT))
+
+
+def test_a_deleted_outlets_key_takes_no_add_until_a_relevel():
+    from backend.services import outlet_service
+
+    env = Env()
+    out = env.outlet(status="ACTIVE", promo={"42": 1})
+    env.pair("SKU1", "42", product=out)
+    env.single(out)
+    env.be.add_shelf_pair("SKU1", "42")                          # a new return: +1 pending
+    plan = outlet_service.publish_preview(env.register(), env.shop, promo_location_id=PROMO)
+    assert plan.actions == () and "held_positive:SKU1:42:1" in plan.anomalies
+
+
+def test_single_delete_aborts_at_a_failed_durable_snapshot_and_never_deletes():
+    class Boom(RegisterAuditSink):
+        def write_durable(self, snapshot):  # noqa: ANN001
+            raise RuntimeError("audit down")
+
+    env = Env()
+    out = env.outlet(status="ACTIVE")
+    env.pair("SKU1", "42", product=out)
+    reg = env.register()
+    rep = env.single(out, sink=Boom(reg, actor="tester"))
+    assert rep.status == ds.STATUS_SNAPSHOT_ABORTED and out.gid in env.shop.products
+    assert env.shop.count("delete") == 0
+
+
+def test_a_snapshot_that_cannot_be_read_writes_nothing_not_even_the_hold():
+    env = Env()
+    out = env.outlet(status="ACTIVE")
+    env.pair("SKU1", "42", product=out)
+    plan = ds.single_delete_preview(env.register(), env.shop, out.gid)
+    env.shop.fault("metafields", "refuse")
+    rep = env.single(out, plan=plan)
+    assert rep.status == ds.STATUS_SNAPSHOT_BUILD_FAILED
+    assert env.audit(KIND_HOLD) == [] and env.pairs()[next(iter(env.pairs()))].outlet_product_id == num(out)
+
+
+def test_single_delete_is_verify_failed_when_a_pair_arrived_since_the_preview():
+    env = Env()
+    out = env.outlet(status="ACTIVE")
+    env.pair("SKU1", "42", product=out)
+    plan = ds.single_delete_preview(env.register(), env.shop, out.gid)
+    env.pair("SKU1", "43")
+    rep = env.single(out, plan=plan)
+    assert rep.status == ds.STATUS_VERIFY_FAILED and out.gid in env.shop.products and env.audit(KIND_HOLD) == []
+
+
+def test_single_delete_needs_its_gesture():
+    env = Env()
+    out = env.outlet()
+    with pytest.raises(ds.DeleteConfirmationError):
+        env.single(out, gesture="2")
+
+
+def test_a_refused_delete_of_a_product_still_there_closes_no_row():
+    env = Env()
+    out = env.outlet(status="ACTIVE", promo={"42": 1})
+    reg = env.register()
+    item = out.variants[0].item
+    row = seed_reconcile(reg, action=L.A_ADJUST, keys=(("SKU1", "42"),), purpose=L.P_ADD, share=1,
+                         inventory_item_id=item, location_id=PROMO, product_id=num(out), sent=True)
+    env.shop.fault("delete", "user_error:X")
+    rep = env.single(out)
+    assert rep.status == ds.STATUS_DELETE_FAILED and out.gid in env.shop.products
+    assert env.register().reconcile_rows(row_ids=[row])[0].status == OPEN
+
+
+def test_an_unknown_delete_answer_with_the_product_gone_is_a_delete():
+    env = Env()
+    out = env.outlet(status="ACTIVE")
+    env.shop.fault("delete", "lose_after")
+    rep = env.single(out)
+    assert rep.status == ds.STATUS_DELETED and out.gid not in env.shop.products
+    assert any(w.startswith("product_reads_gone_after:") for w in rep.warnings)
 
 
 # ---------------------------------------------------------------------------
-# Reconstructive snapshot fields
+# Terminal path (iii): the product's rows not closed, closed by its delete
 # ---------------------------------------------------------------------------
 
-def test_snapshot_captures_reconstructive_fields(monkeypatch):
-    G = "gid://shopify/Product/SN"
-    log: List[tuple] = []
-    OpsMock(
-        monkeypatch, log=log,
-        core_by_gid={G: {
-            "id": G, "title": "Sneak - Outlet", "handle": "sneak-outlet", "status": "ACTIVE",
-            "tags": ["outlet", "nike"],
-            "collections": [
-                {"id": "c1", "title": "OUTLET", "handle": "outlet", "smart": True},
-                {"id": "c2", "title": "Manual", "handle": "man", "smart": False},
-            ],
-        }},
-        variants_by_gid={G: [_snap_variant(vid="v1", sku="SKU-42", size="42")]},
-        mf_by_gid={G: [{"namespace": "custom", "key": "k",
-                        "type": "single_line_text_field", "value": "x"}]},
-        media_by_gid={G: ["https://cdn/img1.jpg", "https://cdn/img2.jpg"]},
-    )
-    sheet, audit = FakeSheet(), FakeAudit(log=log)
-    ds.delete_single_apply(object(), sheet, audit, G, human_gesture="CONFERMO")
-    snap = audit.durable[0]
-    assert snap.title == "Sneak - Outlet" and snap.handle == "sneak-outlet" and snap.status == "ACTIVE"
-    assert snap.tags == ("outlet", "nike")
-    v = snap.variants[0]
-    assert v.size == "42" and v.price == "50.00" and v.compare_at == "100.00" and v.inventory_item_id == "v1/i"
-    assert snap.image_srcs == ("https://cdn/img1.jpg", "https://cdn/img2.jpg")
-    assert snap.metafields[0]["namespace"] == "custom"
-    assert {c.id: c.smart for c in snap.collections} == {"c1": True, "c2": False}
+def test_terminal_path_iii_closes_a_products_open_rows_by_kind_and_settles_their_groups():
+    """``close_product_rows`` itself (a delete runs its holder's recovery first,
+    which would act on these rows before the delete: the kinds are tested here)."""
+    from backend.services import passes
+
+    env = Env()
+    out = env.outlet(status="ACTIVE", promo={"42": 1, "43": 1})
+    other = env.outlet(sku="SKU1", status="ACTIVE", sizes=("44",), promo={"44": 1})
+    reg = env.register()
+    i42, i43 = out.variants[0].item, out.variants[1].item
+    applied = seed_reconcile(reg, action=L.A_ADJUST, keys=(("SKU1", "42"),), event_ids=(5,), purpose=L.P_LOWER,
+                             share=-1, inventory_item_id=i42, location_id=PROMO, product_id=num(out), sent=True,
+                             status=APPLIED, outcome={"moved": -1}, group_id=11)
+    sent_minus = seed_reconcile(reg, action=L.A_ADJUST, keys=(("SKU1", "43"),), event_ids=(6,), purpose=L.P_LOWER,
+                                share=-1, inventory_item_id=i43, location_id=PROMO, product_id=num(out), sent=True,
+                                group_id=12)
+    never_plus = seed_reconcile(reg, action=L.A_ADJUST, keys=(("SKU1", "42"),), purpose=L.P_ADD, share=1,
+                                inventory_item_id=i42, location_id=PROMO, product_id=num(out), group_id=13)
+    sibling = seed_reconcile(reg, action=L.A_ADJUST, keys=(("SKU1", "44"),), event_ids=(6,), purpose=L.P_LOWER,
+                             share=-1, inventory_item_id=other.variants[0].item, location_id=PROMO,
+                             product_id=num(other), sent=True, status=APPLIED, outcome={"moved": -1}, group_id=12)
+    run = passes.Holder(reg, env.shop, PROMO, "delete", lease=env.lease(reg), sleep=lambda s: None)
+    run.lease.take()
+    try:
+        closed = ds.close_product_rows(run.ctx, num(out), 99)
+    finally:
+        run.release()
+    assert set(closed) == {applied, sent_minus, never_plus}
+    rows = {r.row_id: r for r in env.register().reconcile_rows()}
+    assert rows[applied].status == CARRIED and rows[applied].outcome["moved"] == -1      # netted (Groups)
+    assert rows[sent_minus].status == FAILED and rows[sent_minus].outcome["possibly_applied"] is True
+    assert rows[never_plus].status == FAILED and "possibly_applied" not in rows[never_plus].outcome
+    for r in (applied, sent_minus, never_plus):
+        assert rows[r].outcome["reason"] == "product_deleted" and rows[r].outcome["delete_row"] == 99
+    assert rows[sibling].status == CARRIED                       # its group settled beside a FAILED row
+    assert any(i["kind"] == "rows_closed_product_deleted" for i in run.report.items)
+
+
+def test_a_delete_closes_a_sent_add_its_recovery_left_open_and_names_its_delete_row():
+    env = Env()
+    out = env.outlet(status="ACTIVE", promo={"42": 1})
+    reg = env.register()
+    row = seed_reconcile(reg, action=L.A_ADJUST, keys=(("SKU1", "42"),), purpose=L.P_ADD, share=1,
+                         inventory_item_id=out.variants[0].item, location_id=PROMO, product_id=num(out), sent=True)
+    rep = env.single(out)
+    assert rep.status == ds.STATUS_DELETED and rep.closed_rows == (row,)
+    (r,) = env.register().reconcile_rows(row_ids=[row])
+    (delete_row,) = env.audit(KIND_DELETE)
+    assert r.status == FAILED and r.outcome["delete_row"] == delete_row.row_id    # its units left with the product
+    assert any(i["kind"] == "left_for_publish" for i in rep.surfaced)            # recovery left it first
 
 
 # ---------------------------------------------------------------------------
-# CONTINUE-DENY coupling — deny_normalize forces DENY on every variant
+# The bulk cleanup
 # ---------------------------------------------------------------------------
 
-def test_deny_normalize_forces_deny_on_all_variants(monkeypatch):
-    G = "gid://shopify/Product/DN"
-    log: List[tuple] = []
-    OpsMock(monkeypatch, log=log, variants_by_gid={G: [{"id": "v1"}, {"id": "v2"}]})
-    n = ds.deny_normalize(object(), G)
-    assert n == 2
-    bulk = [c for c in log if c[0] == "bulk"]
-    assert bulk[0][1] == G
-    assert bulk[0][2] == [
-        {"id": "v1", "inventoryPolicy": "DENY"},
-        {"id": "v2", "inventoryPolicy": "DENY"},
-    ]
+def test_cleanup_lists_an_outlet_whose_sku_has_a_shelf_pair_apart_and_never_deletes_it():
+    env = Env()
+    keep = env.outlet(sku="SKU1")                                # DRAFT at 0, but a shelf pair: protected
+    gone = env.outlet(sku="SKU2")
+    env.pair("SKU1", "42")
+    plan = ds.cleanup_preview(env.register(), env.shop, promo_location_id=PROMO)
+    assert [c.product_gid for c in plan.candidates] == [gone.gid] and plan.count == 1
+    assert [(p.product_gid, p.reasons) for p in plan.protected] == [(keep.gid, ("shelf_pairs:SKU1",))]
+    rep = env.cleanup(plan=plan, gesture="1")
+    assert rep.deleted == 1 and keep.gid in env.shop.products and gone.gid not in env.shop.products
+
+
+def test_cleanup_rechecks_each_product_right_before_its_delete():
+    env = Env()
+    a = env.outlet(sku="SKU1")
+    b = env.outlet(sku="SKU2")
+    plan = ds.cleanup_preview(env.register(), env.shop, promo_location_id=PROMO)
+    calls = {"n": 0}
+
+    def a_return_lands(shop):
+        calls["n"] += 1
+        if calls["n"] == 1:                                      # the first product's own re-read
+            env.be.add_shelf_pair("SKU1" if plan.candidates[0].product_gid == a.gid else "SKU2", "42")
+
+    env.shop.on("core", a_return_lands)
+    rep = env.cleanup(plan=plan, gesture="2")
+    statuses = {o.product_gid: o.status for o in rep.outcomes}
+    first, second = plan.candidates[0].product_gid, plan.candidates[1].product_gid
+    assert statuses == {first: ds.STATUS_SKIPPED, second: ds.STATUS_DELETED}
+    assert {o.product_gid: o.warnings for o in rep.outcomes}[first] == ("shelf_pairs",)
+    assert first in env.shop.products and b.gid in (first, second)
+
+
+def test_cleanup_clears_the_id_on_sold_pairs_and_writes_a_delete_row_per_product():
+    env = Env()
+    out = env.outlet(sku="SKU1")
+    sold = env.be.add_pair("SKU1", "42", state="VENDUTO", outlet_product_id=num(out))
+    rep = env.cleanup(gesture="1")
+    assert rep.deleted == 1 and env.pairs()[sold].outlet_product_id is None
+    assert [r.product_id for r in env.audit(KIND_DELETE)] == [num(out)]
+
+
+def test_cleanup_aborts_the_whole_batch_on_drift():
+    env = Env()
+    out = env.outlet(sku="SKU1")
+    plan = ds.cleanup_preview(env.register(), env.shop, promo_location_id=PROMO)
+    env.shop.promo(out.gid, "42").available = 2                  # gained stock: no longer a candidate
+    rep = env.cleanup(plan=plan, gesture="1")
+    assert rep.verify_failed and rep.deleted == 0 and env.shop.count("delete") == 0
+
+
+def test_cleanup_gestures_count_word_and_the_capped_second_confirm():
+    env = Env()
+    for i in range(3):
+        env.outlet(sku=f"SKU{i}")
+    plan = ds.cleanup_preview(env.register(), env.shop, promo_location_id=PROMO, threshold=2)
+    assert plan.requires_second_confirm
+    with pytest.raises(ds.DeleteConfirmationError):
+        env.cleanup(plan=plan, gesture="2")                      # wrong count
+    with pytest.raises(ds.DeleteConfirmationError):
+        env.cleanup(plan=plan, gesture="CONFERMO")               # over the threshold, no second confirm
+    capped = ds.cleanup_preview(env.register(), env.shop, promo_location_id=PROMO, threshold=10_000)
+    assert capped.requires_second_confirm is False               # 3 ≤ min(10 000, hard cap 50)
+    rep = env.cleanup(plan=plan, gesture="3", second_confirm=True)
+    assert rep.deleted == 3 and env.shop.count("delete") == 3
+
+
+def test_cleanup_archive_first_stages_and_closes_no_row():
+    env = Env()
+    out = env.outlet(sku="SKU1")
+    rep = env.cleanup(gesture="1", archive_first=True)
+    assert [o.status for o in rep.outcomes] == [ds.STATUS_ARCHIVED]
+    assert env.shop.products[out.gid].status == "ARCHIVED" and env.shop.count("delete") == 0
+
+
+def test_cleanup_yields_between_products_and_releases_the_lease():
+    env = Env()
+    for i in range(3):
+        env.outlet(sku=f"SKU{i}")
+    env.cleanup(gesture="3")
+    (lease,) = env.leases
+    assert lease.takes == 3 and not lease.held and env.register().lease_state().holder is None
+
+
+def test_cleanup_runs_before_the_baseline():
+    env = Env(baseline=False)
+    env.outlet(sku="SKU1")
+    rep = env.cleanup(gesture="1")
+    assert rep.deleted == 1 and any(i["kind"] == "held_key_lowering_skipped" for i in rep.surfaced)
+
+
+def test_product_skus_skip_customisation_only_and_blank_skus():
+    inv = [{"sku": "A", "title": "42", "selectedOptions": [{"name": "Size", "value": "42"}]},
+           {"sku": " ", "title": "43", "selectedOptions": [{"name": "Size", "value": "43"}]},
+           {"sku": "B", "title": "Solo Personalizzazione",
+            "selectedOptions": [{"name": "Size", "value": "Solo Personalizzazione"}]}]
+    assert ds.product_skus(inv) == ("A",)
+
+
+def test_sold_pairs_and_prices_are_never_touched_by_a_delete():
+    env = Env()
+    out = env.outlet(status="ACTIVE")
+    sold = env.be.add_pair("SKU1", "42", state="VENDUTO", price_outlet=Decimal("50.00"))
+    env.single(out)
+    p = env.pairs()[sold]
+    assert p.state == "VENDUTO" and p.price_outlet == Decimal("50.00")
+
+
+def test_one_products_shopify_failure_never_aborts_the_cleanup_batch():
+    env = Env()
+    a = env.outlet(sku="SKU1")
+    b = env.outlet(sku="SKU2")
+    plan = ds.cleanup_preview(env.register(), env.shop, promo_location_id=PROMO)
+    first = plan.candidates[0].product_gid
+    env.shop.fault("core", "refuse", when=lambda v: v["id"] == first)
+    rep = env.cleanup(plan=plan, gesture="2")
+    statuses = {o.product_gid: o.status for o in rep.outcomes}
+    assert statuses[first] == ds.STATUS_ERROR and rep.deleted == 1
+    assert {a.gid, b.gid} - {first} <= set(statuses)

@@ -1,51 +1,45 @@
-"""DELETE vertical — IRREVERSIBLE outlet cleanup / single-delete behind the shared
-preview-job / apply-job / confirm-token machinery (:mod:`backend.api.mutations`).
+"""DELETE vertical — IRREVERSIBLE outlet deletion, the multi-outlet exit and
+deny-normalize on the register (plan ``docs/f7-mysql-adapter-plan.md`` §3.5),
+behind the shared preview-job / apply-job / confirm-token machinery
+(:mod:`backend.api.mutations`). Every route is auth-gated (``require_basic_auth``);
+every job opens a register handle bound to the acting user (the name every audit
+row carries) and closes it; every apply works under the pass lease in its service.
 
-Five surfaces, all auth-gated (``require_basic_auth``); the authenticated username
-is the audit actor, captured into the per-request :class:`GSheetAuditSink`:
+* ``POST /outlet/zero-stock`` + ``GET .../{job_id}`` — READ-ONLY recon
+  (:func:`delete_service.zero_stock_candidates`): candidates + review buckets.
+* ``POST /outlet/cleanup/preview`` + ``GET`` — the bulk cleanup's plan: the
+  DRAFT-at-zero candidates, those whose SKU has an ``IN_SCANSIA`` pair listed apart
+  (``protected``, never deleted), ``count`` / ``requires_second_confirm`` /
+  ``plan_hash``, and a token bound to ``plan_hash#count#requires_second_confirm``.
+* ``POST /outlet/cleanup/apply`` — the gestures enforced SYNCHRONOUSLY before any
+  job: the token over ``{plan_hash}#{count}#{0|1}`` (a wrong count or a bad token →
+  409), ``CONFERMO`` (→ 409), the SIGNED second confirm (→ 409); then a job re-plans
+  live, drift-gates (``VERIFY_FAILED``) and calls
+  :func:`~delete_service.cleanup_apply`.
+* ``POST /outlet/delete/preview`` + ``GET`` — the single delete's step (0): the
+  product SKUs' ``IN_SCANSIA`` pairs and the keys the confirm will hold; refused at
+  once (409 ``single_delete_not_outlet``) for a target that is not an outlet.
+* ``POST /outlet/delete/apply`` — ``CONFERMO`` + count 1 + the token (kind
+  ``delete``) + the outlet gate, synchronously; then a job re-plans, drift-gates and
+  calls :func:`~delete_service.delete_single_apply`.
+* ``POST /outlet/exit/preview`` + ``GET`` / ``POST /outlet/exit/apply`` — the
+  multi-outlet exit (:mod:`backend.services.exit_service`): the SKU and the outlet
+  to keep; ``CONFERMO`` + the token (kind ``exit``).
+* ``POST /outlet/deny-normalize/preview`` + ``GET`` / ``POST
+  /outlet/deny-normalize/apply`` — rule 7's normalisation
+  (:mod:`backend.services.normalize_service`) on the named outlets, or every
+  outlet; ``CONFERMO`` + the token (kind ``normalize``).
 
-* ``POST /outlet/zero-stock`` + ``GET .../{job_id}`` — READ-ONLY recon job
-  (:func:`delete_service.zero_stock_candidates`): candidates + review buckets. No
-  token, no mutation.
-* ``POST /outlet/cleanup/preview`` + ``GET .../{job_id}`` — READ-ONLY plan job
-  (:func:`~delete_service.cleanup_preview`): a :class:`CleanupPlan` with
-  ``count`` / ``requires_second_confirm`` / ``plan_hash`` + a confirm-token bound
-  to the composite ``plan_hash#count#requires_second_confirm`` (so a mistyped
-  count fails the apply token check synchronously, AND the second_confirm
-  requirement itself is SIGNED — post-review HARDENING, see ``cleanup_apply``).
-* ``POST /outlet/cleanup/apply`` — confirm-gated + human-gesture-gated. The gesture
-  is enforced SYNCHRONOUSLY before any job/mutation: the token must verify over
-  ``{plan_hash}#{count}#{0|1}`` (a wrong count OR a bad/expired token -> 409), the
-  typed ``confirm`` must equal ``CONFERMO`` (-> 409), and a SIGNED
-  ``requires_second_confirm=1`` needs ``second_confirm`` (-> 409) — an
-  operator-resubmitted ``threshold`` can no longer silently skip this speed-bump,
-  since the decision was signed at preview time, not re-derived from the
-  client-echoed value. Only then is a job enqueued that re-plans LIVE,
-  drift-gates (``VERIFY_FAILED``), and calls :func:`~delete_service.cleanup_apply`
-  — which owns the mandatory snapshot->write_durable abort gate BEFORE any
-  ``productDelete``. The endpoint NEVER deletes; the service does, behind its gate.
-* ``POST /outlet/delete/apply`` — single hard-delete (a botched CREATE). Same
-  ``CONFERMO`` + ``count == 1`` synchronous gesture, PLUS a HARDENING gate
-  (post-review): the target GID must resolve to an OUTLET (collection membership
-  or ``*Outlet*`` title — :func:`delete_service.resolve_is_outlet`) BEFORE any
-  job/``productDelete`` is reachable, else 409 ``single_delete_not_outlet`` — a
-  mistyped GID can no longer delete an arbitrary non-outlet product. The
-  service's snapshot gate still applies. No live predicate re-check beyond the
-  outlet-membership gate (by design — a crashed CREATE may hold inherited stock,
-  which is exactly what is being removed).
-* ``POST /outlet/deny-normalize`` — the gated DENY-normalization mutation
-  (``CONFERMO`` gesture), unblocking legacy CONTINUE outlets.
-
-Secrets (the signing secret behind the token, the Basic-Auth actor) come from the
-environment / the auth dependency and are NEVER logged; snapshots/GIDs never leave
-the service+sink boundary.
+Plans are not persisted server-side (Option A): the apply body re-submits the
+preview's inputs and the live re-plan must hash as the confirmed one.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from dataclasses import asdict
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.api.errors import CODE_SINGLE_DELETE_NOT_OUTLET
 from backend.api.jobs import JobBusyError
@@ -56,14 +50,14 @@ from backend.api.mutations import (
     DEFAULT_PREVIEW_TTL_S,
     _error,
     _run_apply_job,
-    _run_mutation_job,
     _run_preview_job,
     _run_readonly_job,
     poll_job,
+    register_for,
 )
 from backend.auth.basic_auth import require_basic_auth
-from backend.persistence.gsheet_audit import GSheetAuditSink
-from backend.services import delete_service
+from backend.persistence.audit_sink import RegisterAuditSink
+from backend.services import delete_service, exit_service, normalize_service
 from backend.services.delete_service import (
     CONFIRM_WORD,
     DEFAULT_CLEANUP_THRESHOLD,
@@ -73,13 +67,19 @@ from backend.services.delete_service import (
 KIND_ZERO_STOCK = "outlet_zero_stock"
 KIND_CLEANUP_PREVIEW = "outlet_cleanup_preview"
 KIND_CLEANUP_APPLY = "outlet_cleanup_apply"
+KIND_DELETE_PREVIEW = "outlet_delete_preview"
 KIND_DELETE_SINGLE = "outlet_delete_single"
-KIND_DENY = "outlet_deny_normalize"
+KIND_EXIT_PREVIEW = "outlet_exit_preview"
+KIND_EXIT_APPLY = "outlet_exit_apply"
+KIND_NORMALIZE_PREVIEW = "outlet_normalize_preview"
+KIND_NORMALIZE_APPLY = "outlet_normalize_apply"
 
-# Vertical id SIGNED into the confirm-token (post-review HARDENING — see
-# backend.persistence.tokens): binds the cleanup preview/apply token pair to
-# THIS vertical only (a token minted here can never verify for publish/prices).
+# Vertical ids SIGNED into the confirm-tokens: a token minted for one never
+# verifies for another.
 TOKEN_KIND_CLEANUP = "cleanup"
+TOKEN_KIND_DELETE = "delete"
+TOKEN_KIND_EXIT = "exit"
+TOKEN_KIND_NORMALIZE = "normalize"
 
 
 # =============================================================================
@@ -95,30 +95,49 @@ class CleanupApplyRequest(BaseModel):
     confirm_token: str
     confirm: Optional[str] = None            # human gesture word (must be CONFERMO)
     count: Optional[int] = None              # human gesture count (typed candidate count)
-    # Echoed from the preview (Option A: plans are not persisted server-side); a
-    # mismatch vs the preview is caught by the live drift gate (plan_hash binds them).
     threshold: int = DEFAULT_CLEANUP_THRESHOLD
     archive_first: bool = False
     second_confirm: bool = False
 
 
+class DeletePreviewRequest(BaseModel):
+    product_gid: str
+
+
 class DeleteSingleRequest(BaseModel):
     product_gid: str
+    plan_hash: str
+    confirm_token: str
     confirm: Optional[str] = None
     count: Optional[int] = None              # must be 1 for a single delete
 
 
-class DenyNormalizeRequest(BaseModel):
-    product_gid: str
+class ExitPreviewRequest(BaseModel):
+    sku: str
+    keep_product_gid: str
+
+
+class ExitApplyRequest(ExitPreviewRequest):
+    plan_hash: str
+    confirm_token: str
+    confirm: Optional[str] = None
+
+
+class NormalizePreviewRequest(BaseModel):
+    product_gids: List[str] = Field(default_factory=list)
+
+
+class NormalizeApplyRequest(NormalizePreviewRequest):
+    plan_hash: str
+    confirm_token: str
     confirm: Optional[str] = None
 
 
 # =============================================================================
-# JSON-safe serializers (explicit; never dump raw inventory payloads / GIDs blindly)
+# JSON-safe serializers (explicit; never raw inventory payloads)
 # =============================================================================
 def _review_to_dict(r: Any) -> Dict[str, Any]:
-    return {"product_gid": r.product_gid, "title": r.title, "status": r.status,
-            "reasons": list(r.reasons)}
+    return {"product_gid": r.product_gid, "title": r.title, "status": r.status, "reasons": list(r.reasons)}
 
 
 def serialize_zero_stock(report: Any) -> Dict[str, Any]:
@@ -127,8 +146,7 @@ def serialize_zero_stock(report: Any) -> Dict[str, Any]:
         "in_stock": report.in_stock,
         "candidate_count": len(report.candidates),
         "candidates": [
-            {"product_gid": c.product_gid, "title": c.title, "status": c.status,
-             "variant_count": len(c.variants)}
+            {"product_gid": c.product_gid, "title": c.title, "status": c.status, "variant_count": len(c.variants)}
             for c in report.candidates
         ],
         "review": [_review_to_dict(r) for r in report.review],
@@ -143,17 +161,18 @@ def serialize_cleanup_plan(plan: Any) -> Dict[str, Any]:
         "archive_first": plan.archive_first,
         "requires_second_confirm": plan.requires_second_confirm,
         "plan_hash": plan.plan_hash,
-        "candidates": [
-            {"product_gid": c.product_gid, "title": c.title, "status": c.status}
-            for c in plan.candidates
-        ],
+        "candidates": [{"product_gid": c.product_gid, "title": c.title, "status": c.status} for c in plan.candidates],
         "review": [_review_to_dict(r) for r in plan.review],
+        "protected": [_review_to_dict(r) for r in plan.protected],
     }
 
 
-def _delete_outcome_to_dict(o: Any) -> Dict[str, Any]:
-    return {"product_gid": o.product_gid, "status": o.status,
-            "deleted_id": o.deleted_id, "warnings": list(o.warnings)}
+def serialize_delete_outcome(o: Any) -> Dict[str, Any]:
+    return {
+        "product_gid": o.product_gid, "status": o.status, "deleted_id": o.deleted_id,
+        "warnings": list(o.warnings), "closed_rows": list(o.closed_rows),
+        "held_keys": [list(k) for k in o.held_keys], "surfaced": list(o.surfaced),
+    }
 
 
 def serialize_cleanup_report(report: Any) -> Dict[str, Any]:
@@ -162,8 +181,90 @@ def serialize_cleanup_report(report: Any) -> Dict[str, Any]:
         "verify_failed": report.verify_failed,
         "plan_hash": report.plan_hash,
         "deleted": report.deleted,
-        "outcomes": [_delete_outcome_to_dict(o) for o in report.outcomes],
+        "outcomes": [serialize_delete_outcome(o) for o in report.outcomes],
+        "surfaced": list(report.surfaced),
     }
+
+
+def serialize_single_plan(plan: Any) -> Dict[str, Any]:
+    return {
+        "dry_run": plan.dry_run, "product_gid": plan.product_gid, "title": plan.title, "status": plan.status,
+        "skus": list(plan.skus), "shelf_pairs": list(plan.shelf_pairs), "keys": [list(k) for k in plan.keys],
+        "open_rows": list(plan.open_rows), "plan_hash": plan.plan_hash,
+    }
+
+
+def serialize_exit_plan(plan: Any) -> Dict[str, Any]:
+    return {
+        "dry_run": plan.dry_run, "sku": plan.sku, "keep_gid": plan.keep_gid, "keep_title": plan.keep_title,
+        "refused": plan.refused, "keys": [list(k) for k in plan.keys], "plan_hash": plan.plan_hash,
+        "outlets": [{"product_gid": o.product_gid, "title": o.title, "status": o.status,
+                     "lowerings": [asdict(x) for x in o.lowerings], "refusals": list(o.refusals)}
+                    for o in plan.outlets],
+    }
+
+
+def serialize_exit_report(report: Any) -> Dict[str, Any]:
+    out = asdict(report)
+    out["keys_to_relevel"] = [list(k) for k in report.keys_to_relevel]
+    return out
+
+
+def serialize_normalize_plan(plan: Any) -> Dict[str, Any]:
+    return {
+        "dry_run": plan.dry_run, "scanned": plan.scanned, "plan_hash": plan.plan_hash,
+        "products": [{"product_gid": p.product_gid, "title": p.title, "status": p.status,
+                      "keys": [list(k) for k in p.keys], "unsafe_variant_ids": list(p.unsafe_variant_ids),
+                      "custom_lowerings": [list(c) for c in p.custom_lowerings]} for p in plan.products],
+        "review": [list(r) for r in plan.review],
+    }
+
+
+def serialize_normalize_report(report: Any) -> Dict[str, Any]:
+    return asdict(report)
+
+
+def _plan_hash(plan: Any) -> str:
+    return plan.plan_hash
+
+
+# =============================================================================
+# Shared drivers
+# =============================================================================
+def _gesture_word(confirm: Optional[str]) -> Optional[Any]:
+    if (confirm or "").strip() != CONFIRM_WORD:
+        return _error(409, CODE_GESTURE_REQUIRED, f"Human gesture required: type {CONFIRM_WORD}.")
+    return None
+
+
+def _submit_preview(request: Request, kind: str, preview_fn: Any, serialize: Any, token_kind: str,
+                    extra_fn: Any = None, token_binding_fn: Any = None) -> Any:
+    state = request.app.state
+    try:
+        rec = state.job_store.create(kind)
+    except JobBusyError:
+        return _error(409, CODE_JOB_BUSY, "An operation is already in flight.")
+    state.executor.submit(
+        _run_preview_job, state.job_store, rec.job_id, register_for(state), state.transport_factory,
+        preview_fn, _plan_hash, serialize, state.token_service, token_kind, DEFAULT_PREVIEW_TTL_S,
+        extra_fn, token_binding_fn,
+    )
+    return {"job_id": rec.job_id, "status": rec.status}
+
+
+def _submit_apply(request: Request, kind: str, actor: str, plan_hash: str, preview_fn: Any, apply_fn: Any,
+                  serialize: Any, *, audit: bool = True) -> Any:
+    state = request.app.state
+    try:
+        rec = state.job_store.create(kind)
+    except JobBusyError:
+        return _error(409, CODE_JOB_BUSY, "An operation is already in flight.")
+    audit_builder = (lambda register: RegisterAuditSink(register, actor=actor)) if audit else None
+    state.executor.submit(
+        _run_apply_job, state.job_store, rec.job_id, plan_hash, register_for(state, actor),
+        state.transport_factory, audit_builder, preview_fn, _plan_hash, apply_fn, serialize, None,
+    )
+    return {"job_id": rec.job_id, "status": rec.status}
 
 
 # =============================================================================
@@ -173,7 +274,7 @@ def build_delete_router() -> APIRouter:
     """Construct the DELETE router (mount under the app's auth gate)."""
     router = APIRouter(tags=["delete"])
 
-    # -- zero-stock recon (READ-ONLY job) -----------------------------------
+    # -- zero-stock recon (READ-ONLY job, no register) -------------------------
     @router.post("/outlet/zero-stock", status_code=202)
     async def zero_stock(request: Request, actor: str = Depends(require_basic_auth)) -> Any:
         state = request.app.state
@@ -193,61 +294,35 @@ def build_delete_router() -> APIRouter:
     async def get_zero_stock(job_id: str, request: Request, actor: str = Depends(require_basic_auth)) -> Any:
         return poll_job(request, job_id)
 
-    # -- cleanup preview (READ-ONLY plan job, token bound to plan_hash#count) -
+    # -- bulk cleanup ------------------------------------------------------------------
     @router.post("/outlet/cleanup/preview", status_code=202)
     async def cleanup_preview(request: Request, body: CleanupPreviewRequest,
                               actor: str = Depends(require_basic_auth)) -> Any:
-        state = request.app.state
-        try:
-            rec = state.job_store.create(KIND_CLEANUP_PREVIEW)
-        except JobBusyError:
-            return _error(409, CODE_JOB_BUSY, "An operation is already in flight.")
-        promo = state.promo_location_id
+        promo = request.app.state.promo_location_id
         th, af = body.threshold, body.archive_first
 
-        def preview_fn(sheet: Any, transport: Any) -> Any:
-            return delete_service.cleanup_preview(
-                transport, promo_location_id=promo, threshold=th, archive_first=af)
+        def preview_fn(register: Any, transport: Any) -> Any:
+            return delete_service.cleanup_preview(register, transport, promo_location_id=promo,
+                                                  threshold=th, archive_first=af)
 
-        state.executor.submit(
-            _run_preview_job, state.job_store, rec.job_id,
-            state.sheet_factory, state.transport_factory,
-            preview_fn,
-            lambda p: p.plan_hash,                      # stored (raw) TOCTOU key
-            serialize_cleanup_plan,
-            state.token_service, TOKEN_KIND_CLEANUP, DEFAULT_PREVIEW_TTL_S,
+        return _submit_preview(
+            request, KIND_CLEANUP_PREVIEW, preview_fn, serialize_cleanup_plan, TOKEN_KIND_CLEANUP,
             lambda p: {"count": p.count, "requires_second_confirm": p.requires_second_confirm},
-            # HARDENING (post-review): SIGN requires_second_confirm into the
-            # token too — an operator cannot inflate `threshold` at apply time to
-            # silently skip the speed-bump; the decision is bound to what was
-            # ACTUALLY reviewed at preview, not re-derived from a client-echoed
-            # threshold (see cleanup_apply below).
+            # the second-confirm decision is SIGNED at preview: a client-echoed
+            # threshold can never skip it at apply
             lambda p: f"{p.plan_hash}#{p.count}#{int(p.requires_second_confirm)}",
         )
-        return {"job_id": rec.job_id, "status": rec.status}
 
     @router.get("/outlet/cleanup/preview/{job_id}")
     async def get_cleanup_preview(job_id: str, request: Request, actor: str = Depends(require_basic_auth)) -> Any:
         return poll_job(request, job_id)
 
-    # -- cleanup apply (confirm + human-gesture gated) ----------------------
     @router.post("/outlet/cleanup/apply", status_code=202)
     async def cleanup_apply(request: Request, body: CleanupApplyRequest,
                             actor: str = Depends(require_basic_auth)) -> Any:
         state = request.app.state
-        # (1) count is part of the token binding -> its absence is a gesture failure.
         if body.count is None:
-            return _error(409, CODE_GESTURE_REQUIRED,
-                          "Human gesture required: type the candidate count.")
-        # (2) token gate over plan_hash#count#requires_second_confirm: a wrong
-        #     count OR a bad/expired token both fail here -> 409, NO job,
-        #     cleanup_apply NEVER called. HARDENING (post-review): the
-        #     second_confirm REQUIREMENT is SIGNED at preview time (try both
-        #     signed outcomes) — an operator-resubmitted `threshold` can no
-        #     longer silently skip the speed-bump by claiming a looser cap than
-        #     what was actually reviewed at preview (the backstop
-        #     CLEANUP_HARD_CAP is already folded into the signed decision via
-        #     cleanup_preview's own _effective_cap).
+            return _error(409, CODE_GESTURE_REQUIRED, "Human gesture required: type the candidate count.")
         base = f"{body.plan_hash}#{body.count}"
         if state.token_service.verify(body.confirm_token, f"{base}#1", kind=TOKEN_KIND_CLEANUP):
             gate_requires_second_confirm = True
@@ -255,114 +330,173 @@ def build_delete_router() -> APIRouter:
             gate_requires_second_confirm = False
         else:
             return _error(409, CODE_CONFIRM_INVALID, "Confirm token invalid or expired.")
-        # (3) typed confirmation word.
-        if (body.confirm or "").strip() != CONFIRM_WORD:
-            return _error(409, CODE_GESTURE_REQUIRED, f"Human gesture required: type {CONFIRM_WORD}.")
-        # (4) over-cap count (per the SIGNED preview decision) demands a second
-        #     confirmation.
+        refused = _gesture_word(body.confirm)
+        if refused is not None:
+            return refused
         if gate_requires_second_confirm and not body.second_confirm:
             return _error(409, CODE_GESTURE_REQUIRED,
-                          f"{body.count} candidates exceed the approved threshold: "
-                          f"second_confirm required.")
-        # (5) all gestures satisfied -> enqueue the apply job.
-        try:
-            rec = state.job_store.create(KIND_CLEANUP_APPLY)
-        except JobBusyError:
-            return _error(409, CODE_JOB_BUSY, "An operation is already in flight.")
+                          f"{body.count} candidates exceed the approved threshold: second_confirm required.")
         promo = state.promo_location_id
         th, af, sc = body.threshold, body.archive_first, body.second_confirm
 
-        def preview_fn(sheet: Any, transport: Any) -> Any:
-            return delete_service.cleanup_preview(
-                transport, promo_location_id=promo, threshold=th, archive_first=af)
+        def preview_fn(register: Any, transport: Any) -> Any:
+            return delete_service.cleanup_preview(register, transport, promo_location_id=promo,
+                                                  threshold=th, archive_first=af)
 
-        def apply_fn(sheet: Any, transport: Any, fresh_plan: Any, audit_sink: Any) -> Any:
-            # The service owns the snapshot->write_durable abort gate + its own live
-            # re-verify; the endpoint never issues a productDelete itself.
-            return delete_service.cleanup_apply(
-                transport, sheet, audit_sink, fresh_plan,
-                human_gesture=CONFIRM_WORD, promo_location_id=promo, second_confirm=sc)
+        def apply_fn(register: Any, transport: Any, fresh_plan: Any, audit_sink: Any) -> Any:
+            return delete_service.cleanup_apply(register, transport, audit_sink, fresh_plan,
+                                                human_gesture=CONFIRM_WORD, promo_location_id=promo,
+                                                second_confirm=sc)
 
-        audit_builder = lambda sheet: GSheetAuditSink.from_scansia_sheet(sheet, actor=actor)
-        state.executor.submit(
-            _run_apply_job, state.job_store, rec.job_id,
-            body.plan_hash, state.sheet_factory, state.transport_factory,
-            audit_builder, preview_fn, (lambda p: p.plan_hash), apply_fn,
-            serialize_cleanup_report, None,             # gesture already gated synchronously
-        )
-        return {"job_id": rec.job_id, "status": rec.status}
+        return _submit_apply(request, KIND_CLEANUP_APPLY, actor, body.plan_hash, preview_fn, apply_fn,
+                             serialize_cleanup_report)
 
     @router.get("/outlet/cleanup/apply/{job_id}")
     async def get_cleanup_apply(job_id: str, request: Request, actor: str = Depends(require_basic_auth)) -> Any:
         return poll_job(request, job_id)
 
-    # -- single delete (confirm + count==1 gated) ---------------------------
+    # -- single delete -----------------------------------------------------------------
+    def _not_outlet(state: Any, gid: str) -> Optional[Any]:
+        # the escape hatch is for a botched CREATE (an outlet duplicate): a GID that
+        # does not resolve to an outlet is refused before any job is reachable
+        try:
+            delete_service.require_single_delete_target_is_outlet(state.transport_factory(), gid)
+        except SingleDeleteNotOutletError:
+            return _error(409, CODE_SINGLE_DELETE_NOT_OUTLET, "Target does not resolve to an outlet product.")
+        return None
+
+    # plain defs: the outlet gate is a Shopify read, run in FastAPI's worker threads,
+    # never on the event loop
+    @router.post("/outlet/delete/preview", status_code=202)
+    def delete_preview(request: Request, body: DeletePreviewRequest,
+                       actor: str = Depends(require_basic_auth)) -> Any:
+        gid = body.product_gid.strip()
+        refused = _not_outlet(request.app.state, gid)
+        if refused is not None:
+            return refused
+
+        def preview_fn(register: Any, transport: Any) -> Any:
+            return delete_service.single_delete_preview(register, transport, gid)
+
+        return _submit_preview(request, KIND_DELETE_PREVIEW, preview_fn, serialize_single_plan, TOKEN_KIND_DELETE)
+
+    @router.get("/outlet/delete/preview/{job_id}")
+    async def get_delete_preview(job_id: str, request: Request, actor: str = Depends(require_basic_auth)) -> Any:
+        return poll_job(request, job_id)
+
     @router.post("/outlet/delete/apply", status_code=202)
-    async def delete_single(request: Request, body: DeleteSingleRequest,
-                            actor: str = Depends(require_basic_auth)) -> Any:
+    def delete_single(request: Request, body: DeleteSingleRequest,
+                      actor: str = Depends(require_basic_auth)) -> Any:
         state = request.app.state
-        if (body.confirm or "").strip() != CONFIRM_WORD:
-            return _error(409, CODE_GESTURE_REQUIRED, f"Human gesture required: type {CONFIRM_WORD}.")
+        refused = _gesture_word(body.confirm)
+        if refused is not None:
+            return refused
         if body.count != 1:
             return _error(409, CODE_GESTURE_REQUIRED, "Human gesture required: count must be 1.")
-        # HARDENING (post-review): a mistyped GID must resolve to an OUTLET
-        # BEFORE any job/product_delete is reachable — the escape hatch is for a
-        # botched CREATE (which IS an outlet duplicate), never an arbitrary
-        # product. Belt-and-braces: the SAME gate also runs inside
-        # delete_single_apply itself.
-        transport = state.transport_factory()
-        try:
-            delete_service.require_single_delete_target_is_outlet(transport, body.product_gid)
-        except SingleDeleteNotOutletError:
-            return _error(409, CODE_SINGLE_DELETE_NOT_OUTLET,
-                          "Target does not resolve to an outlet product.")
-        try:
-            rec = state.job_store.create(KIND_DELETE_SINGLE)
-        except JobBusyError:
-            return _error(409, CODE_JOB_BUSY, "An operation is already in flight.")
-        gid = body.product_gid
+        if not state.token_service.verify(body.confirm_token, body.plan_hash, kind=TOKEN_KIND_DELETE):
+            return _error(409, CODE_CONFIRM_INVALID, "Confirm token invalid or expired.")
+        gid = body.product_gid.strip()
+        refused = _not_outlet(state, gid)
+        if refused is not None:
+            return refused
+        promo = state.promo_location_id
 
-        def mutate_fn(sheet: Any, transport: Any, audit_sink: Any) -> Any:
-            return delete_service.delete_single_apply(
-                transport, sheet, audit_sink, gid, human_gesture=CONFIRM_WORD)
+        def preview_fn(register: Any, transport: Any) -> Any:
+            return delete_service.single_delete_preview(register, transport, gid)
 
-        audit_builder = lambda sheet: GSheetAuditSink.from_scansia_sheet(sheet, actor=actor)
-        state.executor.submit(
-            _run_mutation_job, state.job_store, rec.job_id,
-            state.sheet_factory, state.transport_factory, audit_builder,
-            mutate_fn, _delete_outcome_to_dict,
-        )
-        return {"job_id": rec.job_id, "status": rec.status}
+        def apply_fn(register: Any, transport: Any, fresh_plan: Any, audit_sink: Any) -> Any:
+            return delete_service.delete_single_apply(register, transport, audit_sink, fresh_plan,
+                                                      human_gesture=CONFIRM_WORD, promo_location_id=promo)
+
+        return _submit_apply(request, KIND_DELETE_SINGLE, actor, body.plan_hash, preview_fn, apply_fn,
+                             serialize_delete_outcome)
 
     @router.get("/outlet/delete/apply/{job_id}")
     async def get_delete_single(job_id: str, request: Request, actor: str = Depends(require_basic_auth)) -> Any:
         return poll_job(request, job_id)
 
-    # -- deny-normalize (confirm-gated mutation, no audit sink) --------------
-    @router.post("/outlet/deny-normalize", status_code=202)
-    async def deny_normalize(request: Request, body: DenyNormalizeRequest,
-                             actor: str = Depends(require_basic_auth)) -> Any:
+    # -- the multi-outlet exit ---------------------------------------------------------
+    @router.post("/outlet/exit/preview", status_code=202)
+    async def exit_preview(request: Request, body: ExitPreviewRequest,
+                           actor: str = Depends(require_basic_auth)) -> Any:
+        promo = request.app.state.promo_location_id
+        sku, keep = body.sku.strip(), body.keep_product_gid.strip()
+
+        def preview_fn(register: Any, transport: Any) -> Any:
+            return exit_service.exit_preview(register, transport, sku, keep, promo_location_id=promo)
+
+        return _submit_preview(request, KIND_EXIT_PREVIEW, preview_fn, serialize_exit_plan, TOKEN_KIND_EXIT)
+
+    @router.get("/outlet/exit/preview/{job_id}")
+    async def get_exit_preview(job_id: str, request: Request, actor: str = Depends(require_basic_auth)) -> Any:
+        return poll_job(request, job_id)
+
+    @router.post("/outlet/exit/apply", status_code=202)
+    async def exit_apply(request: Request, body: ExitApplyRequest, actor: str = Depends(require_basic_auth)) -> Any:
         state = request.app.state
-        if (body.confirm or "").strip() != CONFIRM_WORD:
-            return _error(409, CODE_GESTURE_REQUIRED, f"Human gesture required: type {CONFIRM_WORD}.")
-        try:
-            rec = state.job_store.create(KIND_DENY)
-        except JobBusyError:
-            return _error(409, CODE_JOB_BUSY, "An operation is already in flight.")
-        gid = body.product_gid
+        refused = _gesture_word(body.confirm)
+        if refused is not None:
+            return refused
+        if not state.token_service.verify(body.confirm_token, body.plan_hash, kind=TOKEN_KIND_EXIT):
+            return _error(409, CODE_CONFIRM_INVALID, "Confirm token invalid or expired.")
+        promo = state.promo_location_id
+        sku, keep = body.sku.strip(), body.keep_product_gid.strip()
 
-        def mutate_fn(sheet: Any, transport: Any, audit_sink: Any) -> Any:
-            return delete_service.deny_normalize(transport, gid)
+        def preview_fn(register: Any, transport: Any) -> Any:
+            return exit_service.exit_preview(register, transport, sku, keep, promo_location_id=promo)
 
-        state.executor.submit(
-            _run_mutation_job, state.job_store, rec.job_id,
-            state.sheet_factory, state.transport_factory, None,   # no audit sink
-            mutate_fn, lambda n: {"normalized": n},
-        )
-        return {"job_id": rec.job_id, "status": rec.status}
+        def apply_fn(register: Any, transport: Any, fresh_plan: Any, audit_sink: Any) -> Any:
+            return exit_service.exit_apply(register, transport, audit_sink, fresh_plan, promo_location_id=promo)
 
-    @router.get("/outlet/deny-normalize/{job_id}")
-    async def get_deny_normalize(job_id: str, request: Request, actor: str = Depends(require_basic_auth)) -> Any:
+        return _submit_apply(request, KIND_EXIT_APPLY, actor, body.plan_hash, preview_fn, apply_fn,
+                             serialize_exit_report)
+
+    @router.get("/outlet/exit/apply/{job_id}")
+    async def get_exit_apply(job_id: str, request: Request, actor: str = Depends(require_basic_auth)) -> Any:
+        return poll_job(request, job_id)
+
+    # -- deny-normalize (rule 7's normalisation) ---------------------------------------
+    @router.post("/outlet/deny-normalize/preview", status_code=202)
+    async def normalize_preview(request: Request, body: NormalizePreviewRequest,
+                                actor: str = Depends(require_basic_auth)) -> Any:
+        promo = request.app.state.promo_location_id
+        gids = [g.strip() for g in body.product_gids if g and g.strip()]
+
+        def preview_fn(register: Any, transport: Any) -> Any:
+            return normalize_service.normalize_preview(register, transport, promo_location_id=promo,
+                                                       product_gids=gids)
+
+        return _submit_preview(request, KIND_NORMALIZE_PREVIEW, preview_fn, serialize_normalize_plan,
+                               TOKEN_KIND_NORMALIZE)
+
+    @router.get("/outlet/deny-normalize/preview/{job_id}")
+    async def get_normalize_preview(job_id: str, request: Request, actor: str = Depends(require_basic_auth)) -> Any:
+        return poll_job(request, job_id)
+
+    @router.post("/outlet/deny-normalize/apply", status_code=202)
+    async def normalize_apply(request: Request, body: NormalizeApplyRequest,
+                              actor: str = Depends(require_basic_auth)) -> Any:
+        state = request.app.state
+        refused = _gesture_word(body.confirm)
+        if refused is not None:
+            return refused
+        if not state.token_service.verify(body.confirm_token, body.plan_hash, kind=TOKEN_KIND_NORMALIZE):
+            return _error(409, CODE_CONFIRM_INVALID, "Confirm token invalid or expired.")
+        promo = state.promo_location_id
+        gids = [g.strip() for g in body.product_gids if g and g.strip()]
+
+        def preview_fn(register: Any, transport: Any) -> Any:
+            return normalize_service.normalize_preview(register, transport, promo_location_id=promo,
+                                                       product_gids=gids)
+
+        def apply_fn(register: Any, transport: Any, fresh_plan: Any, audit_sink: Any) -> Any:
+            return normalize_service.normalize_apply(register, transport, fresh_plan, promo_location_id=promo)
+
+        return _submit_apply(request, KIND_NORMALIZE_APPLY, actor, body.plan_hash, preview_fn, apply_fn,
+                             serialize_normalize_report, audit=False)
+
+    @router.get("/outlet/deny-normalize/apply/{job_id}")
+    async def get_normalize_apply(job_id: str, request: Request, actor: str = Depends(require_basic_auth)) -> Any:
         return poll_job(request, job_id)
 
     return router
@@ -370,11 +504,10 @@ def build_delete_router() -> APIRouter:
 
 __all__ = [
     "build_delete_router",
-    "serialize_zero_stock",
-    "serialize_cleanup_plan",
-    "serialize_cleanup_report",
-    "CleanupPreviewRequest",
-    "CleanupApplyRequest",
-    "DeleteSingleRequest",
-    "DenyNormalizeRequest",
+    "serialize_zero_stock", "serialize_cleanup_plan", "serialize_cleanup_report", "serialize_delete_outcome",
+    "serialize_single_plan", "serialize_exit_plan", "serialize_exit_report", "serialize_normalize_plan",
+    "serialize_normalize_report",
+    "CleanupPreviewRequest", "CleanupApplyRequest", "DeletePreviewRequest", "DeleteSingleRequest",
+    "ExitPreviewRequest", "ExitApplyRequest", "NormalizePreviewRequest", "NormalizeApplyRequest",
+    "TOKEN_KIND_CLEANUP", "TOKEN_KIND_DELETE", "TOKEN_KIND_EXIT", "TOKEN_KIND_NORMALIZE",
 ]

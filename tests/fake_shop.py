@@ -97,6 +97,7 @@ class FakeShop:
         self.publication = PUB
         self.truncated: set = set()          # product gids whose level set reads truncated
         self.duplicate_truncated = False     # a duplicate's level set reads truncated
+        self.locations: Dict[str, str] = {PROMO: "Promo", MAG: "Magazzino"}   # gid → name (E18's gate)
 
     # -- building the store ----------------------------------------------------------
     def _id(self, kind: str) -> str:
@@ -190,6 +191,9 @@ class FakeShop:
             ("collections(first: $collFirst", "core", self._core),
             ("collection(id: $id)", "enumerate", self._enumerate),
             ("variants(first: 250)", "variants", self._variants),
+            ("metafields(first: 250)", "metafields", self._metafields),
+            ("media(first: 250)", "media", self._media),
+            ("locations(first: $first", "locations", self._locations),
         ]
         for marker, op, fn in table:
             if marker in q:
@@ -395,6 +399,25 @@ class FakeShop:
             "id": x.id, "sku": x.sku, "title": x.title, "price": x.price, "compareAtPrice": x.compare_at,
             "inventoryItem": {"id": x.item}, "selectedOptions": [{"name": "Size", "value": x.title}]}}
             for x in p.variants]}}}
+
+    def _locations(self, v: Dict[str, Any], body: Optional[str]) -> Dict[str, Any]:
+        nodes = [{"id": gid, "name": name, "isActive": True} for gid, name in self.locations.items()]
+        return {"locations": {"edges": [{"node": n} for n in nodes],
+                              "pageInfo": {"hasNextPage": False, "endCursor": None}}}
+
+    def _metafields(self, v: Dict[str, Any], body: Optional[str]) -> Dict[str, Any]:
+        p = self.products.get(v["id"])
+        if p is None:
+            return {"node": None}
+        return {"node": {"metafields": {"edges": [{"node": {"namespace": "custom", "key": "k", "type": "single_line_text_field",
+                                                             "value": p.title}}]}}}
+
+    def _media(self, v: Dict[str, Any], body: Optional[str]) -> Dict[str, Any]:
+        p = self.products.get(v["id"])
+        if p is None:
+            return {"product": None}
+        return {"product": {"media": {"nodes": [{"id": "gid://shopify/MediaImage/1", "alt": "",
+                                                  "image": {"url": f"https://cdn.example/{p.handle}.jpg"}}]}}}
 
 
 __all__ = ["FakeShop", "PROMO", "MAG", "PUB", "SimulatedCrashInShop"]

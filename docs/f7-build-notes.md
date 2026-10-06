@@ -192,6 +192,73 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   (route 1 after 168: 5 s timeout, `onerror` Ignore — AUTOMATE, `GATE:live`) and the working-window Scheduler
   job (`*/15 8-19 * * 1-5` Europe/Rome); `shared-secrets.md` gains the service's entry when the value exists.
 
+## §3.5 — prices, deletion, the exit, deny-normalize; a person's close (the lane's mechanisms)
+
+- Every §3.5 apply, and a person's close, is a decrement-class holder (`passes.Holder`): the Promo gate (E18,
+  below), the take (bound 120 s), its class's recovery and the held-key lowering, released and re-taken between
+  SKUs / products. Interpretation: before the whole-register `BASELINE` the lowering cannot run — every event is
+  unstamped until the baseline declares what the outlet reflects, so clamp(P) + Σ pending − N would lower units the
+  outlet rightly shows (N 1, P 1, the import's +1 pending → 1). `prologue(require_baseline=False)` runs the recovery
+  and skips the lowering, surfaced (`held_key_lowering_skipped`); publish and the re-level still refuse there.
+- Pricing (`services/pricing_service.py`, `/prices/*`): the shelf grouped by SKU. Modes kept: percent, direct (a
+  typed price, or the register's own as-is — a repair push; none → `SKIP_MISSING_PRICE`, never a default), bulk
+  (rules scoped by `sku` / `brand` / `product_title` — the register's model columns; `BRAND` is read since). The
+  percent base is B-2's compare-at; `DISCOUNT` is, in every mode, the discount the written price makes on the
+  compare-at, percent to the cent, half up — what the sheet's K held (§6 B-2: J 149 on 189 → 21.16). FIX4 is
+  `outlet_service.validate_price`; a typed price is parsed strictly (`money`: a minus sign is kept, so FIX4 refuses
+  it, never a flipped one). Two compare-ats → listed, blocked; two register prices block only the repair push (a
+  typed price IS the resolution: written on every shelf pair). The push target is the SKU's `OUTLET_PRODUCT_ID` —
+  the sheet era's column-Q gate: no id → the register only, never a SKU search (which also finds the full-price
+  source) — and it must still be an outlet-collection member; pushed when ACTIVE (a DRAFT outlet takes the price at
+  its revive, the tail carries it; `status_override` pushes now); two ids on one SKU → listed, blocked. Order:
+  ONE `PRICE` intent row first (`capture_before`: the live priors of every product to push, unique `INTENT_ID`; a
+  failure writes nothing), then per SKU, re-derived under the lease after each re-take — same plan hash, live
+  prices still the captured priors, else `VERIFY_FAILED` — the register (`set_outlet_price`, its `PRICE` row naming
+  the intent), then the push (price + compare-at on every variant). A refused push leaves the register written,
+  surfaced (a re-run, or the next ACTIVE publish, refreshes Shopify from it).
+- Revert (`/prices/revert`): per SKU, the pairs the intent wrote — read off its own `set_outlet_price` rows — go
+  back to the values they replaced, one `restore_outlet_price` per prior value (a `PRICE` row each, still-shelf
+  pairs only: a pair sold since keeps its price); a pair whose price moved since (a later pricing) leaves the SKU
+  untouched, register and Shopify, listed (`SKIP_CHANGED_SINCE`); then the captured Shopify priors are re-pushed.
+  Why the register too: the publish refreshes every variant from it — a Shopify-only revert would be undone by the
+  next publish. An unknown intent → 404 `intent_not_found`.
+- Deletion (`services/delete_service.py`, `/outlet/delete/*`, `/outlet/cleanup/*`): the snapshot is BUILT before any
+  write (reads only: a failed read writes nothing, not even step (0)); (0) — the single delete — a `HOLD` row
+  "outlet deleted" on the keys of the product SKUs' shelf pairs (the SKUs of its real-size variants), with no event
+  ids: −Δ keep flowing, a +Δ waits (the key is held); (1) `OUTLET_PRODUCT_ID` cleared on every pair carrying it,
+  any state; (2) the `DELETE` row — the gate (`write_durable` returns its id); (3) `productDelete` — a refused or
+  unknown answer followed by a read that says gone counts as deleted; then terminal path (iii) on the product's
+  rows not closed (found by `PRODUCT_ID`; their groups settled); (4) `ONLINE` 0 on its shelf pairs that were 1. The
+  single delete has a preview now (step (0)'s listing; plan hash = the product + the keys). The bulk cleanup lists
+  apart (`protected`) every DRAFT-at-zero candidate whose SKU has a shelf pair, at preview; at apply the batch hash
+  is re-verified under the lease, then each product is re-read right before its own delete (DRAFT, a candidate, no
+  shelf pair) — else `SKIPPED` with the reason.
+- The multi-outlet exit (`services/exit_service.py`, `/outlet/exit/*`): a clean resolution with ≥ 2 outlets, the
+  kept one among them; plan hash = SKU + kept + the others (not their counts: the target is 0 whatever a sale did).
+  Per other outlet: `exit` rows (real-size; key = the variant's (SKU, title)) and `custom` rows (customisation-only,
+  no key) to 0, then the predicate re-read: refused → `STOPPED` before the delete, listed. Interpretation: no
+  drafting — the plan names none, and `flows.total_rule` would write `ONLINE` 0 on the kept outlet's pairs.
+- Deny-normalize (`services/normalize_service.py`, `/outlet/deny-normalize/*`): the named outlets (each must resolve
+  to an outlet) or every collection member, any status (a DRAFT CONTINUE outlet is what blocks the cleanup); per
+  product one group — a `normalise` row (no prices; keys = its real-size keys) when a variant is not DENY + tracked,
+  `custom` rows for customisation-only Promo > 0. The approved plan bounds the products; each is normalised as it
+  reads at apply (normalising only moves a product toward rule 7).
+- A person's close (`services/close_service.py`, `GET /outlet/reconcile/open`, `POST /outlet/reconcile/close`):
+  holder `close`; guarded on the status the person read (`expect_status`); `HELD`, or `FAILED` for a tail /
+  normalise row with (i)'s consequences (a normalise row's ACTIVE product still unsafe is drafted); ONE fenced
+  transaction writes the close (`OUTCOME.person_close` {by, why}) and an `AUDIT` row `person_close`; then the group
+  is settled (AB1: an `APPLIED` sibling → `CARRIED`). A reason of ≥ 3 characters and `CONFERMO` are required.
+- The Promo gate (E18, `services/promo_gate.py`): `PROMO_LOCATION_ID` is normalised to the location GID in config
+  (a numeric id accepted; anything else refuses to boot); before every pass that writes — publish, decrement,
+  baseline, re-level, every `Holder` — one `locations` read: the id must be the active location named "Promo", else
+  `PromoAnchorInvalid` (503 `promo_anchor_invalid`), the lease not taken, nothing written. Read-only recons are not
+  gated. Location gone (AB16): a Promo row's location → the gate stops every pass first; a non-Promo row (a CREATE
+  orphan's disconnect) reads its level absent — a deactivation `APPLIED`, a lowering `FAILED` (nothing to lower).
+- Recovery reads terminal path (ii) first for `APPLIED` rows too (a read, no write): a target gone → `CARRIED`.
+- The read verticals on the register: `GET /scansia` = the shelf (B-2's compare-at per pair); the inventory join
+  groups the shelf by SKU, prefers the pairs' `OUTLET_PRODUCT_ID`, matches sizes exactly (twins surfaced, §3.2),
+  never counts customisation-only units; `GET /audit` = the newest `AUDIT` rows.
+
 ## Parameters the plan proposes, fixed here (each one tested)
 
 - The `/dlqs` precondition (§3.4): the typed instant (ISO 8601; no offset → Europe/Rome) and `dlqCount`, which must

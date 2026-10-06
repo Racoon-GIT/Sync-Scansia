@@ -57,6 +57,7 @@ from backend.services import flows
 from backend.services import ledger as L
 from backend.services import passes, resolvers, variants
 from backend.services.lease import HOLDER_PUBLISH, LeaseUnavailable, PassLease
+from backend.services.promo_gate import require_promo_location
 from backend.services.recovery import CLASS_PUBLISH
 from backend.shopify import ops
 from backend.shopify.ops import ProductNotFound, ShopifyUserError
@@ -608,6 +609,7 @@ def publish_apply(
     take_bound_s: float = PUBLISH_TAKE_BOUND_S,
 ) -> ApplyReport:
     """Execute the approved plan under the pass lease, SKU by SKU (re-derived)."""
+    require_promo_location(transport, promo_location_id)          # E18: before the lease, nothing written
     pass_lease = lease or PassLease(register, HOLDER_PUBLISH)
     try:
         pass_lease.take(bound_s=take_bound_s)

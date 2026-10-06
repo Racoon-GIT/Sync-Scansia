@@ -59,6 +59,7 @@ from backend.services import ledger as L
 from backend.services import outlet_service as OS
 from backend.services import passes, resolvers, variants
 from backend.services.lease import HOLDER_RELEVEL, LeaseUnavailable, PassLease
+from backend.services.promo_gate import require_promo_location
 from backend.services.recovery import CLASS_PUBLISH
 from backend.shopify import ops
 from backend.shopify.ops import ProductNotFound, ShopifyUserError
@@ -419,6 +420,7 @@ def relevel_apply(
     if why is not None:
         return RelevelReport(ST_PRECONDITION_REFUSED, why)
     assert dlq is not None
+    require_promo_location(transport, promo_location_id)          # E18: before the lease, nothing written
     pass_lease = lease or PassLease(register, HOLDER_RELEVEL, sleep=sleep)
     try:
         pass_lease.take(bound_s=take_bound_s)

@@ -16,10 +16,6 @@
   excluded from every match, count and total — not from normalisation.
 * Promo / non-Promo level readers (the quarantine predicate shared with the
   delete flow).
-
-The ``legacy_*`` helpers are the sheet era's normalised match (``_norm_size``,
-FIX5); only the flows not yet rewritten for F7 (init, the inventory join) use
-them, and they go with those rewrites.
 """
 from __future__ import annotations
 
@@ -113,51 +109,8 @@ def has_non_promo_stock(variants: Iterable[Dict[str, Any]], promo_id: str) -> bo
     return False
 
 
-# ---------------------------------------------------------------------------
-# legacy — the sheet era's normalised match (init / inventory join only)
-# ---------------------------------------------------------------------------
-def legacy_norm_size(value: Any) -> str:
-    """FIX5 normalisation: case/whitespace/comma + numeric format
-    (``"42.0" -> "42"``, ``"42,5" -> "42.5"``)."""
-    s = str(value or "").strip().casefold().replace(",", ".")
-    s = " ".join(s.split())
-    try:
-        f = float(s)
-    except (TypeError, ValueError):
-        return s
-    return str(int(f)) if f == int(f) else str(f)
-
-
-def legacy_extract_norm_size(selected_options: List[Dict[str, Any]]) -> Optional[str]:
-    for opt in selected_options or []:
-        if (opt.get("name") or "").strip().casefold() in SIZE_OPTION_NAMES:
-            return legacy_norm_size(opt.get("value"))
-    return None
-
-
-def legacy_variant_size_index(variants: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    idx: Dict[str, Dict[str, Any]] = {}
-    for v in variants:
-        ns = legacy_extract_norm_size(v.get("selectedOptions") or [])
-        if ns is not None and ns not in idx:
-            idx[ns] = v
-    return idx
-
-
-def legacy_match_variant(
-    norm_size: str, size_index: Dict[str, Dict[str, Any]], variants: List[Dict[str, Any]]
-) -> Optional[Dict[str, Any]]:
-    if norm_size in size_index:
-        return size_index[norm_size]
-    if norm_size == "" and len(variants) == 1:
-        return variants[0]
-    return None
-
-
 __all__ = [
     "SIZE_OPTION_NAMES", "variant_title", "is_customisation_only", "real_size_variants",
     "twin_form", "match_exact", "twins", "item_id", "promo_level", "promo_available",
     "has_non_promo_stock",
-    "legacy_norm_size", "legacy_extract_norm_size", "legacy_variant_size_index",
-    "legacy_match_variant",
 ]

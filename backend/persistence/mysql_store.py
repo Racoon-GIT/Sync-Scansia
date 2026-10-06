@@ -105,7 +105,7 @@ SQL_NOW = "SELECT UTC_TIMESTAMP(3)"
 
 _PAIR_COLS = (
     "ID, PAIR_UUID, SKU, SIZE, STATE, PRICE_HIGH, PRICE, PRICE_OUTLET, DISCOUNT, "
-    "OUTLET_PRODUCT_ID, ONLINE, UPDATED_AT, PRODUCT_TITLE"
+    "OUTLET_PRODUCT_ID, ONLINE, UPDATED_AT, PRODUCT_TITLE, BRAND"
 )
 SQL_PAIRS = f"SELECT {_PAIR_COLS} FROM sc_returned_pair"
 _UNSTAMPED_WHERE = (
@@ -276,7 +276,7 @@ def _pair(r: Sequence[Any]) -> PairRow:
         pair_id=int(r[0]), pair_uuid=_text(r[1]), sku=_text(r[2]), size=_text(r[3]), state=_text(r[4]),
         price_high=r[5], price=r[6], price_outlet=r[7], discount=r[8],
         outlet_product_id=None if r[9] is None else int(r[9]), online=bool(r[10]),
-        updated_at=r[11], product_title=_text(r[12]),
+        updated_at=r[11], product_title=_text(r[12]), brand=_text(r[13]),
     )
 
 

@@ -96,6 +96,7 @@ class PairRow:
     online: bool
     updated_at: datetime
     product_title: Optional[str] = None
+    brand: Optional[str] = None
 
     @property
     def key(self) -> Key:

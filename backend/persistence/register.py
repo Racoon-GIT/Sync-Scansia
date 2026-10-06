@@ -33,11 +33,13 @@ from backend.persistence.records import (
     APPLIED,
     CARRIED,
     DONE,
+    FAILED,
     HELD,
     HOLD_BASELINE,
     HOLD_IN_FLIGHT,
     HOLD_RECOVERY,
     HOLD_ROW,
+    KIND_AUDIT,
     KIND_BASELINE,
     KIND_HOLD,
     KIND_PRICE,
@@ -313,10 +315,12 @@ class Register:
         discount: Optional[Decimal],
         *,
         only_missing: bool = False,
+        ref: Optional[str] = None,
     ) -> List[int]:
         """One price per SKU onto its ``IN_SCANSIA`` pairs (§3.5) — all of them,
         or only those with no ``PRICE_OUTLET`` (the publish's fill). A ``PRICE``
-        audit row records each pair's priors. Returns the pair ids written."""
+        audit row records each pair's priors (and ``ref``, the pricing intent that
+        wrote it — what a revert restores). Returns the pair ids written."""
         written: List[int] = []
 
         def build() -> Optional[List[WriteOp]]:
@@ -338,12 +342,54 @@ class Register:
                     for p in pairs
                 ],
             }
+            if ref is not None:
+                payload["intent_id"] = ref
             return [
                 InsertAudit(kind=KIND_PRICE, actor=self.actor, action="set_outlet_price", payload=payload),
                 UpdatePairs(
                     pair_ids=tuple(written), values={"PRICE_OUTLET": price, "DISCOUNT": discount},
                     require_state=SHELF,
                 ),
+            ]
+
+        return list(written) if self._pairs_write(lease, build) else []
+
+    def restore_outlet_price(
+        self,
+        lease: Any,
+        pair_ids: Sequence[int],
+        price: Optional[Decimal],
+        discount: Optional[Decimal],
+        *,
+        ref: str,
+    ) -> List[int]:
+        """A price revert (§3.5): ``PRICE_OUTLET`` / ``DISCOUNT`` back to their
+        priors on the named pairs still ``IN_SCANSIA`` (a pair sold since keeps the
+        price it was sold at), with a ``PRICE`` row recording the values it
+        replaces. Returns the pair ids written."""
+        wanted = sorted({int(i) for i in pair_ids})
+        written: List[int] = []
+
+        def build() -> Optional[List[WriteOp]]:
+            pairs = self.store.read_pairs(states=(SHELF,), pair_ids=wanted) if wanted else []
+            written[:] = [p.pair_id for p in pairs]
+            if not pairs:
+                return None
+            payload = {
+                "intent_id": ref,
+                "price_outlet": None if price is None else str(price),
+                "discount": None if discount is None else str(discount),
+                "pairs": [
+                    {"pair_id": p.pair_id,
+                     "old_price_outlet": None if p.price_outlet is None else str(p.price_outlet),
+                     "old_discount": None if p.discount is None else str(p.discount)}
+                    for p in pairs
+                ],
+            }
+            return [
+                InsertAudit(kind=KIND_PRICE, actor=self.actor, action="revert_outlet_price", payload=payload),
+                UpdatePairs(pair_ids=tuple(written), values={"PRICE_OUTLET": price, "DISCOUNT": discount},
+                            require_state=SHELF),
             ]
 
         return list(written) if self._pairs_write(lease, build) else []
@@ -531,6 +577,28 @@ class Register:
             outcome={**(old.outcome or {}), **outcome, "successor": InsertedId(0)},
         )
         return self._write(lease, [successor, close])[0]
+
+    def person_close(self, lease: Any, row: AuditRow, status: str, why: str) -> int:
+        """Rule 2's terminal path (iv): a person closes a ``RECONCILE`` row not
+        closed — ``HELD`` (``FAILED`` for a revive-tail or normalise row, the
+        caller's choice) — guarded on the status that person read (0 rows matched →
+        :class:`GuardMismatch`, nothing closed), with an ``AUDIT`` row naming who
+        (this handle's actor) and why, in ONE fenced transaction; when is the
+        server's ``CLOSED_AT``. Returns the ``AUDIT`` row's id."""
+        if status not in (HELD, FAILED):
+            raise ValueError("a person's close sets HELD (FAILED for a tail or normalise row), never APPLIED")
+        if row.status not in NOT_CLOSED:
+            raise ValueError("only a row not closed can be closed by a person")
+        if not (why or "").strip():
+            raise ValueError("a person's close says why")
+        outcome = {**(row.outcome or {}), "reason": "person_close",
+                   "person_close": {"by": self.actor, "why": why.strip()}}
+        return self._write(lease, [
+            InsertAudit(kind=KIND_AUDIT, actor=self.actor, action="person_close", product_id=row.product_id,
+                        payload={"row_id": row.row_id, "from": row.status, "to": status, "why": why.strip(),
+                                 "keys": [list(k) for k in row.keys]}),
+            UpdateAudit(row_id=row.row_id, expect_status=row.status, status=status, outcome=outcome),
+        ])[0]
 
     def close_rows(self, lease: Any, closes: Sequence[UpdateAudit]) -> None:
         """Several guarded row updates in one transaction (e.g. a group's

@@ -142,6 +142,15 @@ def _store_factory(state: Any, spec: "MutationVertical", actor: Optional[str] = 
     return factory
 
 
+def register_for(state: Any, actor: Optional[str] = None) -> Callable[[], Any]:
+    """A job's register factory, bound to the acting user when one is given
+    (every audit row the handle writes carries the name)."""
+    factory = state.register_factory
+    if actor is None:
+        return factory
+    return lambda: factory(actor=actor)
+
+
 def _close(handle: Any) -> None:
     """End a store handle's connection (no connection outlives a job, F7 §3.7
     rule 4). Handles without ``close`` (the sheet) are left as they are."""
@@ -457,6 +466,7 @@ __all__ = [
     "ApplyRequest",
     "MutationVertical",
     "build_mutation_router",
+    "register_for",
     "submit_preview",
     "submit_apply",
     "poll_job",

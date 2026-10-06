@@ -147,6 +147,7 @@ class MemoryDB:
         outlet_product_id: Optional[int] = None,
         online: bool = False,
         product_title: Optional[str] = None,
+        brand: Optional[str] = None,
         pair_uuid: Optional[str] = None,
     ) -> int:
         with self.lock:
@@ -165,6 +166,7 @@ class MemoryDB:
                 "OUTLET_PRODUCT_ID": outlet_product_id,
                 "ONLINE": 1 if online else 0,
                 "PRODUCT_TITLE": product_title,
+                "BRAND": brand,
                 "SELLABLE_AT": now if state == SHELF else None,
                 "CREATED_AT": now,
                 "UPDATED_AT": now,
@@ -587,7 +589,7 @@ def _pair_row(p: Dict[str, Any]) -> PairRow:
         state=p["STATE"], price_high=p["PRICE_HIGH"], price=p["PRICE"],
         price_outlet=p["PRICE_OUTLET"], discount=p["DISCOUNT"],
         outlet_product_id=p["OUTLET_PRODUCT_ID"], online=bool(p["ONLINE"]),
-        updated_at=p["UPDATED_AT"], product_title=p["PRODUCT_TITLE"],
+        updated_at=p["UPDATED_AT"], product_title=p["PRODUCT_TITLE"], brand=p.get("BRAND"),
     )
 
 

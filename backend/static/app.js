@@ -7,13 +7,15 @@
  * origin, so `fetch()` below carries no token/secret of any kind: there is
  * nothing to leak from this file.
  *
- * Load-bearing pattern used by publish / prices / cleanup: a *preview* job
+ * Load-bearing pattern used by publish / prices and the delete tab (cleanup,
+ * single delete, multi-outlet exit, deny-normalize): a *preview* job
  * returns `{plan, plan_hash, confirm_token}`. The client stores plan_hash +
  * confirm_token verbatim and echoes them back — unmodified — in the body of
  * the matching *apply* call. The server re-verifies both against the live
  * state (TOCTOU) before mutating anything; a drifted plan_hash comes back as
  * job status `VERIFY_FAILED`, surfaced here as "lo stato è cambiato dal
- * preview: rifai il preview".
+ * preview: rifai il preview" ("piano cambiato: ricalcola l'anteprima" in the
+ * delete tab).
  */
 (function () {
   "use strict";
@@ -381,26 +383,37 @@
   // SCANSIA tab
   // ===========================================================================
   const scansiaState = {
-    rows: [],
+    pairs: [],          // the register's shelf: one row per pair (IN_SCANSIA)
     inventoryBySku: {}, // sku -> join result (chips + freshness)
   };
+
+  // The live join's verdict on this pair's size: exact match (the SPs' rule), a twin
+  // spelling to respell at the source, or no variant.
+  function sizeCell(join, size) {
+    if (!join || join.failed) return "";
+    const s = (join.sizes || []).find(function (x) { return x.size === size; });
+    if (!s) return "";
+    if (s.matched) return "esatta (Promo " + esc(s.promo_available) + ")";
+    if ((s.twins || []).length) return "da riscrivere: " + esc(s.twins.join(" | "));
+    return "assente";
+  }
 
   function renderScansiaTable() {
     const tbody = document.getElementById("scansia-tbody");
     tbody.innerHTML = "";
-    scansiaState.rows.forEach(function (row) {
+    scansiaState.pairs.forEach(function (p) {
       const tr = document.createElement("tr");
-      const join = scansiaState.inventoryBySku[row.sku];
+      const join = scansiaState.inventoryBySku[p.sku];
       tr.innerHTML =
-        "<td>" + esc(row.sku) + "</td>" +
-        "<td>" + esc(row.size) + "</td>" +
-        "<td>" + esc(row.qta) + "</td>" +
-        "<td>" + esc(row.online) + "</td>" +
-        "<td>" + esc(row.prezzo_high) + "</td>" +
-        "<td>" + esc(row.prezzo_outlet) + "</td>" +
-        "<td>" + esc(row.sconto) + "</td>" +
-        "<td>" + (row.reconciled ? "sì" : "no") + "</td>" +
-        "<td>" + esc((row.anomalies || []).join(", ")) + "</td>" +
+        "<td>" + esc(p.pair_id) + "</td>" +
+        "<td>" + esc(p.sku) + "</td>" +
+        "<td>" + esc(p.size) + "</td>" +
+        "<td>" + (p.online ? "sì" : "no") + "</td>" +
+        "<td>" + esc(p.compare_at) + "</td>" +
+        "<td>" + esc(p.price_outlet) + "</td>" +
+        "<td>" + esc(p.discount) + "</td>" +
+        "<td>" + esc(p.outlet_product_id) + "</td>" +
+        "<td>" + sizeCell(join, p.size) + "</td>" +
         "<td>" + renderJoinCell(join) + "</td>";
       tbody.appendChild(tr);
     });
@@ -424,10 +437,10 @@
   async function loadScansia() {
     try {
       const data = await api("GET", "/scansia");
-      scansiaState.rows = data.rows || [];
+      scansiaState.pairs = data.pairs || [];
       renderScansiaTable();
     } catch (e) {
-      toast("Errore caricamento righe scansia: " + e.message, true);
+      toast("Errore caricamento scaffale: " + e.message, true);
     }
   }
 
@@ -617,8 +630,8 @@
       tr.innerHTML =
         "<td>" + esc(d.sku) + "</td>" + "<td>" + esc(d.status) + "</td>" +
         "<td>" + (d.actionable ? "sì" : "no") + "</td>" +
-        "<td>" + esc(d.price) + "</td>" + "<td>" + esc(d.compare_at) + "</td>" +
-        "<td>" + esc(d.sheet_price) + "</td>" + "<td>" + esc(d.live_price) + "</td>" +
+        "<td>" + esc(d.price) + "</td>" + "<td>" + esc(d.compare_at) + "</td>" + "<td>" + esc(d.discount) + "</td>" +
+        "<td>" + esc(d.register_price) + "</td>" + "<td>" + esc(d.live_price) + "</td>" +
         "<td>" + esc((d.warnings || []).join(", ")) + "</td>";
       tbody.appendChild(tr);
     });
@@ -634,9 +647,8 @@
     try {
       const mode = currentPricesMode();
       const params = buildPriceParams();
-      const row_override = document.getElementById("prices-row-override").checked;
       const status_override = document.getElementById("prices-status-override").checked;
-      const sub = await api("POST", "/prices/preview", { mode: mode, params: params, row_override: row_override, status_override: status_override });
+      const sub = await api("POST", "/prices/preview", { mode: mode, params: params, status_override: status_override });
       const rec = await pollJob("/prices/preview/" + sub.job_id);
       if (rec.status === "failed") {
         setStatus(statusEl, jobFailureMessage(rec), "error");
@@ -645,7 +657,7 @@
       pricesState.pending = {
         plan_hash: rec.result.plan_hash,
         confirm_token: rec.result.confirm_token,
-        mode: mode, params: params, row_override: row_override, status_override: status_override,
+        mode: mode, params: params, status_override: status_override,
       };
       renderPricePlan(rec.result.plan);
       setStatus(statusEl, "piano pronto — verifica e conferma", "ok");
@@ -725,7 +737,8 @@
         tbody.appendChild(tr);
       });
       setStatus(statusEl,
-        "revert applicato: " + report.reverted_products + " prodotti / " + report.reverted_variants + " varianti",
+        "revert applicato: " + report.reverted_pairs + " paia nel registro, " + report.reverted_products +
+        " prodotti / " + report.reverted_variants + " varianti su Shopify",
         "ok");
     } catch (e) {
       // gesture_required / confirm errors surface here too (synchronous 409s
@@ -770,9 +783,63 @@
   }
 
   // ===========================================================================
-  // DELETE tab
+  // DELETE tab — zero-stock recon, bulk cleanup, single delete, multi-outlet
+  // exit, deny-normalize (rule 7), the open RECONCILE rows and a person's close.
+  // Every irreversible vertical is two steps: the preview keeps plan_hash +
+  // confirm_token AND the inputs it was computed from, and the apply echoes all
+  // of them with the CONFERMO gesture — what is shown is what is sent. A job
+  // that comes back VERIFY_FAILED ran nothing: the plan moved, preview again.
   // ===========================================================================
   const cleanupState = { pending: null };
+  const singleDeleteState = { pending: null };
+  const exitState = { pending: null };
+  const normalizeState = { pending: null };
+  // Applies wait for the pass lease and touch Shopify once per outlet, and the
+  // all-outlet normalize preview scans every outlet: poll as patiently as the
+  // baseline does, not with the 2-minute default.
+  const SLOW_POLL = INIT_POLL;
+  const VERIFY_FAILED_TEXT = "piano cambiato: ricalcola l'anteprima";
+
+  /** [[sku, size], ...] -> "SKU (taglia), ..." as inline text (a size can hold a "/": no slash separator). */
+  function fmtKeys(keys) {
+    return (keys || []).map(function (k) { return k[0] + " (" + k[1] + ")"; }).join(", ");
+  }
+
+  /** An ISO instant -> Europe/Rome wall-clock text (user-facing timestamps); "" for none. */
+  function fmtRome(iso) {
+    if (!iso) return "";
+    const d = new Date(iso);
+    return isNaN(d.getTime()) ? String(iso) : d.toLocaleString("it-IT", { timeZone: "Europe/Rome" });
+  }
+
+  /** An apply job that is "done" but whose live re-plan no longer hashed as the preview: nothing ran. */
+  function isVerifyFailed(rec) {
+    return !!(rec.result && rec.result.status === "VERIFY_FAILED");
+  }
+
+  /**
+   * Why an apply job has no usable `rec.result.report`: the job failed, the plan
+   * moved (VERIFY_FAILED — checked before the report is read), or the answer is
+   * not the contract's. null when the report is there.
+   */
+  function applyBlockedMessage(rec) {
+    if (isVerifyFailed(rec)) return VERIFY_FAILED_TEXT;
+    const failMsg = jobFailureMessage(rec);
+    if (failMsg) return failMsg;
+    return rec.result && rec.result.report ? null : "risposta inattesa dal server.";
+  }
+
+  /** A service report that is not APPLIED (lease unavailable/lost, ...): partial outcomes stay in the table. */
+  function notCompletedText(report) {
+    return "non completata: " + report.status + (report.reason ? " (" + report.reason + ")" : "") +
+      " — controlla gli esiti";
+  }
+
+  /** Textarea -> trimmed, non-empty, de-duplicated lines (order kept). */
+  function parseGidLines(text) {
+    return (text || "").split("\n").map(function (l) { return l.trim(); })
+      .filter(function (l, i, all) { return l && all.indexOf(l) === i; });
+  }
 
   async function zeroStock() {
     const statusEl = document.getElementById("zero-stock-status");
@@ -843,6 +910,9 @@
         "<td>" + esc(c.status) + "</td>" + "<td>" + esc((c.reasons || []).join(", ")) + "</td>";
       reviewTbody.appendChild(tr);
     });
+    // outlets whose SKU still has pairs on the shelf: listed apart, never deleted
+    renderRows("cleanup-protected-tbody", plan.protected, function (c) {
+      return [c.product_gid, c.title, c.status, (c.reasons || []).join(", ")]; });
     document.getElementById("cleanup-outcome-panel").classList.add("hidden");
   }
 
@@ -884,7 +954,8 @@
       const tr = document.createElement("tr");
       tr.innerHTML =
         "<td>" + esc(o.product_gid) + "</td>" + "<td>" + esc(o.status) + "</td>" +
-        "<td>" + esc(o.deleted_id) + "</td>" + "<td>" + esc((o.warnings || []).join(", ")) + "</td>";
+        "<td>" + esc(o.deleted_id) + "</td>" + "<td>" + esc((o.warnings || []).join(", ")) + "</td>" +
+        "<td>" + esc((o.closed_rows || []).join(", ")) + "</td>";
       tbody.appendChild(tr);
     });
   }
@@ -908,10 +979,15 @@
         confirm: confirmWord, count: confirmCount, second_confirm: secondConfirm,
       });
       const sub = await api("POST", "/outlet/cleanup/apply", body);
-      const rec = await pollJob("/outlet/cleanup/apply/" + sub.job_id);
-      const failMsg = jobFailureMessage(rec);
-      if (failMsg) {
-        setStatus(statusEl, failMsg, "error");
+      const rec = await pollJob("/outlet/cleanup/apply/" + sub.job_id, SLOW_POLL);
+      const blocked = applyBlockedMessage(rec); // VERIFY_FAILED first, before any report is read
+      if (blocked) {
+        setStatus(statusEl, blocked, "error");
+        return;
+      }
+      if (rec.result.report.verify_failed) {
+        // the service's own re-verify under the lease: nothing was deleted
+        setStatus(statusEl, VERIFY_FAILED_TEXT, "error");
         return;
       }
       renderCleanupOutcome(rec.result.report);
@@ -925,28 +1001,366 @@
     }
   }
 
-  async function singleDelete() {
-    const statusEl = document.getElementById("single-delete-status");
-    const btn = document.getElementById("btn-single-delete");
+  // -- single delete: the step-(0) preview, then CONFERMO + apply -------------------
+  /** The single delete's synchronous refusal: a non-outlet target (409 single_delete_not_outlet) has its own words. */
+  function singleDeleteErrorText(e) {
+    return e.code === "single_delete_not_outlet" ? "il GID non è un prodotto outlet" : "errore: " + e.message;
+  }
+
+  function renderSingleDeletePlan(plan) {
+    document.getElementById("single-delete-plan-panel").classList.remove("hidden");
+    document.getElementById("single-delete-title").textContent =
+      (plan.title || "(senza titolo)") + " (" + plan.product_gid + ")";
+    document.getElementById("single-delete-state").textContent = plan.status || "";
+    document.getElementById("single-delete-skus").textContent = (plan.skus || []).join(", ") || "nessuno";
+    document.getElementById("single-delete-keys").textContent =
+      "Chiavi trattenute fino a un re-level: " + (fmtKeys(plan.keys) || "nessuna");
+    document.getElementById("single-delete-shelf").textContent = (plan.shelf_pairs || []).join(", ") || "nessuna";
+    document.getElementById("single-delete-open-rows").textContent = (plan.open_rows || []).join(", ") || "nessuna";
+    document.getElementById("single-delete-confirm-word").value = "";
+    setStatus(document.getElementById("single-delete-status"), "");
+  }
+
+  async function singleDeletePreview() {
+    const statusEl = document.getElementById("single-delete-preview-status");
+    const btn = document.getElementById("btn-single-delete-preview");
     const gid = document.getElementById("single-delete-gid").value.trim();
-    const confirmWord = document.getElementById("single-delete-confirm-word").value.trim();
     if (!gid) {
       setStatus(statusEl, "product GID obbligatorio", "error");
       return;
     }
+    singleDeleteState.pending = null;
+    document.getElementById("single-delete-plan-panel").classList.add("hidden");
     btn.disabled = true;
-    setStatus(statusEl, "elimino...");
+    setStatus(statusEl, "calcolo anteprima...");
     try {
-      const sub = await api("POST", "/outlet/delete/apply", { product_gid: gid, confirm: confirmWord, count: 1 });
-      const rec = await pollJob("/outlet/delete/apply/" + sub.job_id);
+      const sub = await api("POST", "/outlet/delete/preview", { product_gid: gid });
+      const rec = await pollJob("/outlet/delete/preview/" + sub.job_id);
       if (rec.status === "failed") {
         setStatus(statusEl, jobFailureMessage(rec), "error");
         return;
       }
-      setStatus(statusEl, "eliminato: " + JSON.stringify(rec.result), "ok");
-      document.getElementById("single-delete-gid").value = "";
-      document.getElementById("single-delete-confirm-word").value = "";
+      // the GID the plan was computed for is the one the apply echoes
+      singleDeleteState.pending = {
+        product_gid: gid, plan_hash: rec.result.plan_hash, confirm_token: rec.result.confirm_token,
+      };
+      renderSingleDeletePlan(rec.result.plan);
+      setStatus(statusEl, "anteprima pronta — verifica e conferma", "ok");
     } catch (e) {
+      setStatus(statusEl, singleDeleteErrorText(e), "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function singleDeleteReportText(report) {
+    return report.status +
+      (report.deleted_id ? " — " + report.deleted_id : "") +
+      "; chiavi trattenute: " + (fmtKeys(report.held_keys) || "nessuna") +
+      "; righe chiuse: " + ((report.closed_rows || []).join(", ") || "nessuna") +
+      ((report.warnings || []).length ? "; warning: " + report.warnings.join(", ") : "");
+  }
+
+  async function singleDeleteApply() {
+    const statusEl = document.getElementById("single-delete-status");
+    const btn = document.getElementById("btn-single-delete");
+    if (!singleDeleteState.pending) {
+      setStatus(statusEl, "calcola prima l'anteprima", "error");
+      return;
+    }
+    const confirmWord = document.getElementById("single-delete-confirm-word").value.trim();
+    btn.disabled = true;
+    setStatus(statusEl, "elimino...");
+    try {
+      const body = Object.assign({}, singleDeleteState.pending, { confirm: confirmWord, count: 1 });
+      const sub = await api("POST", "/outlet/delete/apply", body);
+      const rec = await pollJob("/outlet/delete/apply/" + sub.job_id, SLOW_POLL);
+      const blocked = applyBlockedMessage(rec);
+      if (blocked) {
+        setStatus(statusEl, blocked, "error");
+        if (isVerifyFailed(rec)) singleDeleteState.pending = null; // stale plan: preview again
+        return;
+      }
+      const report = rec.result.report;
+      if (report.status === "DELETED") {
+        setStatus(statusEl, "eliminato: " + singleDeleteReportText(report), "ok");
+        singleDeleteState.pending = null;
+        document.getElementById("single-delete-confirm-word").value = "";
+      } else if (report.status === "VERIFY_FAILED") {
+        // the service's own re-verify under the lease: nothing was deleted
+        setStatus(statusEl, VERIFY_FAILED_TEXT, "error");
+        singleDeleteState.pending = null;
+      } else {
+        setStatus(statusEl, "non eliminato: " + singleDeleteReportText(report), "error");
+      }
+    } catch (e) {
+      // 409 gesture_required / confirm_invalid / single_delete_not_outlet land here (sync, no job).
+      setStatus(statusEl, singleDeleteErrorText(e), "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // -- multi-outlet exit: lower every other outlet of a SKU to 0 and delete it -------
+  function renderExitPlan(plan) {
+    document.getElementById("exit-plan-panel").classList.remove("hidden");
+    document.getElementById("exit-keep-title").textContent =
+      (plan.keep_title || "(senza titolo)") + " (" + plan.keep_gid + ")";
+    renderRows("exit-outlets-tbody", plan.outlets, function (o) {
+      return [o.product_gid, o.title, o.status,
+        (o.lowerings || []).map(function (l) { return l.title + ":" + l.available; }).join(", "),
+        (o.refusals || []).join(", ")];
+    });
+    document.getElementById("exit-keys").textContent =
+      "Dopo l'uscita: re-level di " + (fmtKeys(plan.keys) || "nessuna chiave");
+    document.getElementById("exit-confirm-word").value = "";
+    setStatus(document.getElementById("exit-apply-status"), "");
+    document.getElementById("exit-outcome-panel").classList.add("hidden");
+  }
+
+  async function exitPreview() {
+    const statusEl = document.getElementById("exit-preview-status");
+    const btn = document.getElementById("btn-exit-preview");
+    const sku = document.getElementById("exit-sku").value.trim();
+    const keepGid = document.getElementById("exit-keep-gid").value.trim();
+    if (!sku || !keepGid) {
+      setStatus(statusEl, "SKU e GID outlet da tenere obbligatori", "error");
+      return;
+    }
+    exitState.pending = null;
+    document.getElementById("exit-plan-panel").classList.add("hidden");
+    document.getElementById("exit-outcome-panel").classList.add("hidden");
+    btn.disabled = true;
+    setStatus(statusEl, "calcolo anteprima...");
+    try {
+      const sub = await api("POST", "/outlet/exit/preview", { sku: sku, keep_product_gid: keepGid });
+      const rec = await pollJob("/outlet/exit/preview/" + sub.job_id);
+      if (rec.status === "failed") {
+        setStatus(statusEl, jobFailureMessage(rec), "error");
+        return;
+      }
+      const plan = rec.result.plan;
+      if (plan.refused) {
+        // a refused plan is never offered for apply
+        setStatus(statusEl, "uscita rifiutata: " + plan.refused, "error");
+        return;
+      }
+      exitState.pending = {
+        sku: sku, keep_product_gid: keepGid,
+        plan_hash: rec.result.plan_hash, confirm_token: rec.result.confirm_token,
+      };
+      renderExitPlan(plan);
+      setStatus(statusEl, "anteprima pronta — verifica e conferma", "ok");
+    } catch (e) {
+      setStatus(statusEl, "errore: " + e.message, "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function renderExitOutcome(report) {
+    document.getElementById("exit-outcome-panel").classList.remove("hidden");
+    document.getElementById("exit-outcome-summary").textContent =
+      "Stato " + report.status + (report.reason ? " (" + report.reason + ")" : "") +
+      ". Chiavi da riallineare con un re-level: " + (fmtKeys(report.keys_to_relevel) || "nessuna") + ".";
+    renderRows("exit-outcome-tbody", report.outcomes, function (o) {
+      return [o.product_gid, o.status, (o.warnings || []).join(", "),
+        (o.lowered_rows || []).join(", "), (o.closed_rows || []).join(", ")];
+    });
+  }
+
+  async function exitApply() {
+    const statusEl = document.getElementById("exit-apply-status");
+    const btn = document.getElementById("btn-exit-apply");
+    if (!exitState.pending) {
+      setStatus(statusEl, "calcola prima l'anteprima", "error");
+      return;
+    }
+    const confirmWord = document.getElementById("exit-confirm-word").value.trim();
+    btn.disabled = true;
+    setStatus(statusEl, "eseguo l'uscita (alcuni minuti)...");
+    try {
+      const body = Object.assign({}, exitState.pending, { confirm: confirmWord });
+      const sub = await api("POST", "/outlet/exit/apply", body);
+      const rec = await pollJob("/outlet/exit/apply/" + sub.job_id, SLOW_POLL);
+      const blocked = applyBlockedMessage(rec);
+      if (blocked) {
+        setStatus(statusEl, blocked, "error");
+        if (isVerifyFailed(rec)) exitState.pending = null; // stale plan: preview again
+        return;
+      }
+      const report = rec.result.report;
+      if (report.status === "VERIFY_FAILED") {
+        // the service's own re-verify under the lease: nothing ran
+        setStatus(statusEl, VERIFY_FAILED_TEXT, "error");
+        exitState.pending = null;
+        return;
+      }
+      renderExitOutcome(report);
+      if (report.status === "APPLIED") {
+        setStatus(statusEl, "uscita eseguita", "ok");
+        exitState.pending = null;
+        document.getElementById("exit-confirm-word").value = "";
+      } else {
+        setStatus(statusEl, notCompletedText(report), "error");
+      }
+    } catch (e) {
+      // 409 gesture_required / confirm_invalid land here (sync response, no job).
+      setStatus(statusEl, "errore: " + e.message, "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // -- deny-normalize (rule 7) on the named outlets, or on every outlet --------------
+  function renderNormalizePlan(plan) {
+    const products = plan.products || [];
+    document.getElementById("normalize-plan-panel").classList.remove("hidden");
+    document.getElementById("normalize-summary").textContent =
+      "Outlet scansionati " + plan.scanned + ", da normalizzare " + products.length +
+      ", da rivedere " + (plan.review || []).length + ".";
+    renderRows("normalize-products-tbody", products, function (p) {
+      return [p.product_gid, p.title, p.status, (p.unsafe_variant_ids || []).length, (p.custom_lowerings || []).length];
+    });
+    renderRows("normalize-review-tbody", plan.review, function (r) { return [r[0], r[1]]; });
+    document.getElementById("normalize-confirm-word").value = "";
+    setStatus(document.getElementById("normalize-apply-status"), "");
+    document.getElementById("btn-normalize-apply").disabled = !products.length; // nothing planned: nothing to apply
+    document.getElementById("normalize-outcome-panel").classList.add("hidden");
+  }
+
+  async function normalizePreview() {
+    const statusEl = document.getElementById("normalize-preview-status");
+    const btn = document.getElementById("btn-normalize-preview");
+    const gids = parseGidLines(document.getElementById("normalize-gids").value);
+    normalizeState.pending = null;
+    document.getElementById("normalize-plan-panel").classList.add("hidden");
+    document.getElementById("normalize-outcome-panel").classList.add("hidden");
+    btn.disabled = true;
+    setStatus(statusEl, gids.length ? "calcolo anteprima..." : "calcolo anteprima su tutti gli outlet (alcuni minuti)...");
+    try {
+      const sub = await api("POST", "/outlet/deny-normalize/preview", { product_gids: gids });
+      const rec = await pollJob("/outlet/deny-normalize/preview/" + sub.job_id, SLOW_POLL);
+      if (rec.status === "failed") {
+        setStatus(statusEl, jobFailureMessage(rec), "error");
+        return;
+      }
+      // the list the plan was computed for is the list the apply echoes
+      normalizeState.pending = {
+        product_gids: gids, plan_hash: rec.result.plan_hash, confirm_token: rec.result.confirm_token,
+      };
+      renderNormalizePlan(rec.result.plan);
+      setStatus(statusEl, "anteprima pronta — verifica e conferma", "ok");
+    } catch (e) {
+      setStatus(statusEl, "errore: " + e.message, "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function renderNormalizeOutcome(report) {
+    document.getElementById("normalize-outcome-panel").classList.remove("hidden");
+    renderRows("normalize-outcome-tbody", report.outcomes, function (o) {
+      return [o.product_gid, o.status, (o.warnings || []).join(", "), (o.rows || []).join(", ")];
+    });
+  }
+
+  async function normalizeApply() {
+    const statusEl = document.getElementById("normalize-apply-status");
+    const btn = document.getElementById("btn-normalize-apply");
+    if (!normalizeState.pending) {
+      setStatus(statusEl, "calcola prima l'anteprima", "error");
+      return;
+    }
+    const confirmWord = document.getElementById("normalize-confirm-word").value.trim();
+    btn.disabled = true;
+    setStatus(statusEl, "applico (alcuni minuti)...");
+    try {
+      const body = Object.assign({}, normalizeState.pending, { confirm: confirmWord });
+      const sub = await api("POST", "/outlet/deny-normalize/apply", body);
+      const rec = await pollJob("/outlet/deny-normalize/apply/" + sub.job_id, SLOW_POLL);
+      const blocked = applyBlockedMessage(rec);
+      if (blocked) {
+        setStatus(statusEl, blocked, "error");
+        if (isVerifyFailed(rec)) normalizeState.pending = null; // stale plan: preview again
+        return;
+      }
+      const report = rec.result.report;
+      renderNormalizeOutcome(report);
+      if (report.status === "APPLIED") {
+        setStatus(statusEl, "normalizzazione applicata: " + (report.outcomes || []).length + " prodotti", "ok");
+        normalizeState.pending = null;
+        document.getElementById("normalize-confirm-word").value = "";
+      } else {
+        setStatus(statusEl, notCompletedText(report), "error");
+      }
+    } catch (e) {
+      // 409 gesture_required / confirm_invalid land here (sync response, no job).
+      setStatus(statusEl, "errore: " + e.message, "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // -- the open RECONCILE rows, and a person's close of one --------------------------
+  async function reconcileOpen() {
+    const statusEl = document.getElementById("reconcile-open-status");
+    const btn = document.getElementById("btn-reconcile-open");
+    btn.disabled = true;
+    setStatus(statusEl, "leggo...");
+    try {
+      const data = await api("GET", "/outlet/reconcile/open"); // synchronous read, no job
+      const rows = data.rows || [];
+      renderRows("reconcile-open-tbody", rows, function (r) {
+        return [r.row_id, r.action, r.purpose, r.status, fmtKeys(r.keys), r.product_id, fmtRome(r.sent_at), r.closes_as];
+      });
+      setStatus(statusEl, rows.length + " righe aperte", "ok");
+    } catch (e) {
+      setStatus(statusEl, "errore: " + e.message, "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function reconcileClose() {
+    const statusEl = document.getElementById("reconcile-close-status");
+    const btn = document.getElementById("btn-reconcile-close");
+    const rowId = Number(document.getElementById("close-row-id").value); // "" -> 0, "12.5" -> refused: never truncated
+    const why = document.getElementById("close-why").value.trim();
+    if (!Number.isInteger(rowId) || rowId < 1) {
+      setStatus(statusEl, "ID riga obbligatorio (numero intero)", "error");
+      return;
+    }
+    if (!why) {
+      setStatus(statusEl, "motivo obbligatorio", "error");
+      return;
+    }
+    btn.disabled = true;
+    setStatus(statusEl, "chiudo...");
+    try {
+      const sub = await api("POST", "/outlet/reconcile/close", {
+        row_id: rowId,
+        expect_status: document.getElementById("close-expect-status").value,
+        why: why,
+        confirm: document.getElementById("close-confirm-word").value.trim(),
+      });
+      const rec = await pollJob("/outlet/reconcile/close/" + sub.job_id, SLOW_POLL);
+      document.getElementById("close-confirm-word").value = "";
+      if (rec.status === "failed") {
+        setStatus(statusEl, jobFailureMessage(rec), "error");
+      } else {
+        const r = rec.result || {}; // the close report itself, not wrapped
+        if (r.status === "CLOSED") {
+          setStatus(statusEl, "chiusa come " + r.closed_as, "ok");
+          document.getElementById("close-row-id").value = "";
+          document.getElementById("close-why").value = "";
+        } else {
+          setStatus(statusEl, (r.status || "risposta inattesa dal server") + (r.reason ? " (" + r.reason + ")" : ""), "error");
+        }
+      }
+      await reconcileOpen(); // the table now shows what is still open
+    } catch (e) {
+      // 409 gesture_required (CONFERMO, a reason, a closable status) lands here (sync, no job).
       setStatus(statusEl, "errore: " + e.message, "error");
     } finally {
       btn.disabled = false;
@@ -957,7 +1371,14 @@
     document.getElementById("btn-zero-stock").addEventListener("click", zeroStock);
     document.getElementById("btn-cleanup-preview").addEventListener("click", cleanupPreview);
     document.getElementById("btn-cleanup-apply").addEventListener("click", cleanupApply);
-    document.getElementById("btn-single-delete").addEventListener("click", singleDelete);
+    document.getElementById("btn-single-delete-preview").addEventListener("click", singleDeletePreview);
+    document.getElementById("btn-single-delete").addEventListener("click", singleDeleteApply);
+    document.getElementById("btn-exit-preview").addEventListener("click", exitPreview);
+    document.getElementById("btn-exit-apply").addEventListener("click", exitApply);
+    document.getElementById("btn-normalize-preview").addEventListener("click", normalizePreview);
+    document.getElementById("btn-normalize-apply").addEventListener("click", normalizeApply);
+    document.getElementById("btn-reconcile-open").addEventListener("click", reconcileOpen);
+    document.getElementById("btn-reconcile-close").addEventListener("click", reconcileClose);
   }
 
   // ===========================================================================

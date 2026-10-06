@@ -12,6 +12,10 @@ open rows wait). The N-0 release runs before grouping, every pass.
   Δ < 0 and Δ = 0 group — held keys included, on their post-hold events — and
   drafts at zero. It never adds, activates or creates: Δ > 0 groups stay pending
   for the publish, surfaced.
+* :class:`Holder` — the run of a decrement-class holder of plan §3.5 (pricing, the
+  delete, the bulk cleanup, the multi-outlet exit, deny-normalize) and of a
+  person's close (rule 2's (iv)): the take, its class's recovery and the held-key
+  lowering, and the yield between SKUs / products (rule 6).
 
 Groups (§3.3): ``pending_deltas()`` grouped by exact (SKU, SIZE); Δ = the sum,
 net of what ``CARRIED`` rows already moved over those events (the remainder).
@@ -23,10 +27,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from backend.persistence.records import EventRow, Key, LeaseLost, PendingDeltas, StoreError
+from backend.persistence.records import BaselineMissing, EventRow, Key, LeaseLost, PendingDeltas, StoreError
 from backend.services import flows
 from backend.services import ledger as L
 from backend.services.lease import HOLDER_DECREMENT, LeaseUnavailable, PassLease
+from backend.services.promo_gate import require_promo_location
 from backend.services.recovery import CLASS_DECREMENT, CLASS_PUBLISH, recover
 from backend.shopify.ops import ProductNotFound, ShopifyUserError
 from backend.shopify.transport import ShopifyTransportError
@@ -62,12 +67,26 @@ def key_groups(pend: PendingDeltas) -> List[KeyGroup]:
     return out
 
 
-def prologue(ctx: "flows.Context", klass: str) -> None:
+def prologue(ctx: "flows.Context", klass: str, *, require_baseline: bool = True) -> None:
     """Recovery + the held-key lowering when another holder held the lease
-    since this holder's previous generation (or at a first take)."""
+    since this holder's previous generation (or at a first take).
+
+    Before the whole-register ``BASELINE`` row the lowering has no pending set to
+    count (every event is unstamped until the baseline declares what the outlet
+    reflects — the formula would lower units the outlet rightly shows), so it
+    cannot run: a holder that refuses before the baseline (publish, re-level)
+    raises :class:`BaselineMissing` here; one that may run before it (the §3.5
+    verticals, a person's close — ``require_baseline=False``) runs its recovery
+    and skips the lowering, surfaced."""
     if ctx.ledger.lease.others_between:
         recover(ctx, klass)
-        pend = ctx.register.pending_deltas()
+        try:
+            pend = ctx.register.pending_deltas()
+        except BaselineMissing:
+            if require_baseline:
+                raise
+            ctx.report.surface("held_key_lowering_skipped", reason="baseline_missing")
+            return
         flows.held_key_lowering(ctx, holds=pend.holds, pending=pend.events, carried=pend.carried)
 
 
@@ -82,6 +101,48 @@ class PassReport:
                 "lease_generation": self.lease_generation}
 
 
+# How long a §3.5 holder waits for the lease (a decrement or a publish in flight).
+HOLDER_TAKE_BOUND_S = 120.0
+
+
+class Holder:
+    """A decrement-class run that may start before the whole-register baseline
+    (``prologue(require_baseline=False)``): :meth:`start` takes the lease
+    (:class:`LeaseUnavailable` past ``take_bound_s``) and runs the prologue;
+    :meth:`next_item` yields between items — release, re-take (a waiting decrement
+    gets in first), the prologue again only when another holder came in between;
+    :meth:`release` ends it. ``ctx`` is the run's flow context (its ledger, its
+    report)."""
+
+    def __init__(self, register: Any, transport: Any, promo_location_id: str, kind: str, *,
+                 lease: Optional[PassLease] = None, take_bound_s: float = HOLDER_TAKE_BOUND_S,
+                 sleep: Callable[[float], None] = time.sleep) -> None:
+        self.register = register
+        self.lease = lease or PassLease(register, kind, sleep=sleep)
+        self.take_bound_s = take_bound_s
+        self.ctx = flows.Context(L.Ledger(register, transport, self.lease, promo_location_id, sleep=sleep))
+        self._items = 0
+
+    @property
+    def report(self) -> L.Report:
+        return self.ctx.report
+
+    def start(self) -> None:
+        require_promo_location(self.ctx.transport, self.ctx.promo)   # E18: before the lease, nothing written
+        self.lease.take(bound_s=self.take_bound_s)
+        prologue(self.ctx, CLASS_DECREMENT, require_baseline=False)
+
+    def next_item(self) -> None:
+        if self._items:
+            self.lease.retake()                       # the hand-off: a waiting decrement gets in
+            if self.lease.others_between:
+                prologue(self.ctx, CLASS_DECREMENT, require_baseline=False)
+        self._items += 1
+
+    def release(self) -> None:
+        self.lease.release()
+
+
 def decrement_pass(
     register: Any,
     transport: Any,
@@ -93,6 +154,7 @@ def decrement_pass(
 ) -> PassReport:
     """B-3's pass. Raises :class:`LeaseUnavailable` when the lease is not handed
     over within its bound (the caller surfaces it; nothing was written)."""
+    require_promo_location(transport, promo_location_id)          # E18: before the lease, nothing written
     lease = lease or PassLease(register, HOLDER_DECREMENT, sleep=sleep)
     if wait_bound_s is None:
         lease.take_waiting()
@@ -128,5 +190,5 @@ def decrement_pass(
     return out
 
 
-__all__ = ["KeyGroup", "key_groups", "prologue", "PassReport", "decrement_pass",
+__all__ = ["KeyGroup", "key_groups", "prologue", "PassReport", "decrement_pass", "Holder", "HOLDER_TAKE_BOUND_S",
            "CLASS_PUBLISH", "CLASS_DECREMENT", "LeaseUnavailable"]

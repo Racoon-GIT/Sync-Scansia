@@ -183,7 +183,7 @@ def test_a_lost_connect_is_retried_once_and_a_refusal_never():
 
 def test_an_idle_session_is_reopened_before_the_next_statement():
     drv, mono, s = _store(lambda sql, c: ok(1, rows=[(1, "x", "S", "42", SHELF, None, None, None,
-                                                      None, None, 0, None, None)]))
+                                                      None, None, 0, None, None, "Nike")]))
     s.read_pairs()
     assert len(drv.connections) == 1
     mono.t += mysql_store.IDLE_REOPEN_S + 1

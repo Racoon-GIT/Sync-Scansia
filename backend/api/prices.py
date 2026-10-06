@@ -1,5 +1,7 @@
-"""PRICES vertical — price/discount maintenance behind the shared preview-job /
-apply-job / confirm-token machinery (:mod:`backend.api.mutations`).
+"""PRICES vertical — one outlet price per SKU on the register (plan
+``docs/f7-mysql-adapter-plan.md`` §3.5) behind the shared preview-job / apply-job /
+confirm-token machinery (:mod:`backend.api.mutations`). Every job opens a register
+handle (``app.state.register_factory``, bound to the acting user) and closes it.
 
 Wires :mod:`backend.services.pricing_service` to auth-gated routes:
 
@@ -11,10 +13,12 @@ Wires :mod:`backend.services.pricing_service` to auth-gated routes:
   service call). Otherwise a job re-plans LIVE, drift-gates (``VERIFY_FAILED``),
   and calls :func:`~pricing_service.prices_apply`, which captures priors via the
   actor-bound audit sink BEFORE any push. Option A: ``mode``/``params`` are
-  re-submitted (plans are not persisted server-side).
+  re-submitted (plans are not persisted server-side). The service then works
+  under the pass lease, the register first, the push after.
 * ``POST /prices/revert`` (body: ``intent_id`` + ``confirm``) — confirm-gated
-  MUTATION: ``confirm`` must equal ``CONFERMO`` (-> 409). A job re-pushes the
-  captured priors via :func:`~pricing_service.revert_prices`.
+  MUTATION: ``confirm`` must equal ``CONFERMO`` (-> 409). A job undoes the intent
+  via :func:`~pricing_service.revert_prices`: the register pairs it wrote back to
+  their priors, then the captured Shopify priors re-pushed.
 * ``POST /prices/discharge-debt`` + ``GET .../{job_id}`` — READ-ONLY recon job
   (:func:`~pricing_service.discharge_debt_count`): live outlets failing price
   validation. (Exposed as an off-loop job, not a synchronous GET: it is a slow
@@ -28,7 +32,7 @@ per-SKU ``PriceDiff.plan_hash`` values — the coarse batch drift gate on top of
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
@@ -46,9 +50,10 @@ from backend.api.mutations import (
     _run_preview_job,
     _run_readonly_job,
     poll_job,
+    register_for,
 )
 from backend.auth.basic_auth import require_basic_auth
-from backend.persistence.gsheet_audit import GSheetAuditSink
+from backend.persistence.audit_sink import RegisterAuditSink
 from backend.services import pricing_service
 from backend.services.delete_service import CONFIRM_WORD
 from backend.services.pricing_service import _MODES, BulkRule, PriceParams
@@ -97,7 +102,6 @@ class PriceParamsModel(BaseModel):
 class PricePreviewRequest(BaseModel):
     mode: str
     params: PriceParamsModel = Field(default_factory=PriceParamsModel)
-    row_override: bool = False
     status_override: bool = False
 
 
@@ -108,7 +112,6 @@ class PriceApplyRequest(BaseModel):
     # mismatch drifts the recomputed plan_hash -> VERIFY_FAILED.
     mode: str
     params: PriceParamsModel = Field(default_factory=PriceParamsModel)
-    row_override: bool = False
     status_override: bool = False
 
 
@@ -142,14 +145,15 @@ def _price_diff_to_dict(d: Any) -> Dict[str, Any]:
         "actionable": d.actionable,
         "price": d.price,
         "compare_at": d.compare_at,
+        "discount": d.discount,
         "percent": d.percent,
-        "sheet_price": d.sheet_price,
-        "sheet_changed": d.sheet_changed,
+        "register_price": d.register_price,
+        "register_changed": d.register_changed,
         "live_price": d.live_price,
         "live_compare_at": d.live_compare_at,
         "live_changed": d.live_changed,
         "live_status": d.live_status,
-        "row_uuids": list(d.row_uuids),
+        "pair_ids": list(d.pair_ids),
         "warnings": list(d.warnings),
         "plan_hash": d.plan_hash,
     }
@@ -171,7 +175,8 @@ def _price_outcome_to_dict(o: Any) -> Dict[str, Any]:
 
 def serialize_price_report(report: Any) -> Dict[str, Any]:
     return {"intent_id": report.intent_id,
-            "outcomes": [_price_outcome_to_dict(o) for o in report.outcomes]}
+            "outcomes": [_price_outcome_to_dict(o) for o in report.outcomes],
+            "surfaced": list(report.surfaced)}
 
 
 def serialize_revert_report(report: Any) -> Dict[str, Any]:
@@ -179,7 +184,9 @@ def serialize_revert_report(report: Any) -> Dict[str, Any]:
         "intent_id": report.intent_id,
         "reverted_products": report.reverted_products,
         "reverted_variants": report.reverted_variants,
+        "reverted_pairs": report.reverted_pairs,
         "outcomes": [_price_outcome_to_dict(o) for o in report.outcomes],
+        "surfaced": list(report.surfaced),
     }
 
 
@@ -210,16 +217,14 @@ def build_prices_router() -> APIRouter:
             rec = state.job_store.create(KIND_PREVIEW)
         except JobBusyError:
             return _error(409, CODE_JOB_BUSY, "An operation is already in flight.")
-        mode, params = body.mode, _to_params(body.params)
-        ro, so = body.row_override, body.status_override
+        mode, params, so = body.mode, _to_params(body.params), body.status_override
 
-        def preview_fn(sheet: Any, transport: Any) -> Any:
-            return pricing_service.prices_preview(
-                sheet, transport, mode, params, row_override=ro, status_override=so)
+        def preview_fn(register: Any, transport: Any) -> Any:
+            return pricing_service.prices_preview(register, transport, mode, params, status_override=so)
 
         state.executor.submit(
             _run_preview_job, state.job_store, rec.job_id,
-            state.sheet_factory, state.transport_factory,
+            state.register_factory, state.transport_factory,
             preview_fn, prices_plan_hash, serialize_price_plan,
             state.token_service, TOKEN_KIND_PRICES, DEFAULT_PREVIEW_TTL_S, None,
         )
@@ -243,22 +248,21 @@ def build_prices_router() -> APIRouter:
             rec = state.job_store.create(KIND_APPLY)
         except JobBusyError:
             return _error(409, CODE_JOB_BUSY, "An operation is already in flight.")
-        mode, params = body.mode, _to_params(body.params)
-        ro, so = body.row_override, body.status_override
+        mode, params, so = body.mode, _to_params(body.params), body.status_override
+        promo = state.promo_location_id
 
-        def preview_fn(sheet: Any, transport: Any) -> Any:
-            return pricing_service.prices_preview(
-                sheet, transport, mode, params, row_override=ro, status_override=so)
+        def preview_fn(register: Any, transport: Any) -> Any:
+            return pricing_service.prices_preview(register, transport, mode, params, status_override=so)
 
-        def apply_fn(sheet: Any, transport: Any, fresh_plan: Any, audit_sink: Any) -> Any:
+        def apply_fn(register: Any, transport: Any, fresh_plan: Any, audit_sink: Any) -> Any:
             return pricing_service.prices_apply(
-                sheet, transport, mode, params, fresh_plan, audit_sink,
-                row_override=ro, status_override=so)
+                register, transport, mode, params, fresh_plan, audit_sink,
+                promo_location_id=promo, status_override=so)
 
-        audit_builder = lambda sheet: GSheetAuditSink.from_scansia_sheet(sheet, actor=actor)
+        audit_builder = lambda register: RegisterAuditSink(register, actor=actor)
         state.executor.submit(
             _run_apply_job, state.job_store, rec.job_id,
-            body.plan_hash, state.sheet_factory, state.transport_factory,
+            body.plan_hash, register_for(state, actor), state.transport_factory,
             audit_builder, preview_fn, prices_plan_hash, apply_fn,
             serialize_price_report, None,               # prices has no human-gesture gate
         )
@@ -279,15 +283,17 @@ def build_prices_router() -> APIRouter:
             rec = state.job_store.create(KIND_REVERT)
         except JobBusyError:
             return _error(409, CODE_JOB_BUSY, "An operation is already in flight.")
-        intent_id = body.intent_id
+        intent_id = body.intent_id.strip()
+        promo = state.promo_location_id
 
-        def mutate_fn(sheet: Any, transport: Any, audit_sink: Any) -> Any:
-            return pricing_service.revert_prices(transport, audit_sink, intent_id)
+        def mutate_fn(register: Any, transport: Any, audit_sink: Any) -> Any:
+            return pricing_service.revert_prices(register, transport, audit_sink, intent_id,
+                                                 promo_location_id=promo)
 
-        audit_builder = lambda sheet: GSheetAuditSink.from_scansia_sheet(sheet, actor=actor)
+        audit_builder = lambda register: RegisterAuditSink(register, actor=actor)
         state.executor.submit(
             _run_mutation_job, state.job_store, rec.job_id,
-            state.sheet_factory, state.transport_factory, audit_builder,
+            register_for(state, actor), state.transport_factory, audit_builder,
             mutate_fn, serialize_revert_report,
         )
         return {"job_id": rec.job_id, "status": rec.status}

@@ -55,3 +55,15 @@ def test_no_hardcoded_store_fallback(monkeypatch, shopify_env):
     with pytest.raises(ConfigError):
         cfg = load_shopify_config()
         assert cfg.store != "racoon-lab.myshopify.com"
+
+
+def test_promo_location_id_is_normalised_to_a_location_gid(monkeypatch, shopify_env):
+    """E18: every inventory read compares, and every write sends, a location GID."""
+    monkeypatch.setenv("PROMO_LOCATION_ID", "61184966721")
+    assert load_shopify_config().promo_location_id == "gid://shopify/Location/61184966721"
+    monkeypatch.setenv("PROMO_LOCATION_ID", " gid://shopify/Location/61184966721 ")
+    assert load_shopify_config().promo_location_id == "gid://shopify/Location/61184966721"
+    for bad in ("Promo", "gid://shopify/Product/1", "61184966721x", "gid://shopify/Location/"):
+        monkeypatch.setenv("PROMO_LOCATION_ID", bad)
+        with pytest.raises(ConfigError, match="PROMO_LOCATION_ID"):
+            load_shopify_config()

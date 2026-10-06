@@ -207,16 +207,17 @@ class MySQLBackend:
     def add_pair(self, sku: str, size: str, *, state: str = "IN_SCANSIA", price_high: Any = None,
                  price: Any = None, price_outlet: Any = None, discount: Any = None,
                  outlet_product_id: Optional[int] = None, online: bool = False,
-                 product_title: Optional[str] = None, pair_uuid: Optional[str] = None) -> int:
+                 product_title: Optional[str] = None, brand: Optional[str] = None,
+                 pair_uuid: Optional[str] = None) -> int:
         import uuid
 
         return self._x(
             "INSERT INTO sc_returned_pair (PAIR_UUID, SKU, SIZE, STATE, PRICE_HIGH, PRICE, PRICE_OUTLET, "
-            "DISCOUNT, OUTLET_PRODUCT_ID, ONLINE, PRODUCT_TITLE, SOURCE, INTAKE_KEY, SELLABLE_AT, "
-            "CREATED_AT, UPDATED_AT) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'MANUAL', %s, "
+            "DISCOUNT, OUTLET_PRODUCT_ID, ONLINE, PRODUCT_TITLE, BRAND, SOURCE, INTAKE_KEY, SELLABLE_AT, "
+            "CREATED_AT, UPDATED_AT) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'MANUAL', %s, "
             "IF(%s, UTC_TIMESTAMP(3), NULL), UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
             (pair_uuid or str(uuid.uuid4()), sku, size, state, price_high, price, price_outlet, discount,
-             outlet_product_id, 1 if online else 0, product_title, f"f7test:{uuid.uuid4().hex}",
+             outlet_product_id, 1 if online else 0, product_title, brand, f"f7test:{uuid.uuid4().hex}",
              1 if state == "IN_SCANSIA" else 0),
         )
 
@@ -388,3 +389,22 @@ def stamp_carrier(event_ids, keys=(), action="stamp-only") -> InsertAudit:
 
 
 __all__ = ["MemoryBackend", "MySQLBackend", "StubLease", "stamp_carrier", "PROMO"]
+
+
+def seed_reconcile(register: Register, *, sent: bool = False, status: str = "OPEN",
+                   outcome: Optional[dict] = None, group_id: int = 7, **spec: Any) -> int:
+    """A ``RECONCILE`` row as an earlier pass would have left it: written ahead
+    (``ledger.RowSpec(**spec)``), optionally sent, optionally given an outcome —
+    under a lease taken and released for the purpose."""
+    from backend.services import ledger as L
+
+    stub = StubLease(register, holder="seed")
+    try:
+        (rid,) = register.write_ahead(stub, [L.RowSpec(**spec).to_insert(actor="seed", group_id=group_id)])
+        if sent:
+            register.mark_sent(stub, rid, first=True, sent_available=0, request='{"query": "x", "variables": {}}')
+        if status != "OPEN":
+            register.record_outcome(stub, rid, expect="OPEN", status=status, outcome=outcome or {})
+    finally:
+        register.lease_release(stub)
+    return rid

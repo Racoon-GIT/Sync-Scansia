@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple, runtime_checkable
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 from backend.persistence.records import (
     AuditRow,
@@ -38,9 +38,11 @@ from backend.persistence.records import (
     Snapshot,
     WriteOp,
 )
-from backend.services.delete_service import BeforeSnapshot, DeleteOutcomeEvent
-from backend.services.baseline_service import InitBeforeSnapshot
-from backend.services.pricing_service import PriceIntent
+
+if TYPE_CHECKING:  # annotations only: the services import the register, never the reverse at runtime
+    from backend.services.baseline_service import InitBeforeSnapshot
+    from backend.services.delete_service import BeforeSnapshot, DeleteOutcomeEvent
+    from backend.services.pricing_service import PriceIntent
 
 
 @runtime_checkable
@@ -147,6 +149,17 @@ class RegisterPort(Protocol):
         discount: Optional[Decimal],
         *,
         only_missing: bool = False,
+        ref: Optional[str] = None,
+    ) -> List[int]: ...
+
+    def restore_outlet_price(
+        self,
+        lease: FenceHolder,
+        pair_ids: Sequence[int],
+        price: Optional[Decimal],
+        discount: Optional[Decimal],
+        *,
+        ref: str,
     ) -> List[int]: ...
 
     def set_outlet_product(self, lease: FenceHolder, pair_ids: Sequence[int], product_id: int) -> None: ...
@@ -191,9 +204,10 @@ class AuditSink(Protocol):
         ...
 
     # --- delete side -------------------------------------------------------
-    def write_durable(self, snapshot: BeforeSnapshot) -> None:
+    def write_durable(self, snapshot: BeforeSnapshot) -> Optional[int]:
         """Persist the delete before-snapshot; RAISE on any failure — the delete
-        ABORT GATE: if it raises, ``productDelete`` is never reached."""
+        ABORT GATE: if it raises, ``productDelete`` is never reached. Returns the
+        ``DELETE`` row's id (terminal path (iii) names it)."""
         ...
 
     def write_outcome(self, event: DeleteOutcomeEvent) -> None:

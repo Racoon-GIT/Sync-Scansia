@@ -16,16 +16,22 @@ code change whose precondition is every surface deprecated at the old pin
 migrated (S14, §5). Pinned 2026-10-06: ``2026-10`` is "Latest stable", accessible
 until 2027-10-16 15:00 UTC (shopify.dev/docs/api/usage/versioning, read that day).
 
-``PROMO_LOCATION_ID`` is only checked for *presence* here. Verifying that it
-actually resolves (live, via the Shopify API) to a location named "Promo" is
-a startup gate that belongs to M1b, not this module.
+``PROMO_LOCATION_ID`` is checked for presence and FORM here: a location GID
+(``gid://shopify/Location/<n>``) or its numeric id (normalised to the GID —
+every inventory read and write compares and sends GIDs); anything else refuses
+to boot. That it resolves, live, to the location named "Promo" is checked before
+every pass that writes (``backend.services.promo_gate``, plan E18): the README's
+examples set the id of "Magazzino".
 """
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 PINNED_API_VERSION = "2026-10"
+LOCATION_GID_PREFIX = "gid://shopify/Location/"
+_LOCATION_ID = re.compile(r"(?:gid://shopify/Location/)?([0-9]+)")
 DEFAULT_API_VERSION = PINNED_API_VERSION
 
 
@@ -48,6 +54,14 @@ class ShopifyConfig:
     promo_location_id: str
 
 
+def location_gid(value: str) -> str:
+    """``PROMO_LOCATION_ID`` as a location GID: the GID itself or its numeric id."""
+    m = _LOCATION_ID.fullmatch(value.strip())
+    if m is None:
+        raise ConfigError("PROMO_LOCATION_ID must be a location GID or its numeric id")
+    return f"{LOCATION_GID_PREFIX}{m.group(1)}"
+
+
 def load_shopify_config() -> ShopifyConfig:
     """Build a ``ShopifyConfig`` from environment variables.
 
@@ -65,5 +79,5 @@ def load_shopify_config() -> ShopifyConfig:
         store=_require("SHOPIFY_STORE"),
         token=_require("SHOPIFY_ADMIN_TOKEN"),
         api_version=PINNED_API_VERSION,
-        promo_location_id=_require("PROMO_LOCATION_ID"),
+        promo_location_id=location_gid(_require("PROMO_LOCATION_ID")),
     )

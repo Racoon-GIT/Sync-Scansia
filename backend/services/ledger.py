@@ -23,7 +23,7 @@ surfaced — never more. Every Shopify write is one ``RECONCILE`` row:
 Row kinds (``ACTION``): ``adjust`` (a relative ``available`` write; its
 ``PAYLOAD.purpose`` says which: ``add`` / ``lower`` carry a signed ``share`` of
 their group's Δ; ``zero`` / ``excess`` / ``custom`` / ``orphan`` / ``nonpromo``
-/ ``relevel`` carry an absolute ``target`` — the delta is computed at the send,
+/ ``exit`` / ``relevel`` carry an absolute ``target`` — the delta is computed at the send,
 from the live read: "a level re-read, not a delta"), ``activate``,
 ``deactivate`` (no key: not ``@idempotent``), the state rows ``create``,
 ``revive-tail``, ``normalise`` (``SENT_AT`` + ``STEP`` before EVERY call), and
@@ -80,9 +80,10 @@ P_CUSTOM = "custom"
 P_ORPHAN = "orphan"
 P_NONPROMO = "nonpromo"
 P_RELEVEL = "relevel"
+P_EXIT = "exit"          # the multi-outlet exit: a non-kept outlet's real-size Promo to 0 (§3.5)
 SHARE_PURPOSES = frozenset({P_ADD, P_LOWER})
-TARGET_PURPOSES = frozenset({P_ZERO, P_EXCESS, P_CUSTOM, P_ORPHAN, P_NONPROMO, P_RELEVEL})
-EVENTLESS_LOWERINGS = frozenset({P_ZERO, P_EXCESS, P_CUSTOM, P_ORPHAN, P_NONPROMO})
+TARGET_PURPOSES = frozenset({P_ZERO, P_EXCESS, P_CUSTOM, P_ORPHAN, P_NONPROMO, P_RELEVEL, P_EXIT})
+EVENTLESS_LOWERINGS = frozenset({P_ZERO, P_EXCESS, P_CUSTOM, P_ORPHAN, P_NONPROMO, P_EXIT})
 
 # The re-send window: the first send + 24 h − the 1 h margin (build notes).
 RESEND_WINDOW = timedelta(hours=23)
@@ -555,7 +556,7 @@ def carried_share(carried_rows: Iterable[AuditRow], key: Key, event_ids: Iterabl
 __all__ = [
     "A_ADJUST", "A_ACTIVATE", "A_DEACTIVATE", "A_CREATE", "A_TAIL", "A_NORMALISE", "A_STAMP",
     "INVENTORY_ACTIONS", "STATE_ACTIONS",
-    "P_ADD", "P_LOWER", "P_ZERO", "P_EXCESS", "P_CUSTOM", "P_ORPHAN", "P_NONPROMO", "P_RELEVEL",
+    "P_ADD", "P_LOWER", "P_ZERO", "P_EXCESS", "P_CUSTOM", "P_ORPHAN", "P_NONPROMO", "P_RELEVEL", "P_EXIT",
     "SHARE_PURPOSES", "TARGET_PURPOSES", "EVENTLESS_LOWERINGS",
     "RESEND_WINDOW", "KEY_RETENTION", "CONCURRENT_BACKOFF_S",
     "ANS_OK", "ANS_CONCURRENT", "ANS_MISMATCH", "ANS_PREVIOUS_FAILED", "ANS_STALE", "ANS_GONE",

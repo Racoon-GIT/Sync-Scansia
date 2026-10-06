@@ -105,12 +105,13 @@ class RegisterAuditSink:
         return PriceIntent(mode=p.get("mode") or "", plan_hash=(row.plan_hash or "").strip(), priors=priors)
 
     # -- delete side ------------------------------------------------------------
-    def write_durable(self, snapshot: BeforeSnapshot) -> None:
+    def write_durable(self, snapshot: BeforeSnapshot) -> int:
+        """The ``DELETE`` row (the abort gate); returns its id."""
         try:
             payload = asdict(snapshot)
         except TypeError as e:
             raise StoreError("delete snapshot is not serialisable") from e
-        self._insert(InsertAudit(
+        return self._insert(InsertAudit(
             kind=KIND_DELETE, actor=self._actor, action="before_snapshot",
             product_id=_product_number(snapshot.product_gid), payload=payload,
         ))
