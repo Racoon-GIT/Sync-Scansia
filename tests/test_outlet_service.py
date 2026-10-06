@@ -1,30 +1,43 @@
-"""backend.services.outlet_service — PUBLISH orchestration.
+"""backend.services.outlet_service — PUBLISH orchestration on the register.
 
-Every collaborator is mocked in-memory (ScansiaSheet, resolvers, ops) — NO HTTP,
-NO live store, NO live Sheet, per project rules. The ops/resolver leaves are
-patched on their module objects (outlet_service calls them through the module),
-so a single ``OpsMock`` records the exact orchestration call ORDER, which is the
-whole point of the anti-phantom-stock branch.
+Every collaborator is in-memory: the register is the fake store
+(``backend.persistence.memory_store``, MySQL semantics), resolvers and ops are
+patched on their module objects so a single ``OpsMock`` records the exact
+orchestration call ORDER (the point of the anti-phantom-stock branch). NO HTTP,
+NO live store, NO database.
 
-Coverage: CREATE order, phantom-stock isolation, ACTIVE no-re-inflate, delta
-exactly-once (compare-mismatch), DRAFT sold-out, TOCTOU VERIFY_FAILED, FIX4
-price rejection, FIX5 size-primary matching, DRY_RUN read-only, and main.py FIX2.
+These are the sheet-era publish tests ported to the register — the parity oracle
+of the positive-delta flows (plan §4 step 2): CREATE order, phantom-stock
+isolation, ACTIVE no-re-inflate, TOCTOU VERIFY_FAILED, FIX4, size-primary
+matching (now exact, §3.2), DRY_RUN read-only, the post-review fixes. Retired
+with the ``frozen_pre`` branches (§3.3, not ported): the sheet era's
+"delta exactly-once" pair (compare-mismatch "already applied" / strict
+mismatch) — the register stamps events, and §4 step 4 replaces the
+compare-with-frozen decision by a relative write with ``changeFromQuantity``.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Dict, List
 
 import pytest
 
-from backend.gsheet.reader import CanonRead, CanonRow
-from backend.gsheet.writer import WriteResult
+from backend.persistence.records import (
+    DONE,
+    HOLD_BASELINE,
+    BaselineMissing,
+    InsertAudit,
+)
 from backend.services import outlet_service
 from backend.services import resolvers
+from backend.services.lease import PassLease
 from backend.shopify import ops
+
+from tests.register_fixtures import MemoryBackend
 
 PROMO = "gid://shopify/Location/PROMO"
 MAG = "gid://shopify/Location/MAG"
 PUB = "gid://shopify/Publication/OS"
+OUT = "gid://shopify/Product/500"
 
 _MUTATION_OPS = {
     "product_duplicate",
@@ -40,25 +53,41 @@ _MUTATION_OPS = {
 # Builders
 # ---------------------------------------------------------------------------
 
-def _row(sku, size, qta, *, reconciled=False, product_id="",
-         prezzo_high="100.00", prezzo_outlet="50.00", row_uuid=None) -> CanonRow:
-    return CanonRow(
-        row_uuid=row_uuid or f"u-{sku}-{size}",
-        sku=sku, size=size, product_id=product_id,
-        prezzo_high=prezzo_high, prezzo_outlet=prezzo_outlet,
-        qta=qta, qta_raw=str(qta), online="SI", sconto="",
-        reconciled=reconciled, row_index=0, anomalies=[], raw={},
-    )
+class World:
+    """The register (fake) with its whole-register baseline already recorded."""
+
+    def __init__(self) -> None:
+        self.be = MemoryBackend()
+        self.be.seed_baseline()
+
+    def returned(self, sku, size, n=1, *, price_outlet="50.00", price_high="100.00", **kw) -> List[int]:
+        """``n`` pairs of (sku, size) on the shelf, each with its pending +1."""
+        out = []
+        for _ in range(n):
+            _, eid = self.be.add_shelf_pair(sku, size, price_outlet=price_outlet,
+                                            price_high=price_high, **kw)
+            out.append(eid)
+        return out
+
+    def register(self):
+        return self.be.register(actor="tester")
+
+    def unstamped(self) -> List[int]:
+        return [e.event_id for e in self.be.store().read_unstamped_events()]
+
+    def writes(self) -> List[str]:
+        return [x[0] for x in self.be.db.log if x[0] in ("renew", "insert_audit", "stamp", "update_pairs",
+                                                          "update_audit", "commit")]
 
 
-def _level(loc_id, available, on_hand=None):
+def _level(loc_id, available, on_hand=None, committed=0):
     return {"location_id": loc_id, "location_name": loc_id.split("/")[-1],
-            "available": available, "committed": 0,
+            "available": available, "committed": committed,
             "on_hand": available if on_hand is None else on_hand}
 
 
 def _inv_variant(vid, size, item_id, levels, policy="DENY", truncated=False, sku=None):
-    return {"id": vid, "sku": sku, "inventoryPolicy": policy,
+    return {"id": vid, "sku": sku, "title": size, "inventoryPolicy": policy,
             "selectedOptions": [{"name": "Size", "value": size}],
             "inventoryItemId": item_id, "levels": levels, "levels_truncated": truncated}
 
@@ -81,26 +110,11 @@ def _source_match(gid, title="Nike Air"):
             "review": False, "matched_variant_gids": [gid + "/v"]}
 
 
-class FakeSheet:
-    def __init__(self, rows: List[CanonRow]):
-        self.rows = rows
-        self.marked: List[Any] = []
-        self.reads: List[bool] = []
-
-    def read_canonical(self, *, assign_uuids=True) -> CanonRead:
-        self.reads.append(assign_uuids)
-        return CanonRead(list(self.rows), {}, [])
-
-    def mark_reconciled(self, row_uuid, *, expected_sku) -> WriteResult:
-        self.marked.append((row_uuid, expected_sku))
-        return WriteResult(True, 1, None)
-
-
 class OpsMock:
     """Patches every ops.* / resolvers.* used by the service and records calls."""
 
     def __init__(self, monkeypatch, *, inv_by_gid=None, source_variants=None,
-                 outlet=None, source=None, new_gid="gid://shopify/Product/DUP",
+                 outlet=None, source=None, new_gid="gid://shopify/Product/900",
                  outlet_by_sku=None, source_by_sku=None, read_inv_raises=None):
         self.calls: List[tuple] = []
         self.inv_by_gid: Dict[str, list] = inv_by_gid or {}
@@ -108,16 +122,12 @@ class OpsMock:
         self.new_gid = new_gid
         self.outlet = outlet if outlet is not None else {"matches": [], "warning": None}
         self.source = source if source is not None else {"matches": [], "warning": None}
-        # per-sku resolver overrides (default: same outlet/source for every sku).
         self.outlet_by_sku: Dict[str, dict] = outlet_by_sku or {}
         self.source_by_sku: Dict[str, dict] = source_by_sku or {}
-        # models the duplicate's product status across the CREATE finalization
-        # (fix1): _duplicate seeds "DRAFT", _status records every explicit flip.
         self.status_by_gid: Dict[str, str] = {}
         self.status_history: List[tuple] = []
-        # gid -> Exception instance to raise instead of returning inventory
-        # (fix3 error-isolation coverage: e.g. a RuntimeError mid-execution).
         self.read_inv_raises: Dict[str, Exception] = read_inv_raises or {}
+        self.on_set = None  # hook: called on each inventory_set_quantities
 
         monkeypatch.setattr(resolvers, "outlet_resolver", lambda t, sku: self.outlet_by_sku.get(sku, self.outlet))
         monkeypatch.setattr(resolvers, "source_resolver", lambda t, sku: self.source_by_sku.get(sku, self.source))
@@ -131,11 +141,8 @@ class OpsMock:
         monkeypatch.setattr(ops, "product_publish", self._publish)
         monkeypatch.setattr(ops, "get_online_store_publication_id", lambda t: PUB)
 
-    # recorded ops
     def _duplicate(self, t, src, title):
         self.calls.append(("product_duplicate", src, title))
-        # fix1: productDuplicate(newStatus=DRAFT) -> the duplicate is DRAFT
-        # atomically at creation, never inheriting the ACTIVE source's status.
         self.status_by_gid[self.new_gid] = "DRAFT"
         self.status_history.append((self.new_gid, "DRAFT"))
         return self.new_gid
@@ -147,16 +154,21 @@ class OpsMock:
         return [dict(v) for v in self.inv_by_gid.get(gid, [])]
 
     def _get_variants(self, t, gid):
-        self.calls.append(("get_product_variants", gid)); return list(self.source_variants)
+        self.calls.append(("get_product_variants", gid))
+        return list(self.source_variants)
 
     def _set_qty(self, t, item, loc, qty, *a, **k):
-        self.calls.append(("inventory_set_quantities", item, loc, qty)); return {}
+        self.calls.append(("inventory_set_quantities", item, loc, qty))
+        if self.on_set is not None:
+            self.on_set(item, loc, qty)
+        return {}
 
     def _deactivate(self, t, item, loc):
-        self.calls.append(("inventory_deactivate", item, loc)); return None
+        self.calls.append(("inventory_deactivate", item, loc))
 
     def _bulk(self, t, gid, variants):
-        self.calls.append(("product_variants_bulk_update", gid, variants)); return {}
+        self.calls.append(("product_variants_bulk_update", gid, variants))
+        return {}
 
     def _status(self, t, gid, status):
         self.calls.append(("product_update_status", gid, status))
@@ -165,9 +177,9 @@ class OpsMock:
         return {}
 
     def _publish(self, t, gid, pub):
-        self.calls.append(("product_publish", gid, pub)); return {}
+        self.calls.append(("product_publish", gid, pub))
+        return {}
 
-    # helpers
     @property
     def names(self) -> List[str]:
         return [c[0] for c in self.calls]
@@ -187,52 +199,52 @@ def _dup_inv_two_sizes():
     ]
 
 
+def _preview_apply(w: World, **kw):
+    reg = w.register()
+    plan = outlet_service.publish_preview(reg, object(), promo_location_id=PROMO)
+    report = outlet_service.publish_apply(reg, object(), plan, promo_location_id=PROMO, **kw)
+    return plan, report
+
+
 # ---------------------------------------------------------------------------
 # 1) CREATE — exact anti-phantom-stock ORDER
 # ---------------------------------------------------------------------------
 
 def test_create_branch_exact_order(monkeypatch):
-    rows = [_row("SKU1", "42", 2)]
-    sheet = FakeSheet(rows)
+    w = World()
+    events = w.returned("SKU1", "42", 2)
     m = OpsMock(
         monkeypatch,
         source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
         source_variants=[_src_variant("V42", "42", "IIT42"), _src_variant("V43", "43", "IIT43")],
-        inv_by_gid={"gid://shopify/Product/DUP": _dup_inv_two_sizes()},
+        inv_by_gid={"gid://shopify/Product/900": _dup_inv_two_sizes()},
     )
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
+    plan, report = _preview_apply(w)
     assert plan.actions[0].branch == "CREATE"
-    report = outlet_service.publish_apply(sheet, object(), plan, promo_location_id=PROMO)
     assert report.outcomes[0].status == "APPLIED"
+    assert sorted(report.outcomes[0].stamped_event_ids) == sorted(events)
 
     names = m.names
-    # (1) duplicate happens ONCE, before every inventory/publish mutation
     dup_i = m.idx("product_duplicate")
     assert len(dup_i) == 1
     dup_i = dup_i[0]
-    inv_mut = [i for i, c in enumerate(m.calls)
-               if c[0] in {"inventory_set_quantities", "inventory_deactivate",
-                           "product_variants_bulk_update", "product_update_status",
-                           "product_publish"}]
+    inv_mut = [i for i, c in enumerate(m.calls) if c[0] in _MUTATION_OPS - {"product_duplicate"}]
     assert dup_i < min(inv_mut)
-    # (2) every non-Promo disconnect happens BEFORE the first Promo zero
     last_deact = max(m.idx("inventory_deactivate"))
     promo_zeros = [i for i, c in enumerate(m.calls)
                    if c[0] == "inventory_set_quantities" and c[2] == PROMO and c[3] == 0]
     assert last_deact < min(promo_zeros)
-    # (3) delta set (Promo, 2) AFTER the Promo zeros
     delta_i = next(i for i, c in enumerate(m.calls)
                    if c[0] == "inventory_set_quantities" and c[2] == PROMO and c[3] == 2)
     assert max(promo_zeros) < delta_i
-    # (4) DENY normalize AFTER delta, (5) activate + publish are the LAST two
     bulk_i = m.idx("product_variants_bulk_update")[0]
     assert delta_i < bulk_i
     assert names[-2] == "product_update_status" and m.calls[-2][2] == "ACTIVE"
     assert names[-1] == "product_publish"
-    # DENY + outlet prices carried on the bulk update
     variants_input = m.calls[bulk_i][2]
     assert all(v["inventoryPolicy"] == "DENY" for v in variants_input)
     assert all(v["price"] == "50.00" and v["compareAtPrice"] == "100.00" for v in variants_input)
+    assert w.unstamped() == []
 
 
 # ---------------------------------------------------------------------------
@@ -240,96 +252,76 @@ def test_create_branch_exact_order(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_create_isolates_returned_size_only(monkeypatch):
-    rows = [_row("SKU1", "42", 2)]  # size 43 NOT returned
-    sheet = FakeSheet(rows)
+    w = World()
+    w.returned("SKU1", "42", 2)  # size 43 NOT returned
     m = OpsMock(
         monkeypatch,
         source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
         source_variants=[_src_variant("V42", "42", "IIT42"), _src_variant("V43", "43", "IIT43")],
-        inv_by_gid={"gid://shopify/Product/DUP": _dup_inv_two_sizes()},
+        inv_by_gid={"gid://shopify/Product/900": _dup_inv_two_sizes()},
     )
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
-    outlet_service.publish_apply(sheet, object(), plan, promo_location_id=PROMO)
-
-    # the ONLY non-zero inventory set is the returned size 42 at Promo
+    _preview_apply(w)
     nonzero = [c for c in m.sets() if c[3] > 0]
     assert nonzero == [("inventory_set_quantities", "gid/DUP/i42", PROMO, 2)]
-    # both variants' Magazzino (non-Promo) levels were zeroed AND disconnected
     assert ("inventory_deactivate", "gid/DUP/i42", MAG) in m.calls
     assert ("inventory_deactivate", "gid/DUP/i43", MAG) in m.calls
     assert ("inventory_set_quantities", "gid/DUP/i43", PROMO, 0) in m.calls
 
 
 # ---------------------------------------------------------------------------
-# 3) ACTIVE — a reconciled row is never re-applied (no re-inflate)
+# 3) ACTIVE — a stamped event is never re-applied (no re-inflate)
 # ---------------------------------------------------------------------------
 
-def test_active_does_not_reapply_reconciled_row(monkeypatch):
-    rows = [
-        _row("SKU1", "42", 2, reconciled=True, row_uuid="u-old"),   # already applied
-        _row("SKU1", "43", 1, reconciled=False, row_uuid="u-new"),  # fresh return
-    ]
-    sheet = FakeSheet(rows)
-    gid = "gid://shopify/Product/OUT"
+def test_active_does_not_reapply_a_stamped_event(monkeypatch):
+    w = World()
+    p_old, e_old = w.be.add_shelf_pair("SKU1", "42", reconciled=True,
+                                       price_outlet="50.00", price_high="100.00")
+    (e_new,) = w.returned("SKU1", "43")
     inv = [
         _inv_variant("v42", "42", "i42", [_level(PROMO, 2)]),
         _inv_variant("v43", "43", "i43", [_level(PROMO, 0)]),
     ]
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(gid, "ACTIVE")], "warning": None},
-                inv_by_gid={gid: inv})
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
+    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
+                inv_by_gid={OUT: inv})
+    plan, report = _preview_apply(w)
     assert plan.actions[0].branch == "ACTIVE"
-    report = outlet_service.publish_apply(sheet, object(), plan, promo_location_id=PROMO)
-
     assert report.outcomes[0].status == "APPLIED"
-    # only the fresh size-43 delta is written; size-42 (reconciled) is untouched
     assert m.sets() == [("inventory_set_quantities", "i43", PROMO, 1)]
-    assert sheet.marked == [("u-new", "SKU1")]
+    assert report.outcomes[0].stamped_event_ids == (e_new,)
+    assert w.unstamped() == []
 
 
 # ---------------------------------------------------------------------------
-# 4) DELTA exactly-once — compare-mismatch (already applied) => no double
+# 4) A key's Δ is the SUM of its events; every event of the group is stamped
 # ---------------------------------------------------------------------------
 
-def test_delta_exactly_once_no_double_on_compare_mismatch(monkeypatch):
-    rows = [_row("SKU1", "42", 3, row_uuid="u1")]
-    sheet = FakeSheet(rows)
-    gid = "gid://shopify/Product/OUT"
-    inv_pre = [_inv_variant("v42", "42", "i42", [_level(PROMO, 0)])]   # preview: pre=0
-    inv_live = [_inv_variant("v42", "42", "i42", [_level(PROMO, 3)])]  # apply: already 3
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(gid, "ACTIVE")], "warning": None},
-                inv_by_gid={gid: inv_pre})
-
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
-    assert plan.actions[0].size_targets[0].frozen_pre == 0
-
-    m.inv_by_gid[gid] = inv_live  # external actor applied the +3 before apply
-    report = outlet_service.publish_apply(sheet, object(), plan, promo_location_id=PROMO)
-
-    # NO inventory set (would be the double); row still marked reconciled; anomaly surfaced
-    assert m.sets() == []
-    assert sheet.marked == [("u1", "SKU1")]
-    assert any(w.startswith("delta_already_applied") for w in report.outcomes[0].warnings)
+def test_a_key_group_sums_its_events_and_stamps_all_of_them(monkeypatch):
+    w = World()
+    e1, e2 = w.returned("SKU1", "42", 2)
+    e3 = w.be.consume("SKU1", "42")                       # a full-price sale: −1
+    inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 0)])]
+    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
+                inv_by_gid={OUT: inv})
+    plan, report = _preview_apply(w)
+    (st,) = plan.actions[0].size_targets
+    assert st.delta == 1 and sorted(st.event_ids) == sorted([e1, e2, e3])
+    assert m.sets() == [("inventory_set_quantities", "i42", PROMO, 1)]
+    assert sorted(report.outcomes[0].stamped_event_ids) == sorted([e1, e2, e3])
 
 
 # ---------------------------------------------------------------------------
-# 5) DRAFT — drafted, no fresh return => sold-out skip + surface
+# 5) No Δ > 0 group → nothing planned, nothing written (Δ ≤ 0 is the decrement's)
 # ---------------------------------------------------------------------------
 
-def test_draft_sold_out_skips_and_surfaces(monkeypatch):
-    rows = [_row("SKU1", "42", 0, reconciled=False, row_uuid="u1")]  # non-reconciled, qta 0
-    sheet = FakeSheet(rows)
-    gid = "gid://shopify/Product/OUT"
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(gid, "DRAFT")], "warning": None})
-
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
-    assert plan.actions[0].branch == "DRAFT" and plan.actions[0].reason == "sold_out"
-    report = outlet_service.publish_apply(sheet, object(), plan, promo_location_id=PROMO)
-
-    assert report.outcomes[0].status == "SOLD_OUT"
-    # nothing mutated
+def test_no_positive_group_plans_nothing_and_writes_nothing(monkeypatch):
+    w = World()
+    p, _ = w.be.add_shelf_pair("SKU1", "42", reconciled=True)
+    e0 = w.be.consume("SKU1", "42", outlet_line=True)      # Δ 0: an outlet-line sale
+    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "DRAFT")], "warning": None})
+    plan, report = _preview_apply(w)
+    assert plan.actions == () and report.outcomes == ()
     assert not any(n in _MUTATION_OPS for n in m.names)
-    assert sheet.marked == []
+    assert w.unstamped() == [e0]
 
 
 # ---------------------------------------------------------------------------
@@ -337,90 +329,105 @@ def test_draft_sold_out_skips_and_surfaces(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_toctou_branch_drift_aborts_verify_failed(monkeypatch):
-    rows = [_row("SKU1", "42", 2, row_uuid="u1")]
-    sheet = FakeSheet(rows)
-    gid = "gid://shopify/Product/OUT"
+    w = World()
+    w.returned("SKU1", "42", 2)
     inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 0)])]
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(gid, "ACTIVE")], "warning": None},
-                inv_by_gid={gid: inv})
-
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
+    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
+                inv_by_gid={OUT: inv})
+    reg = w.register()
+    plan = outlet_service.publish_preview(reg, object(), promo_location_id=PROMO)
     assert plan.actions[0].branch == "ACTIVE"
-
-    m.outlet = {"matches": [_outlet_match(gid, "DRAFT")], "warning": None}  # drift ACTIVE->DRAFT
-    report = outlet_service.publish_apply(sheet, object(), plan, promo_location_id=PROMO)
-
+    m.outlet = {"matches": [_outlet_match(OUT, "DRAFT")], "warning": None}  # drift ACTIVE->DRAFT
+    report = outlet_service.publish_apply(reg, object(), plan, promo_location_id=PROMO)
     assert report.outcomes[0].status == "VERIFY_FAILED"
-    # no publish / activate / inventory mutation executed
     assert not any(n in _MUTATION_OPS for n in m.names)
-    assert sheet.marked == []
+    assert len(w.unstamped()) == 2
 
 
 # ---------------------------------------------------------------------------
 # 7) FIX4 — price 0 and price >= compareAt both BLOCK publish
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("outlet_price,high", [("0.00", "100.00"), ("120.00", "100.00")])
+@pytest.mark.parametrize("outlet_price,high", [("0.00", "100.00"), ("120.00", "100.00"), (None, "100.00")])
 def test_fix4_invalid_price_blocks_publish(monkeypatch, outlet_price, high):
-    rows = [_row("SKU1", "42", 2, prezzo_outlet=outlet_price, prezzo_high=high)]
-    sheet = FakeSheet(rows)
+    w = World()
+    w.returned("SKU1", "42", 2, price_outlet=outlet_price, price_high=high)
     m = OpsMock(monkeypatch,
                 source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
                 source_variants=[_src_variant("V42", "42", "IIT42")])
-
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
+    plan, report = _preview_apply(w)
     act = plan.actions[0]
     assert act.publishable is False and act.reason == "price_invalid"
-    report = outlet_service.publish_apply(sheet, object(), plan, promo_location_id=PROMO)
-
     assert report.outcomes[0].status == "PRICE_INVALID"
-    assert "product_duplicate" not in m.names  # never created
+    assert "product_duplicate" not in m.names
+    assert len(w.unstamped()) == 2
 
 
 # ---------------------------------------------------------------------------
-# 8) FIX5 — variant matched by SIZE (primary), SKU mismatch only surfaced
+# 8) Size-primary match, now EXACT (§3.2): SKU mismatch only surfaced
 # ---------------------------------------------------------------------------
 
-def test_fix5_size_primary_match_ignores_sku(monkeypatch):
-    # size-42 variant carries a DIFFERENT sku ("ZZZ"); SKU-equality-first would
-    # pick the size-43 variant (sku "SKU1"). Size-primary must pick V42.
-    rows = [_row("SKU1", "42", 2)]
-    sheet = FakeSheet(rows)
+def test_size_primary_exact_match_ignores_sku(monkeypatch):
+    w = World()
+    w.returned("SKU1", "42", 2)
     src = [_src_variant("V42", "42", "IIT42", sku="ZZZ"),
            _src_variant("V43", "43", "IIT43", sku="SKU1")]
     dup_inv = [_inv_variant("dV42", "42", "dI42", [_level(PROMO, 0)]),
                _inv_variant("dV43", "43", "dI43", [_level(PROMO, 0)])]
     m = OpsMock(monkeypatch,
                 source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
-                source_variants=src, inv_by_gid={"gid://shopify/Product/DUP": dup_inv})
-
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
+                source_variants=src, inv_by_gid={"gid://shopify/Product/900": dup_inv})
+    plan, _ = _preview_apply(w)
     st = plan.actions[0].size_targets[0]
-    assert st.norm_size == "42" and st.matched is True and st.variant_id == "V42"
-    assert any(w.startswith("sku_mismatch_on_size:42") for w in plan.actions[0].warnings)
-
-    outlet_service.publish_apply(sheet, object(), plan, promo_location_id=PROMO)
-    # apply matched the size-42 duplicate variant (dI42) for the delta, by size not sku
+    assert st.size == "42" and st.matched is True and st.variant_id == "V42"
+    assert any(x.startswith("sku_mismatch_on_size:42") for x in plan.actions[0].warnings)
     assert ("inventory_set_quantities", "dI42", PROMO, 2) in m.calls
 
 
+def test_a_spelling_twin_is_surfaced_never_published(monkeypatch):
+    w = World()
+    (e_twin,) = w.returned("AR-K-33PC", "42L")
+    (e_ok,) = w.returned("AR-K-33PC", "43")
+    inv = [_inv_variant("v42", "42 L", "i42", [_level(PROMO, 0)]),
+           _inv_variant("v43", "43", "i43", [_level(PROMO, 0)])]
+    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
+                inv_by_gid={OUT: inv})
+    plan, report = _preview_apply(w)
+    act = plan.actions[0]
+    assert act.unmatched_sizes == ("42L",)
+    assert "size_twin:42L:42 L" in act.warnings
+    assert m.sets() == [("inventory_set_quantities", "i43", PROMO, 1)]   # never "42 L"
+    assert report.outcomes[0].stamped_event_ids == (e_ok,)
+    assert w.unstamped() == [e_twin]                                     # pending, surfaced
+
+
+def test_customisation_only_variant_never_matches(monkeypatch):
+    w = World()
+    (e,) = w.returned("SKU1", "Solo Personalizzazione")
+    inv = [_inv_variant("vc", "Solo Personalizzazione", "ic", [_level(PROMO, 0)])]
+    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
+                inv_by_gid={OUT: inv})
+    plan, _ = _preview_apply(w)
+    assert plan.actions[0].unmatched_sizes == ("Solo Personalizzazione",)
+    assert m.sets() == [] and w.unstamped() == [e]
+
+
 # ---------------------------------------------------------------------------
-# 9) DRY_RUN — preview mutates NOTHING (Shopify nor Sheet)
+# 9) DRY_RUN — preview mutates NOTHING (Shopify nor register)
 # ---------------------------------------------------------------------------
 
 def test_dry_run_preview_is_read_only(monkeypatch):
-    rows = [_row("SKU1", "42", 2)]
-    sheet = FakeSheet(rows)
+    w = World()
+    w.returned("SKU1", "42", 2)
     m = OpsMock(monkeypatch,
                 source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
                 source_variants=[_src_variant("V42", "42", "IIT42")])
-
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
-
+    w.be.db.log.clear()
+    plan = outlet_service.publish_preview(w.register(), object(), promo_location_id=PROMO)
     assert plan.dry_run is True and plan.actions[0].branch == "CREATE"
-    assert sheet.reads == [False]              # assign_uuids=False (no uuid minting)
-    assert sheet.marked == []                  # no reconciliation write
-    assert not any(n in _MUTATION_OPS for n in m.names)  # no Shopify mutation
+    assert w.writes() == []                                    # no lease, no write, no stamp
+    assert not any(x[0].startswith("lease") for x in w.be.db.log)
+    assert not any(n in _MUTATION_OPS for n in m.names)
 
 
 # ---------------------------------------------------------------------------
@@ -448,174 +455,239 @@ def test_main_run_sync_dry_run_unset_does_not_mutate(monkeypatch):
     assert recorded == {"dry_run": True}
 
 
+def test_legacy_run_mode_sync_is_retired():
+    with pytest.raises(RuntimeError):
+        outlet_service.run(dry_run=True)
+
+
 # ---------------------------------------------------------------------------
 # POST-REVIEW FIXES (fix1..fix6) — business-critical publish-outlet hardening
 # ---------------------------------------------------------------------------
 
-# fix1 — productDuplicate(newStatus=DRAFT): the duplicate is DRAFT atomically at
-# creation, never inheriting the ACTIVE source's status (2025-07 semantics).
-
 def test_create_duplicate_is_draft_atomically_fix1(monkeypatch):
-    """The duplicate's FIRST modeled status transition is DRAFT (mirroring the
-    real newStatus=DRAFT arg on productDuplicate); the LAST is the explicit
-    ACTIVE flip — never a no-op, since the duplicate never started ACTIVE."""
-    rows = [_row("SKU1", "42", 2)]
-    sheet = FakeSheet(rows)
+    w = World()
+    w.returned("SKU1", "42", 2)
     m = OpsMock(
         monkeypatch,
         source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
         source_variants=[_src_variant("V42", "42", "IIT42")],
-        inv_by_gid={"gid://shopify/Product/DUP": [_inv_variant("dV42", "42", "dI42", [_level(PROMO, 0)])]},
+        inv_by_gid={"gid://shopify/Product/900": [_inv_variant("dV42", "42", "dI42", [_level(PROMO, 0)])]},
     )
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
-    report = outlet_service.publish_apply(sheet, object(), plan, promo_location_id=PROMO)
-
+    _, report = _preview_apply(w)
     assert report.outcomes[0].status == "APPLIED"
     assert m.status_history[0] == (m.new_gid, "DRAFT")
     assert m.status_history[-1] == (m.new_gid, "ACTIVE")
     assert m.status_by_gid[m.new_gid] == "ACTIVE"
 
 
-# fix2 — DRAFT-revive quarantine gate (mirrors ACTIVE's _has_non_promo_stock).
-
 def test_draft_revive_quarantines_non_promo_stock_fix2(monkeypatch):
-    """A DRAFT outlet that inherited stock at a location != Promo must NOT be
-    revived/published with that phantom stock — it goes to QUARANTINED."""
-    rows = [_row("SKU1", "42", 2, row_uuid="u1")]
-    sheet = FakeSheet(rows)
-    gid = "gid://shopify/Product/OUT"
+    w = World()
+    w.returned("SKU1", "42", 2)
     inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 0), _level(MAG, 3)])]
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(gid, "DRAFT")], "warning": None},
-                inv_by_gid={gid: inv})
-
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
+    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "DRAFT")], "warning": None},
+                inv_by_gid={OUT: inv})
+    plan, report = _preview_apply(w)
     assert plan.actions[0].branch == "DRAFT"
-    assert plan.actions[0].reason == "quarantine"
-    assert plan.actions[0].publishable is False
-
-    report = outlet_service.publish_apply(sheet, object(), plan, promo_location_id=PROMO)
+    assert plan.actions[0].reason == "quarantine" and plan.actions[0].publishable is False
     assert report.outcomes[0].status == "QUARANTINED"
     assert not any(n in _MUTATION_OPS for n in m.names)
-    assert sheet.marked == []
+    assert len(w.unstamped()) == 2
 
 
-# fix3 — per-action isolation: an unexpected exception (e.g. RuntimeError from a
-# read op) is bounded to that sku's ERROR outcome; the batch always continues.
+def test_draft_revive_adds_on_the_live_level_then_activates_last(monkeypatch):
+    w = World()
+    (e,) = w.returned("SKU1", "42")
+    inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 1)])]
+    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "DRAFT")], "warning": None},
+                inv_by_gid={OUT: inv})
+    _, report = _preview_apply(w)
+    assert report.outcomes[0].status == "REVIVED"
+    assert m.sets() == [("inventory_set_quantities", "i42", PROMO, 2)]    # E9: live + Δ
+    assert m.names[-2:] == ["product_update_status", "product_publish"]
+    assert report.outcomes[0].stamped_event_ids == (e,)
+
 
 def test_error_isolation_runtime_error_does_not_abort_batch_fix3(monkeypatch):
-    rows = [_row("SKU1", "42", 2, row_uuid="u1"), _row("SKU2", "42", 1, row_uuid="u2")]
-    sheet = FakeSheet(rows)
-    gid2 = "gid://shopify/Product/OUT2"
-    m = OpsMock(
+    w = World()
+    w.returned("SKU1", "42", 1)
+    (e2,) = w.returned("SKU2", "42", 1)
+    gid2 = "gid://shopify/Product/502"
+    OpsMock(
         monkeypatch,
-        outlet={"matches": [], "warning": None},  # SKU1: no outlet -> CREATE via source
+        outlet={"matches": [], "warning": None},
         source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
         source_variants=[_src_variant("V42", "42", "IIT42", sku="SKU1")],
         outlet_by_sku={"SKU2": {"matches": [_outlet_match(gid2, "ACTIVE")], "warning": None}},
         inv_by_gid={gid2: [_inv_variant("v42", "42", "i42", [_level(PROMO, 0)])]},
-        # the CREATE branch's post-duplicate inventory read blows up mid-execution.
-        read_inv_raises={"gid://shopify/Product/DUP": RuntimeError("boom")},
+        read_inv_raises={"gid://shopify/Product/900": RuntimeError("boom")},
     )
-
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
+    plan, report = _preview_apply(w)
     assert {a.sku: a.branch for a in plan.actions} == {"SKU1": "CREATE", "SKU2": "ACTIVE"}
-
-    report = outlet_service.publish_apply(sheet, object(), plan, promo_location_id=PROMO)
     by_sku = {o.sku: o for o in report.outcomes}
-
     assert by_sku["SKU1"].status == "ERROR"
-    assert any(w.startswith("unexpected_error:RuntimeError") for w in by_sku["SKU1"].warnings)
-    # SKU2 is NOT aborted by SKU1's failure — the batch continues and applies it.
+    assert any(x.startswith("unexpected_error:RuntimeError") for x in by_sku["SKU1"].warnings)
     assert by_sku["SKU2"].status == "APPLIED"
-    assert sheet.marked == [("u2", "SKU2")]
+    assert by_sku["SKU2"].stamped_event_ids == (e2,)
 
-
-# fix4 — publication resolved EAGER/fail-fast, before any mutation.
 
 def test_publication_resolved_eager_before_any_mutation_fix4(monkeypatch):
-    rows = [_row("SKU1", "42", 2)]
-    sheet = FakeSheet(rows)
+    w = World()
+    w.returned("SKU1", "42", 2)
     m = OpsMock(
         monkeypatch,
         source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
         source_variants=[_src_variant("V42", "42", "IIT42")],
-        inv_by_gid={"gid://shopify/Product/DUP": [_inv_variant("dV42", "42", "dI42", [_level(PROMO, 0)])]},
+        inv_by_gid={"gid://shopify/Product/900": [_inv_variant("dV42", "42", "dI42", [_level(PROMO, 0)])]},
     )
 
     def _boom(_t):
         raise RuntimeError("Online Store publication not found")
 
     monkeypatch.setattr(ops, "get_online_store_publication_id", _boom)
-
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
-    report = outlet_service.publish_apply(sheet, object(), plan, promo_location_id=PROMO)
-
-    assert len(report.outcomes) == 1
-    assert report.outcomes[0].status == "ERROR"
-    assert any(w.startswith("publication_resolve_failed") for w in report.outcomes[0].warnings)
-    # clean abort: resolved BEFORE the loop, so NOTHING was ever mutated.
+    _, report = _preview_apply(w)
+    assert len(report.outcomes) == 1 and report.outcomes[0].status == "ERROR"
+    assert any(x.startswith("publication_resolve_failed") for x in report.outcomes[0].warnings)
     assert not any(n in _MUTATION_OPS for n in m.names)
-    assert sheet.marked == []
+    assert len(w.unstamped()) == 2
 
-
-# fix5 — read_variant_inventory now selects `sku`, so the secondary cross-check
-# fires on ACTIVE/DRAFT too (previously a no-op there).
 
 def test_fix5_sku_cross_check_fires_on_active_branch(monkeypatch):
-    rows = [_row("SKU1", "42", 2)]
-    sheet = FakeSheet(rows)
-    gid = "gid://shopify/Product/OUT"
+    w = World()
+    w.returned("SKU1", "42", 2)
     inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 0)], sku="OTHER-SKU")]
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(gid, "ACTIVE")], "warning": None},
-                inv_by_gid={gid: inv})
-
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
+    OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
+            inv_by_gid={OUT: inv})
+    plan = outlet_service.publish_preview(w.register(), object(), promo_location_id=PROMO)
     st = plan.actions[0].size_targets[0]
-    assert st.matched is True and st.norm_size == "42"
-    assert any(w.startswith("sku_mismatch_on_size:42:OTHER-SKU") for w in plan.actions[0].warnings)
+    assert st.matched is True and st.size == "42"
+    assert any(x.startswith("sku_mismatch_on_size:42:OTHER-SKU") for x in plan.actions[0].warnings)
 
-
-# fix6(a) — DELTA compare-mismatch, STRICT case: base_v < live_v < target.
-
-def test_delta_exactly_once_strict_mismatch_below_target_fix6a(monkeypatch):
-    rows = [_row("SKU1", "42", 3, row_uuid="u1")]
-    sheet = FakeSheet(rows)
-    gid = "gid://shopify/Product/OUT"
-    inv_pre = [_inv_variant("v42", "42", "i42", [_level(PROMO, 0)])]   # preview: frozen_pre=0
-    inv_live = [_inv_variant("v42", "42", "i42", [_level(PROMO, 1)])]  # apply: live=1 (0 < 1 < 3)
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(gid, "ACTIVE")], "warning": None},
-                inv_by_gid={gid: inv_pre})
-
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
-    assert plan.actions[0].size_targets[0].frozen_pre == 0
-
-    m.inv_by_gid[gid] = inv_live
-    report = outlet_service.publish_apply(sheet, object(), plan, promo_location_id=PROMO)
-
-    assert m.sets() == []  # neither the target set nor a re-add was issued
-    assert sheet.marked == []  # not marked reconciled — genuinely ambiguous, needs re-preview
-    assert any(w.startswith("delta_compare_mismatch:42") for w in report.outcomes[0].warnings)
-
-
-# fix6(b) — QUARANTINED: CREATE whose duplicate's inventory read is truncated
-# (UNKNOWN level set -> cannot guarantee non-Promo cleanup).
 
 def test_create_quarantines_when_levels_truncated_after_duplicate_fix6b(monkeypatch):
-    rows = [_row("SKU1", "42", 2)]
-    sheet = FakeSheet(rows)
-    dup_gid = "gid://shopify/Product/DUP"
+    w = World()
+    w.returned("SKU1", "42", 2)
+    dup_gid = "gid://shopify/Product/900"
     m = OpsMock(
         monkeypatch,
         source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
         source_variants=[_src_variant("V42", "42", "IIT42")],
         inv_by_gid={dup_gid: [_inv_variant("dV42", "42", "dI42", [_level(PROMO, 0)], truncated=True)]},
     )
-    plan = outlet_service.publish_preview(sheet, object(), promo_location_id=PROMO)
-    report = outlet_service.publish_apply(sheet, object(), plan, promo_location_id=PROMO)
-
+    _, report = _preview_apply(w)
     assert report.outcomes[0].status == "QUARANTINED"
-    assert any(w.startswith("quarantine:levels_truncated") for w in report.outcomes[0].warnings)
-    # the duplicate WAS created (that's how the truncation was discovered), but no
-    # further mutation (zero/disconnect/DENY/activate/publish) was ever issued.
+    assert any(x.startswith("quarantine:levels_truncated") for x in report.outcomes[0].warnings)
     assert {n for n in m.names if n in _MUTATION_OPS} == {"product_duplicate"}
-    assert sheet.marked == []
+    assert len(w.unstamped()) == 2
+
+
+# ---------------------------------------------------------------------------
+# The register side of the apply (F7)
+# ---------------------------------------------------------------------------
+
+def test_preview_refuses_before_the_whole_register_baseline(monkeypatch):
+    from tests.register_fixtures import MemoryBackend as Fresh
+
+    be = Fresh()                                  # no BASELINE row
+    be.add_shelf_pair("SKU1", "42")
+    OpsMock(monkeypatch)
+    with pytest.raises(BaselineMissing):
+        outlet_service.publish_preview(be.register(), object(), promo_location_id=PROMO)
+
+
+def test_each_stamp_is_carried_by_its_reconcile_row_in_one_transaction(monkeypatch):
+    w = World()
+    (e,) = w.returned("SKU1", "42")
+    inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 3)])]
+    OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
+            inv_by_gid={OUT: inv})
+    w.be.db.log.clear()
+    _preview_apply(w)
+    assert w.writes() == ["renew", "insert_audit", "stamp", "commit"]
+    (row,) = w.register().reconcile_rows()
+    assert row.status == DONE and row.action == "add" and row.product_id == 500
+    assert row.payload["event_ids"] == [e] and row.keys == (("SKU1", "42"),)
+    assert (row.payload["level_before"], row.payload["level_after"]) == (3, 4)
+    assert row.lease_gen == 1
+
+
+def test_a_held_positive_key_is_never_added(monkeypatch):
+    w = World()
+    (e_held,) = w.returned("SKU1", "42")
+    (e_free,) = w.returned("SKU1", "43")
+    w.be.seed_audit(InsertAudit(
+        kind="HOLD", actor="t", action="hold",
+        payload={"keys": [["SKU1", "42"]], "reason": "moved", "event_ids": [e_held]}))
+    inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 0)]),
+           _inv_variant("v43", "43", "i43", [_level(PROMO, 0)])]
+    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
+                inv_by_gid={OUT: inv})
+    plan, report = _preview_apply(w)
+    assert [st.size for st in plan.actions[0].size_targets] == ["43"]
+    assert m.sets() == [("inventory_set_quantities", "i43", PROMO, 1)]
+    assert w.unstamped() == [e_held]
+
+
+def test_a_baseline_held_key_with_a_post_hold_return_is_surfaced_not_added(monkeypatch):
+    from tests.register_fixtures import MemoryBackend as Fresh
+
+    be = Fresh()
+    _, e_snap = be.add_shelf_pair("SKU1", "42")                 # held with the snapshot
+    be.seed_baseline(held=[{"key": ["SKU1", "42"], "reason": "moved", "event_ids": [e_snap]}])
+    _, e_new = be.add_shelf_pair("SKU1", "42", price_outlet="50.00", price_high="100.00")
+    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None})
+    plan = outlet_service.publish_preview(be.register(), object(), promo_location_id=PROMO)
+    assert plan.actions == ()
+    assert "held_positive:SKU1:42:1" in plan.anomalies
+    assert {h.kind for h in be.register().held_keys()} == {HOLD_BASELINE}
+    assert not any(n in _MUTATION_OPS for n in m.names)
+
+
+def test_the_keyless_miss_is_surfaced_never_stamped(monkeypatch):
+    w = World()
+    e = w.be.consume("NOPE", "40")
+    OpsMock(monkeypatch)
+    plan, _ = _preview_apply(w)
+    assert plan.anomalies == (f"consume_miss:{e}",)
+    assert w.unstamped() == [e]
+
+
+def test_lease_unavailable_writes_nothing(monkeypatch):
+    w = World()
+    w.returned("SKU1", "42")
+    inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 0)])]
+    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
+                inv_by_gid={OUT: inv})
+    reg = w.register()
+    plan = outlet_service.publish_preview(reg, object(), promo_location_id=PROMO)
+    other = PassLease(w.register(), "decrement")
+    other.take()                                            # another pass holds it
+    report = outlet_service.publish_apply(reg, object(), plan, promo_location_id=PROMO)
+    assert [o.warnings for o in report.outcomes] == [("lease_unavailable",)]
+    assert not any(n in _MUTATION_OPS for n in m.names)
+    assert len(w.unstamped()) == 1
+
+
+def test_a_lost_lease_stops_the_apply(monkeypatch):
+    w = World()
+    (e1,) = w.returned("SKU1", "42")
+    w.returned("SKU2", "42")
+    gid2 = "gid://shopify/Product/502"
+    m = OpsMock(
+        monkeypatch,
+        outlet_by_sku={"SKU1": {"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
+                       "SKU2": {"matches": [_outlet_match(gid2, "ACTIVE")], "warning": None}},
+        inv_by_gid={OUT: [_inv_variant("v1", "42", "i1", [_level(PROMO, 0)])],
+                    gid2: [_inv_variant("v2", "42", "i2", [_level(PROMO, 0)])]},
+    )
+
+    def expire_after_first_write(item, loc, qty):
+        if item == "i1":
+            w.be.advance(400_000)                           # the lease expires mid-SKU
+            PassLease(w.register(), "decrement").take()     # and is taken over
+
+    m.on_set = expire_after_first_write
+    _, report = _preview_apply(w)
+    assert [(o.sku, o.status, o.warnings) for o in report.outcomes] == [
+        ("SKU1", "ERROR", ("lease_lost",)), ("SKU2", "ERROR", ("lease_lost",))]
+    assert ("inventory_set_quantities", "i2", PROMO, 1) not in m.calls      # SKU2 never written
+    assert e1 in w.unstamped()                       # the stamp after the take-over rolled back

@@ -91,10 +91,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 from backend.gsheet import GSheetError
-from backend.services.outlet_service import (
-    _SIZE_OPTION_NAMES,
-    _has_non_promo_stock,
-    _promo_available,
+from backend.services.variants import (
+    SIZE_OPTION_NAMES as _SIZE_OPTION_NAMES,
+    has_non_promo_stock as _has_non_promo_stock,
+    promo_available as _promo_available,
 )
 from backend.shopify import ops
 from backend.shopify.ops import ShopifyUserError

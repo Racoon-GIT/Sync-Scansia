@@ -84,10 +84,17 @@ def _register_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(Exception, _boundary_handler)
 
 
+def _register_not_configured() -> Any:
+    """Production default until the MySQL adapter is wired (F7 §4 step 3):
+    fail-closed — a publish job reports ``config_error``, nothing is written."""
+    raise ConfigError("register database not configured")
+
+
 def create_app(
     *,
     config: Optional[ShopifyConfig] = None,
     sheet_factory: Optional[Callable[[], Any]] = None,
+    register_factory: Optional[Callable[[], Any]] = None,
     transport_factory: Optional[Callable[[], Any]] = None,
     audit_factory: Optional[Callable[[], Any]] = None,
     executor: Optional[Any] = None,
@@ -117,6 +124,8 @@ def create_app(
             state.transport_factory = lambda: ShopifyTransport(cfg)
         if state.sheet_factory is None:
             state.sheet_factory = ScansiaSheet.open
+        if state.register_factory is None:
+            state.register_factory = _register_not_configured
         if state.audit_factory is None:
             state.audit_factory = lambda: GSheetAuditSink.from_scansia_sheet(state.sheet_factory())
         if state.executor is None:
@@ -137,6 +146,7 @@ def create_app(
 
     app.state.config = config
     app.state.sheet_factory = sheet_factory
+    app.state.register_factory = register_factory
     app.state.transport_factory = transport_factory
     app.state.audit_factory = audit_factory
     app.state.executor = executor

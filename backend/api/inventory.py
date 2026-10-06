@@ -41,11 +41,11 @@ from zoneinfo import ZoneInfo
 from backend.gsheet import ScansiaSheet
 from backend.gsheet.reader import GSheetError
 from backend.services import resolvers
-from backend.services.outlet_service import (
-    _match_variant,
-    _norm_size,
-    _promo_available,
-    _variant_size_index,
+from backend.services.variants import (
+    legacy_match_variant as _match_variant,
+    legacy_norm_size as _norm_size,
+    legacy_variant_size_index as _variant_size_index,
+    promo_available as _promo_available,
 )
 from backend.shopify import ops
 from backend.shopify.ops import ShopifyUserError

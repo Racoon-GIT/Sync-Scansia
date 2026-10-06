@@ -44,7 +44,7 @@ from backend.auth.basic_auth import require_basic_auth
 from backend.persistence.gsheet_audit import GSheetAuditSink
 from backend.services import init_service
 from backend.services.delete_service import CONFIRM_WORD
-from backend.services.outlet_service import _norm_size
+from backend.services.variants import legacy_norm_size as _norm_size
 
 PREFIX = "/init"
 KIND_PREVIEW = "init_preview"

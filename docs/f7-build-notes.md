@@ -33,21 +33,50 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   test fixture, never printed, never opened with a tool. The fixture refuses to run unless `DATABASE()` is
   `racoon_staging`. Server: `78.46.244.227:3306`, TLS `VERIFY_IDENTITY` against `IT/SERVER/racoon-internal-ca.pem`.
 
+## Code layering (§4.2, the lane's)
+
+- `RegisterPort` (§3.1's operations) is implemented ONCE, by `backend/persistence/register.py` `Register`, over a
+  small `RegisterStore` (`ports.py`): plain non-locking reads, the three lease statements, and ONE write primitive
+  `fenced_write(fence, ops)` — the guarded renew, then ops from a closed algebra (`records.py`: `InsertAudit`,
+  `UpdateAudit`, `StampEvents`, `UpdatePairs`), at most one register op and it is last (§3.7 rule 1), every guard
+  counting rows MATCHED (`GuardMismatch` rolls the whole transaction back). Two stores: `memory_store.py` (the test
+  fake, MySQL semantics: atomic transactions, server clock, JSON keys re-ordered as MySQL does) and the MySQL one
+  (§4.3); `tests/test_register_store.py` is their shared contract.
+- Holds are derived from audit rows, never stored: the whole-register `BASELINE` row's `PAYLOAD.held`, `RECONCILE`
+  rows `HELD`, `HOLD` rows, and every `RECONCILE` row `OPEN`/`APPLIED` (the in-flight hold). A per-key `BASELINE`
+  row releases that key's baseline / recovery / `HOLD` holds with a LOWER row id, never an in-flight one. Holds a
+  re-level's confirm makes are `HOLD` rows; `BASELINE` rows only define (whole-register) or release (per key).
+- `PAYLOAD` conventions: `keys` [[SKU, SIZE], …] and `event_ids` on `RECONCILE` / `HOLD` rows; `scope`
+  (`register` | `key`), `key`, `held` [{key, reason, event_ids}] on `BASELINE` rows. A stamp is always carried by
+  an audit row in its transaction: a new `RECONCILE` row (a stamp with no Shopify write: `STATUS DONE` at insert)
+  or the close of `APPLIED` rows; the N-0 release writes its per-key `BASELINE` row even on a key not held.
+- The lease client (`backend/services/lease.py`) reads the renew's START on the holder's own monotonic clock.
+
 ## Parameters the plan proposes, fixed here (each one tested)
 
 - Re-send window margin 1 h (§3.3 rule 2): the window is the first `SENT_AT` + 23 h.
 - Session `wait_timeout` 60 s, `innodb_lock_wait_timeout` 5 s (§3.7 rules 4–5).
 - `GROUP_ID` = `LEASE_GEN × 10^6 + n` (the n-th group of that take): unique with no sequence table; a
   `SUPERSEDED` row's successor inherits its group's id (§3.3 rule 2); a remainder is a new group of its pass.
-- Lease TTL and the local-deadline margin: fixed at §4.3 — the expiry exceeds the longest single Shopify call with
-  its retries (rule 6), measured on `transport.py`'s timeouts.
+- Lease (`lease.py`, tested in `tests/test_lease.py`): the longest single Shopify call with its retries, on
+  `transport.py`'s constants, is a read — 5 × 30 s timeout + backoffs 1+2+4+8+8 s + 5 × 0.7 s ≈ 177 s (a mutation is
+  never re-posted blind, rule 9). TTL 300 s; keepalive renews before a call once 60 s have passed since the last
+  renew (every call starts with ≥ 240 s left > 177 s); a send must start within TTL − 60 s of its renew. The
+  decrement's waiter flag lives 60 s, refreshed every 2 s poll; it waits at most TTL + 60 s (a crashed holder's
+  expiry) before ending its run, surfaced; a releasing holder waits up to 600 s to re-take.
+- Customisation-only (rule 7): an option value or variant title containing "personalizzazione", case-folded — the
+  three measured spellings (`measures/2026-09-30-f7/c7_join_sku_size.csv:2272-2274`) and any other.
+- Exact size (§3.2): `SIZE` == the variant's `title` (what an order sends as `variant_title`); a twin is a title
+  equal after case-fold, comma → dot and inner-space removal — §3.2's list, nothing more.
 - Admin API pin: the newest stable version on the build day (`2026-10` per E15) — re-read
   shopify.dev/docs/api/usage/versioning on the day it is pinned.
 
 ## Facts read during the build (source, date)
 
 - `sc_returned_pair_event.PAIR_ID` is `INT UNSIGNED NULL` (SERVER's A04 = STOCK_Manager's DDL at `92f6f90`,
-  2026-10-06): an event with no pair has no (SKU, SIZE) key. Open: which event types can carry it NULL (design
-  §2.2) — until read, `pending_deltas()` surfaces such an event and never stamps it.
+  2026-10-06): an event with no pair has no (SKU, SIZE) key. Read 2026-10-06: NULL **only** for `CONSUME_MISS`
+  (design §2.2 at `92f6f90`), whose `OUTLET_DELTA` is always 0 (SP spec step 4, `scansia-sp-spec.md:200-202` at
+  `92f6f90`; the live CONSUME text, SERVER A07). `pending_deltas()` returns such events apart (`keyless`):
+  surfaced, never grouped, never stamped.
 - Render `scansia-manager` deploys `main` on commit (`scansia-f6`, 2026-10-06 14:23Z): this branch deploys nothing;
   `main` is production and stays out of F7.2.

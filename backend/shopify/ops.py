@@ -624,6 +624,7 @@ query($id: ID!, $variantsFirst: Int!, $levelsFirst: Int!, $variantsAfter: String
         nodes {
           id
           sku
+          title
           inventoryPolicy
           selectedOptions { name value }
           inventoryItem {
@@ -682,6 +683,7 @@ def read_variant_inventory(
         {
           "id": <variant GID>,
           "sku": <variant sku>,                     # fix5: secondary cross-check key
+          "title": <variant title>,                 # F7 §3.2: the exact-size match key
           "inventoryPolicy": "DENY" | "CONTINUE",   # on the VARIANT (not the item)
           "selectedOptions": [{"name","value"}, ...],
           "inventoryItemId": <inventory item GID>,
@@ -734,6 +736,7 @@ def read_variant_inventory(
                 {
                     "id": vn["id"],
                     "sku": vn.get("sku"),
+                    "title": vn.get("title"),
                     "inventoryPolicy": vn.get("inventoryPolicy"),
                     "selectedOptions": vn.get("selectedOptions") or [],
                     "inventoryItemId": inv_item.get("id"),

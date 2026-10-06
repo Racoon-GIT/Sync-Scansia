@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from backend.auth.basic_auth import AuthError, AuthNotConfigured
 from backend.config import ConfigError
 from backend.gsheet.reader import CutoverNotDoneError, GSheetError, SheetIOError
+from backend.persistence.records import BaselineMissing, LeaseLost, StoreError
+from backend.services.lease import LeaseUnavailable
 from backend.services.delete_service import (
     DeleteConfirmationError,
     PromoAnchorError,
@@ -44,6 +46,10 @@ CODE_SHOPIFY_TRANSPORT_ERROR = "shopify_transport_error"
 CODE_PROMO_ANCHOR_MISSING = "promo_anchor_missing"
 CODE_DELETE_CONFIRMATION_REQUIRED = "delete_confirmation_required"
 CODE_SINGLE_DELETE_NOT_OUTLET = "single_delete_not_outlet"
+CODE_BASELINE_MISSING = "baseline_missing"
+CODE_LEASE_LOST = "lease_lost"
+CODE_PASS_BUSY = "pass_busy"
+CODE_REGISTER_ERROR = "register_error"
 CODE_INTERNAL_ERROR = "internal_error"
 
 
@@ -94,6 +100,16 @@ def map_exception(exc: BaseException) -> ApiError:
         # HARDENING (post-review): the single-delete escape hatch refused a GID
         # that does not resolve to an outlet — never a delete, always a 409.
         return ApiError(409, CODE_SINGLE_DELETE_NOT_OUTLET, "Target does not resolve to an outlet product.")
+    if isinstance(exc, BaselineMissing):
+        # The reader refuses publish and decrement before the whole-register
+        # BASELINE row ("Inizializza" not run) — a precondition, never a fault.
+        return ApiError(409, CODE_BASELINE_MISSING, "Register baseline not recorded.")
+    if isinstance(exc, LeaseLost):
+        return ApiError(409, CODE_LEASE_LOST, "Another pass took over; nothing more was written.")
+    if isinstance(exc, LeaseUnavailable):
+        return ApiError(409, CODE_PASS_BUSY, "Another pass is running.")
+    if isinstance(exc, StoreError):
+        return ApiError(502, CODE_REGISTER_ERROR, "Register database error.")
     if isinstance(exc, CutoverNotDoneError):
         return ApiError(409, CODE_CUTOVER_NOT_DONE, "Sheet cutover not completed.")
     if isinstance(exc, SheetIOError):
@@ -133,5 +149,9 @@ __all__ = [
     "CODE_PROMO_ANCHOR_MISSING",
     "CODE_DELETE_CONFIRMATION_REQUIRED",
     "CODE_SINGLE_DELETE_NOT_OUTLET",
+    "CODE_BASELINE_MISSING",
+    "CODE_LEASE_LOST",
+    "CODE_PASS_BUSY",
+    "CODE_REGISTER_ERROR",
     "CODE_INTERNAL_ERROR",
 ]

@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -127,6 +127,21 @@ class MutationVertical:
     extra_fn: Optional[Callable[[Any], Dict[str, Any]]] = None
     make_audit: Optional[Callable[[Any, str], Callable[[Any], Any]]] = None
     make_gesture: Optional[Callable[[ApplyRequest], Callable[[Any], Optional[str]]]] = None
+    # The ``app.state`` factory of the store handle the closures receive first:
+    # ``register_factory`` (the register, MySQL) or ``sheet_factory`` (the
+    # verticals not yet moved off the sheet — F7 §4 step 4).
+    collaborator: str = "sheet_factory"
+
+
+def _close(handle: Any) -> None:
+    """End a store handle's connection (no connection outlives a job, F7 §3.7
+    rule 4). Handles without ``close`` (the sheet) are left as they are."""
+    close = getattr(handle, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - closing never masks the job's own outcome
+            logger.warning("store handle close failed")
 
 
 # =============================================================================
@@ -161,6 +176,7 @@ def _run_preview_job(
     from backend.api.errors import map_exception  # local import: keep module light
 
     store.mark_running(job_id)
+    sheet = None
     try:
         sheet = sheet_factory()
         transport = transport_factory()
@@ -182,6 +198,8 @@ def _run_preview_job(
         err = map_exception(e)
         logger.error("preview job %s failed: %s -> %s", job_id, type(e).__name__, err.error_code)
         store.mark_failed(job_id, err.error_code)
+    finally:
+        _close(sheet)
 
 
 def _run_apply_job(
@@ -206,6 +224,7 @@ def _run_apply_job(
     from backend.api.errors import map_exception  # local import: keep module light
 
     store.mark_running(job_id)
+    sheet = None
     try:
         sheet = sheet_factory()
         transport = transport_factory()
@@ -241,6 +260,8 @@ def _run_apply_job(
         err = map_exception(e)
         logger.error("apply job %s failed: %s -> %s", job_id, type(e).__name__, err.error_code)
         store.mark_failed(job_id, err.error_code)
+    finally:
+        _close(sheet)
 
 
 def _run_readonly_job(
@@ -292,6 +313,7 @@ def _run_mutation_job(
     from backend.api.errors import map_exception  # local import: keep module light
 
     store.mark_running(job_id)
+    sheet = None
     try:
         sheet = sheet_factory()
         transport = transport_factory()
@@ -302,6 +324,8 @@ def _run_mutation_job(
         err = map_exception(e)
         logger.error("mutation job %s failed: %s -> %s", job_id, type(e).__name__, err.error_code)
         store.mark_failed(job_id, err.error_code)
+    finally:
+        _close(sheet)
 
 
 # =============================================================================
@@ -324,7 +348,7 @@ def submit_preview(request: Request, spec: MutationVertical) -> Any:
         _run_preview_job,
         state.job_store,
         rec.job_id,
-        state.sheet_factory,
+        getattr(state, spec.collaborator),
         state.transport_factory,
         preview_fn,
         spec.plan_hash_fn,
@@ -363,7 +387,7 @@ def submit_apply(request: Request, spec: MutationVertical, body: ApplyRequest, a
         state.job_store,
         rec.job_id,
         body.plan_hash,
-        state.sheet_factory,
+        getattr(state, spec.collaborator),
         state.transport_factory,
         audit_builder,
         preview_fn,
