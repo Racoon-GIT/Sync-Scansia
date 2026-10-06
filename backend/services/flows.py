@@ -475,15 +475,19 @@ def _not_deny_tracked(inv: Sequence[Dict[str, Any]]) -> bool:
 
 
 def run_normalise(ctx: Context, row: AuditRow) -> str:
-    """DENY + tracked on every variant of the product (rule 7). A refusal closes
-    ``FAILED`` and, on an ACTIVE product still carrying a variant not DENY +
-    tracked, drafts it (terminal path (i))."""
+    """DENY + tracked on every variant of the product (rule 7) — with the SKU's
+    price and compare-at when the row carries them (the publish's ACTIVE branch:
+    the sheet era refreshed them on every variant). A refusal closes ``FAILED``
+    and, on an ACTIVE product still carrying a variant not DENY + tracked, drafts
+    it (terminal path (i))."""
     gid = product_gid(row.product_id)
+    p = L.payload(row)
+    prices = {"price": p["price"], "compareAtPrice": p.get("compare_at")} if p.get("price") is not None else {}
     try:
         inv = ctx.inventory(gid)
-        if _not_deny_tracked(inv):
+        if prices or _not_deny_tracked(inv):
             ctx.ledger.step(row, "1:normalise", lambda: ops.product_variants_bulk_update(
-                ctx.transport, gid, ops.deny_tracked_inputs(inv)))
+                ctx.transport, gid, ops.deny_tracked_inputs(inv, **prices)))
     except ShopifyUserError as e:
         status = ctx.ledger.close(ctx.ledger.reload(row), FAILED, refused=e.mutation)
         draft_if_unsafe(ctx, gid)

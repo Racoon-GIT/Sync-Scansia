@@ -465,6 +465,7 @@ def _settled(ctx: flows.Context, fresh: PlanAction, branch: str, gid: Optional[s
         ctx.register.set_online(ctx.ledger.lease, to_online, True)
     if fresh.price is not None:
         ctx.register.set_outlet_price(ctx.ledger.lease, fresh.sku, Decimal(fresh.price), None, only_missing=True)
+    flows.maybe_set_outlet_product(ctx, fresh.sku, ctx.resolve(fresh.sku))   # §3.1: any pass (a fresh CREATE is `review`)
     return ApplyOutcome(fresh.sku, branch, ok_status, gid, fresh.warnings, tuple(stamped))
 
 

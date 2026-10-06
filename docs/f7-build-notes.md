@@ -80,7 +80,9 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   write; `PAYLOAD.purpose` `add` / `lower` carry a signed `share` of the group's Δ; `zero`, `excess`, `custom`,
   `orphan`, `nonpromo`, `relevel` carry an absolute `target` and compute the delta at the send from the live
   read), `activate` (explicit 0/0, only on an absent or inactive level), `deactivate` (no key), the state rows
-  `create`, `revive-tail`, `normalise` (`SENT_AT` + `STEP` before every call, `STEP` `<step>:ok` after), and
+  `create`, `revive-tail`, `normalise` (`SENT_AT` + `STEP` before every call, `STEP` `<step>:ok` after; a
+  `normalise` row carrying `price` / `compare_at` writes them on every variant with DENY + tracked — the publish's
+  ACTIVE branch, parity with the sheet era's price refresh; rule 7's own normalisation carries none), and
   `stamp-only` (`DONE` at insert). First send: write-ahead (group) → rule 8 read (`ops.read_level`,
   `includeInactive`) → premise check (else `FAILED` never sent) → `SENT_AT` + `SENT_AVAILABLE` + `REQUEST`
   → send → outcome. Settle: all non-`SUPERSEDED` rows `APPLIED` → stamp (distinct union of the rows' event ids)
@@ -155,7 +157,8 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   ≤ 50 keys a run; `GET /relevel/held` lists the holds). A publish-class holder: `passes.prologue` at the take
   (recovery + the held-key lowering — it refuses before the whole-register `BASELINE`), the lease released and
   re-taken between SKUs (prologue again when another holder came in between).
-- Per key, target N: one ACTIVE outlet with the size → a group [`normalise` if a variant is not DENY + tracked,
+- Per key, target N: one ACTIVE outlet with the size → a group [`normalise` (DENY + tracked and the SKU's
+  FIX4-checked price and compare-at on every variant, as the publish's ACTIVE branch),
   `activate` if the level is absent or inactive, `relevel` target N carrying every unstamped event of the key —
   pending and held, a `HELD` row's included], settled (stamp + `DONE`), then the publish re-run as a group of its
   own (a `revive-tail` row with no prices: DENY + tracked, ACTIVE, publish — idempotent; its refusal surfaced, the

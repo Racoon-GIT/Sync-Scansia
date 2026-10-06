@@ -308,10 +308,10 @@ class _Run:
         common = dict(keys=(kp.key,), inventory_item_id=f.inventory_item_id, location_id=self.promo,
                       variant_id=f.variant_id, product_id=f.product_id)
         inv = self.ctx.inventory(flows.product_gid(f.product_id))
-        specs: List[L.RowSpec] = []
-        if any((v.get("inventoryPolicy") or "").upper() != "DENY" or v.get("tracked") is False for v in inv):
-            keys = tuple(sorted({(kp.sku, variants.variant_title(v)) for v in variants.real_size_variants(inv)}))
-            specs.append(L.RowSpec(action=L.A_NORMALISE, keys=keys, product_id=f.product_id))
+        keys = tuple(sorted({(kp.sku, variants.variant_title(v)) for v in variants.real_size_variants(inv)}))
+        # DENY + tracked and the SKU's FIX4-checked prices on every variant, before the level (as the publish)
+        specs: List[L.RowSpec] = [L.RowSpec(action=L.A_NORMALISE, keys=keys, product_id=f.product_id,
+                                            extra={"price": kp.price, "compare_at": kp.compare_at})]
         if kp.activate:
             specs.append(L.RowSpec(action=L.A_ACTIVATE, event_ids=kp.event_ids, **common))
         specs.append(L.RowSpec(action=L.A_ADJUST, purpose=L.P_RELEVEL, target=kp.n, event_ids=kp.event_ids,

@@ -666,3 +666,29 @@ def test_the_keyless_miss_is_surfaced_never_stamped():
     e = w.be.consume("NOPE", "40")
     plan, _rep = w.run()
     assert plan.anomalies == (f"consume_miss:{e}",) and w.unstamped() == [e]
+
+
+# ---------------------------------------------------------------------------
+# Parity (§4 step 2): the ACTIVE branch refreshes the SKU's prices; §3.1's outlet id
+# ---------------------------------------------------------------------------
+
+def test_active_refreshes_price_and_compare_at_on_every_variant_as_the_sheet_era_did():
+    w = World()
+    out = w.shop.product("Nike - Outlet", promo={"42": 0, "43": 0})
+    w.returned(price_outlet="55.00", price_high="110.00")
+    _, rep = w.run()
+    assert rep.outcomes[0].status == "APPLIED"
+    assert {(v.price, v.compare_at) for v in w.shop.products[out.gid].variants} == {("55.00", "110.00")}
+    names = [c[0] for c in w.shop.calls if c[0] in MUTATIONS]
+    assert names.index("bulk") < names.index("adjust")              # prices and DENY + tracked before the unit
+
+
+def test_a_publish_writes_the_outlet_id_of_a_member_and_title_outlet_never_a_fresh_create():
+    w = World()
+    out = w.shop.product("Nike - Outlet", promo={"42": 0})
+    w.returned()
+    w.shop.product("Puma Suede", sku="SKU2", outlet=False, sizes=("40",))
+    w.returned(sku="SKU2", size="40")
+    w.run()
+    ids = {p.sku: p.outlet_product_id for p in w.register().shelf()}
+    assert ids == {"SKU1": int(out.gid.rsplit("/", 1)[1]), "SKU2": None}   # a CREATE is a `review` match
