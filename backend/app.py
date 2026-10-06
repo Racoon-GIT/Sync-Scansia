@@ -134,7 +134,9 @@ def create_app(
             # B-3 (D23): the decrement on its own thread, never on the jobs' executor
             state.decrement_worker = DecrementWorker(make_run_pass(state))
         # B-3's boot pass: whoever woke the instance (678434's call, a person, a
-        # restart), what is pending is applied. Never blocks the startup.
+        # restart), what is pending is applied. Never blocks the startup. A test
+        # entering the lifespan (`with TestClient(app)`) sets app.state.decrement_worker
+        # first, or this pass runs on a thread against its fakes.
         state.decrement_worker.trigger("boot")
         yield
         # Shutdown: release the worker pool (only if we own a real one).

@@ -37,7 +37,7 @@ Pipeline: build · item: F7 — Scansia Manager on MySQL · plan: docs/f7-mysql-
 - The sheet as store (Q-persistenza, 2026-07-06): voided by the F6 cutover — the register is MySQL.
 - Level-setting sweeps ("set Promo to the shelf count"): they put back units sold during an intake stall (plan §3.3).
 
-**Key refs**: plan `docs/f7-mysql-adapter-plan.md` (§3 design, §4 build list, §10 review minors); `docs/f7-build-notes.md` (layering, engine, parameters, staging harness, facts — read before building); `backend/persistence/ports.py`; `backend/services/`; `docs/testing.md` (venv for the FastAPI suite); F1 history: `TRACKER-ARCHIVE.md`.
+**Key refs**: plan `docs/f7-mysql-adapter-plan.md` (§3 design, §4 build list, §10 review minors); `docs/f7-build-notes.md` (layering, engine, parameters, staging harness, facts — read before building); `backend/persistence/ports.py`; `backend/services/`; `docs/testing.md` (venv for the FastAPI suite — one ready while `/private/tmp` lasts: `/private/tmp/claude-501/-Users-alesap-DATI-Racoon-LAB-IT-SVILUPPO-Sync-Scansia/13a63901-7c1c-460f-8849-4c78ed0bcfcb/scratchpad/venv/bin/python -m pytest -q -o addopts=""`); F1 history: `TRACKER-ARCHIVE.md`.
 
 ## Archive
 Full history: `TRACKER-ARCHIVE.md` (same folder). Keep appending superseded material there — never here.
