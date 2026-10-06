@@ -89,6 +89,8 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   + `DONE`; beside `FAILED` / `HELD` → `APPLIED` rows `CARRIED` (`OUTCOME.moved` = what they moved).
 - Interpretation recorded: terminal path (ii) on a row never sent closes it `FAILED` "never sent", whatever its
   kind (nothing sent → nothing landed; (ii)'s `HELD` protects a landed +Δ, which a never-sent row cannot be).
+- A preview is a read and runs no recovery: a key held in flight by an `OPEN` row plans nothing (listed
+  `held_positive`) until an apply's prologue resolves the row; the next preview then plans it.
 - `referenceDocumentUri` of every inventory write: `gid://scansia-manager/OutletReconcile/<row id>` (Shopify's
   inventory history names the row). Reason `correction`.
 - Transport (rule 9): a mutation is re-sent only after HTTP 429 or a `THROTTLED` top-level error (refused
