@@ -18,7 +18,7 @@ Pipeline: build · item: F7 — Scansia Manager on MySQL · plan: docs/f7-mysql-
 - [ ] §4.3 — MySQL adapters (register, audit) on `mysql-connector-python`; integration tests only on `racoon_staging`, after the orchestrator's INFO that SERVER created it (F7.1, D26).
 - [ ] §4.4 — reconciliation (§3.3) and "Inizializza" (§3.4) rewrite + every test §4 item 4 names (AB1–AB3 mandatory, D18; §10's minors are test cases, D16); B-3's trigger route and boot pass (§6 B-3, D23).
 - [ ] F7.2 per §7 — pin one named Admin API version (the newest stable on the build day) and write against it (`@idempotent`, `changeFromQuantity`, explicit activation); migrate `productUpdate(input:)` and `Collection.ruleSet`, or record why not.
-- [ ] §4.5 — remove §3.8 (`gspread`, `backend/gsheet/`, `src/sync.py`, `fix_prices.py`, `RUN_MODE=SYNC`); `requirements.txt` gains the driver, loses `gspread`.
+- [ ] §4.5 — remove §3.8 (`gspread`, `backend/gsheet/`, `src/sync.py`, `fix_prices.py`, `RUN_MODE=SYNC`); `requirements.txt` gains the driver, loses `gspread`; the project `CLAUDE.md` still describes the legacy `RUN_MODE` cron jobs and the sheet — rewrite it to the web service on MySQL in the same step.
 - [ ] §4.6 — gate-2: `IT/SVILUPPO/docs/adversarial-verify.md`, `mutate-verify.sh` PASS rows, `/ship`; then `[SYNC-SCANSIA→SCANSIA] DONE|BLOCKED` to `scansia-f6`.
 
 **Active constraints & decisions**:
