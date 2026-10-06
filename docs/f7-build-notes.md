@@ -71,7 +71,8 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
 - Baseline reads (§3.4): `read_snapshot(key=None)` is the one stated read transaction (`START TRANSACTION READ
   ONLY WITH CONSISTENT SNAPSHOT`, three plain SELECTs, `COMMIT`): shelf pairs, every unstamped event, each key's
   max event id over all its events; `read_import_payloads(pair_ids)` returns each pair's `IMPORTED` `PAYLOAD`
-  (B-2's J seed at `raw.J.v`, E14).
+  (B-2's J seed at `raw.J.v`, E14) — outside the snapshot, safely: events are append-only
+  (`STOCK_Manager/docs/scansia-design.md` §2.2).
 
 ## The reconciliation engine (§4.4, the lane's mechanism)
 
