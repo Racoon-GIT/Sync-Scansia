@@ -91,6 +91,41 @@
     </div>
   </section>
 
+  <!-- ============================== RE-LEVEL (per key) ============================== -->
+  <section id="relevel-panel" class="plan-panel">
+    <h3>Riallineamento per chiave</h3>
+    <p class="warning-banner">
+      Rilascia una chiave trattenuta — o riallinea una chiave non trattenuta — portando lo stock Promo
+      al numero di paia in scansia. Stessa precondizione dell'inizializzazione: lettura <code>/dlqs</code>
+      di 678434 senza voci irrisolte.
+    </p>
+    <div class="toolbar">
+      <button id="btn-relevel-held">Elenca chiavi trattenute</button>
+      <label>SKU <input type="text" id="relevel-sku"></label>
+      <label>Taglia <input type="text" id="relevel-size"></label>
+      <button id="btn-relevel-add">Aggiungi chiave</button>
+      <span id="relevel-status" class="status-text"></span>
+    </div>
+    <table class="data-table"><thead><tr><th></th><th>SKU</th><th>Taglia</th><th>Tipi</th><th>Motivi</th><th>Eventi</th></tr></thead>
+      <tbody id="relevel-held-tbody"></tbody></table>
+    <div class="toolbar"><button id="btn-relevel-preview">Calcola riallineamento</button></div>
+    <div id="relevel-plan-panel" class="plan-panel hidden">
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>N</th><th>Ramo</th><th>Motivo</th><th>Δ Promo</th><th>Trattenuta da</th></tr></thead>
+        <tbody id="relevel-plan-tbody"></tbody></table>
+      <div class="gesture-panel">
+        <label>Lettura /dlqs alle <input type="datetime-local" id="relevel-dlq-at" step="1"></label>
+        <label>Voci irrisolte (dlqCount) <input type="number" id="relevel-dlq-count" min="0" step="1"></label>
+        <label>Digita CONFERMO <input type="text" id="relevel-confirm-word"></label>
+        <button id="btn-relevel-apply" class="btn-danger">Applica riallineamento</button>
+        <span id="relevel-apply-status" class="status-text"></span>
+      </div>
+    </div>
+    <div id="relevel-outcome-panel" class="plan-panel hidden">
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>Ramo</th><th>Esito</th><th>Motivo</th></tr></thead>
+        <tbody id="relevel-outcome-tbody"></tbody></table>
+    </div>
+  </section>
+
   <!-- ============================== SCANSIA ============================== -->
   <section id="tab-scansia" class="tab-panel active">
     <div class="toolbar">

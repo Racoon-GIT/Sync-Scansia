@@ -285,7 +285,7 @@ def _validate_price(
 ) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
     """Reject missing/zero/negative price, missing/zero compareAt, or price>=compareAt.
 
-    Mirrors ``outlet_service._validate_price`` (FIX4) so publish and prices reject
+    Mirrors ``outlet_service.validate_price`` (FIX4) so publish and prices reject
     identically. Returns ``(ok, price, compare_at, reason)``.
     """
     if not price:

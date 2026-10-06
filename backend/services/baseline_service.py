@@ -127,6 +127,7 @@ R_MOVED = "moved_at_confirm"
 R_NORMALISE = "normalise_not_applied"
 R_WRITE = "level_write_not_applied"
 R_PENDING = "shelf_events_not_n"
+R_UNIT_HELD = "n0_committed_unit"
 
 # J seed statuses (B-2: one price per SKU; different values listed, never picked).
 SEED = "seed"
@@ -422,7 +423,7 @@ def _variant_facts(product_id: int, status: str, v: Dict[str, Any], promo: str) 
                         bool(lvl.get("is_active")), lvl.get("available"), lvl.get("committed"))
 
 
-def _plan_hash(doc: Dict[str, Any]) -> str:
+def plan_digest(doc: Dict[str, Any]) -> str:
     raw = json.dumps(doc, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
@@ -447,7 +448,7 @@ class _Outlet:
 
 
 @dataclass
-class _SkuView:
+class SkuView:
     sku: str
     clean: bool
     outlets: List[_Outlet]
@@ -461,7 +462,7 @@ class _SkuView:
         return tuple(sorted((o.facts(size, promo) for o in self.outlets), key=lambda f: f.product_id))
 
 
-class _Reader:
+class OutletReader:
     """The Shopify reads of one preview or one confirm: each SKU resolved once,
     each product's inventory read once — or afresh (``fresh``: the confirm's
     per-key re-read). ``keepalive`` renews the lease before a call (the confirm's)."""
@@ -490,7 +491,7 @@ class _Reader:
         inv, why = self.inventory(gid, fresh=fresh)
         return _Outlet(gid, flows.product_number(gid) or 0, _status(status), str(title or ""), inv, why)
 
-    def sku_view(self, sku: str, *, fresh: bool = False) -> _SkuView:
+    def sku_view(self, sku: str, *, fresh: bool = False) -> SkuView:
         if sku not in self._res:
             self.keepalive()
             try:
@@ -501,7 +502,7 @@ class _Reader:
                 self._res[sku] = (not res.get("truncated"), list(res.get("matches") or ()), res.get("warning"))
         clean, matches, warning = self._res[sku]
         outlets = [self.outlet(m["product_gid"], m.get("status"), m.get("title"), fresh=fresh) for m in matches]
-        return _SkuView(sku, clean, outlets, warning)
+        return SkuView(sku, clean, outlets, warning)
 
     def resolution(self, sku: str) -> Optional[flows.Resolution]:
         """The SKU's resolution as already read (``None`` if never read)."""
@@ -515,7 +516,7 @@ class _Reader:
 # The Level decision (pure over what was read)
 # =============================================================================
 def _decide(k: Key, shelf: Sequence[PairRow], events: Sequence[EventRow], on_shelf: Set[int],
-            max_event_id: int, view: Optional[_SkuView], held_kinds: Set[str], promo: str) -> KeyPlan:
+            max_event_id: int, view: Optional[SkuView], held_kinds: Set[str], promo: str) -> KeyPlan:
     sku, size = k
     n = len(shelf)
     base = dict(
@@ -543,6 +544,8 @@ def _decide(k: Key, shelf: Sequence[PairRow], events: Sequence[EventRow], on_she
         return hold(R_UNRESOLVED)                     # a failed / truncated resolution is not "none"
     if not readable:
         return hold(R_UNREADABLE)
+    if n == 0 and any((f.committed or 0) > 0 for f in facts):
+        return hold(R_UNIT_HELD)                      # its −1 waits for a unit only held (rule 4, D33)
     # (b) and (c) leave the shelf pairs' events pending (+1 each, E17): §3.4's
     # invariant holds only where they sum to N — a key where they do not is held
     pending_on_shelf = sum(e.delta for e in events if e.pair_id in on_shelf)
@@ -565,16 +568,18 @@ def _decide(k: Key, shelf: Sequence[PairRow], events: Sequence[EventRow], on_she
             return hold(R_COMMITTED)
         return KeyPlan(**base, action=ACT_LEVEL, outlets=facts, target=n, delta=delta, activate=activate)
     if o.status == "DRAFT":                           # (b)
-        if pending_on_shelf != n:
-            return hold(R_PENDING)
-        return KeyPlan(**base, action=ACT_ZERO, outlets=facts, target=0, delta=-f.p)
+        if pending_on_shelf == n:
+            return KeyPlan(**base, action=ACT_ZERO, outlets=facts, target=0, delta=-f.p)
+        if f.p + pending_on_shelf == n:               # DRAFT-parked: the invariant holds as it is (a re-level exposes it)
+            return KeyPlan(**base, action=ACT_ZERO, outlets=facts, target=0, delta=0)
+        return hold(R_PENDING)
     return hold(f"{R_STATUS}:{o.status or 'NONE'}")
 
 
 # =============================================================================
 # Preview
 # =============================================================================
-def _foreign_outlets(reader: _Reader, views: Dict[str, _SkuView], skus: Set[str],
+def _foreign_outlets(reader: OutletReader, views: Dict[str, SkuView], skus: Set[str],
                      anomalies: List[str]) -> List[_Outlet]:
     """The outlet collection's products no register SKU resolves to (stale units,
     rule 7's normalisations). A collection product carrying a register SKU the
@@ -601,7 +606,7 @@ def _foreign_outlets(reader: _Reader, views: Dict[str, _SkuView], skus: Set[str]
     return out
 
 
-def _stale_keys(views: Dict[str, _SkuView], foreign: Sequence[_Outlet], register_keys: Set[Key],
+def _stale_keys(views: Dict[str, SkuView], foreign: Sequence[_Outlet], register_keys: Set[Key],
                 promo: str) -> List[KeyPlan]:
     """Keys with no shelf pair and no event whose real-size Promo is > 0 on an outlet."""
     stale: Dict[Key, List[VariantFacts]] = {}
@@ -628,7 +633,7 @@ def _stale_keys(views: Dict[str, _SkuView], foreign: Sequence[_Outlet], register
     ]
 
 
-def _product_fixes(views: Dict[str, _SkuView], foreign: Sequence[_Outlet], promo: str) -> List[ProductFix]:
+def _product_fixes(views: Dict[str, SkuView], foreign: Sequence[_Outlet], promo: str) -> List[ProductFix]:
     seen: Dict[str, Dict[str, Any]] = {}
 
     def add(o: _Outlet, sku: Optional[str]) -> None:
@@ -701,7 +706,7 @@ def _price_seeds(register: Any, snap: Snapshot) -> List[PriceSeed]:
     return out
 
 
-def _part_b(snap: Snapshot, views: Dict[str, _SkuView], promo: str) -> List[PartBRow]:
+def _part_b(snap: Snapshot, views: Dict[str, SkuView], promo: str) -> List[PartBRow]:
     out: List[PartBRow] = []
     for p in snap.pairs:
         if not p.online:
@@ -730,7 +735,7 @@ def _part_b(snap: Snapshot, views: Dict[str, _SkuView], promo: str) -> List[Part
     return out
 
 
-def _catalogue(reader: _Reader, keys: Sequence[KeyPlan]) -> List[CatalogueNote]:
+def _catalogue(reader: OutletReader, keys: Sequence[KeyPlan]) -> List[CatalogueNote]:
     """§3.3's listing for the keys the publish would create: a SKU not in the
     catalogue, several sources, or a size its source lacks (a person)."""
     by_sku: Dict[str, List[KeyPlan]] = {}
@@ -763,11 +768,11 @@ def baseline_preview(register: Any, transport: Any, *, promo_location_id: str) -
     now = register.server_now()
     if register.baseline() is not None:
         return BaselinePlan(dry_run=True, already_done=True, previewed_at=now,
-                            plan_hash=_plan_hash({"already_done": True}))
+                            plan_hash=plan_digest({"already_done": True}))
     promo = promo_location_id
     snap = register.snapshot()
     holds = register.held_keys()
-    reader = _Reader(transport)
+    reader = OutletReader(transport)
 
     shelf_by_key: Dict[Key, List[PairRow]] = {}
     for p in snap.pairs:
@@ -807,7 +812,7 @@ def baseline_preview(register: Any, transport: Any, *, promo_location_id: str) -
     return BaselinePlan(
         dry_run=True, already_done=False, previewed_at=now, keys=tuple(keys), products=tuple(products),
         prices=tuple(prices), part_b=tuple(part_b), catalogue=tuple(catalogue), keyless_event_ids=keyless,
-        anomalies=tuple(anomalies), plan_hash=_plan_hash(doc),
+        anomalies=tuple(anomalies), plan_hash=plan_digest(doc),
     )
 
 
@@ -823,7 +828,7 @@ class _Run:
         self.led = ctx.ledger
         self.promo = ctx.promo
         self.approved = approved
-        self.reader = _Reader(ctx.transport, keepalive=ctx.ledger.lease.keepalive)
+        self.reader = OutletReader(ctx.transport, keepalive=ctx.ledger.lease.keepalive)
         self.outcomes: List[KeyOutcome] = []
         self.held: List[Dict[str, Any]] = []
         self.held_plans: Dict[Key, KeyPlan] = {}
@@ -912,7 +917,7 @@ class _Run:
         else:  # pragma: no cover - the preview builds only the actions above
             self._hold(kp, f"unknown_action:{kp.action}")
 
-    def _moved(self, kp: KeyPlan, view: Optional[_SkuView]) -> bool:
+    def _moved(self, kp: KeyPlan, view: Optional[SkuView]) -> bool:
         """§3.4: the confirm re-reads N, the max event id (any Δ) and the events,
         and every live level of the key on its SKU's outlets."""
         snap = self.reg.snapshot(kp.key)
@@ -957,8 +962,8 @@ class _Run:
 
     def _zero(self, kp: KeyPlan) -> None:
         f = kp.outlets[0]
-        if f.p == 0:
-            self._done(kp, "zeroed")        # nothing to lower; a negative is never raised
+        if kp.delta == 0:
+            self._done(kp, "zeroed")        # nothing to lower (a negative is never raised), or parked at N
             return
         (row,) = self.led.write_group([L.RowSpec(
             action=L.A_ADJUST, keys=(kp.key,), purpose=L.P_ZERO, target=0, inventory_item_id=f.inventory_item_id,
@@ -1135,12 +1140,13 @@ def baseline_apply(
 __all__ = [
     "RULE_LEVEL", "ACT_LEVEL", "ACT_ZERO", "ACT_NONE", "ACT_STAMP", "ACT_LOWER", "ACT_HOLD",
     "R_BLANK_SKU", "R_HELD_BEFORE", "R_UNRESOLVED", "R_UNREADABLE", "R_MULTI_OUTLET", "R_SIZE_ABSENT",
-    "R_STATUS", "R_COMMITTED", "R_MOVED", "R_NORMALISE", "R_WRITE", "R_PENDING",
+    "R_STATUS", "R_COMMITTED", "R_MOVED", "R_NORMALISE", "R_WRITE", "R_PENDING", "R_UNIT_HELD",
     "SEED", "SEED_CONFLICT", "SEED_UNPARSEABLE", "SEED_INVALID", "SEED_PRICED",
     "B_KEPT", "B_MISSING", "B_DRAFT", "B_SOLD_OUT", "B_MULTI", "B_UNRESOLVED", "B_BLANK",
     "ST_APPLIED", "ST_ALREADY_DONE", "ST_PRECONDITION_REFUSED", "ST_LEASE_UNAVAILABLE", "ST_ABORTED", "ST_INCOMPLETE",
     "BASELINE_TAKE_BOUND_S", "DLQ_CHECK_WINDOW", "DLQ_CHECK_SKEW",
     "VariantFacts", "KeyPlan", "ProductFix", "PriceSeed", "PartBRow", "CatalogueNote", "BaselinePlan",
     "InitBeforeSnapshot", "DlqCheck", "KeyOutcome", "BaselineReport",
+    "OutletReader", "SkuView", "plan_digest",
     "parse_sheet_price", "parse_dlq", "check_dlq", "baseline_preview", "baseline_apply",
 ]

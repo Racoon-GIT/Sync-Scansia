@@ -156,7 +156,7 @@ def _plan_hash(anchor: Optional[str], branch: Optional[str], live_status: Option
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def _validate_price(price: Optional[str], compare_at: Optional[str]) -> Tuple[bool, Optional[str]]:
+def validate_price(price: Optional[str], compare_at: Optional[str]) -> Tuple[bool, Optional[str]]:
     """FIX4/D3: reject missing/zero price, missing/zero compare-at, price ≥ compare-at."""
     if not price:
         return False, "price_missing"
@@ -211,7 +211,7 @@ def sku_prices(shelf: List[PairRow]) -> SkuPrices:
     )
 
 
-def _outlet_title(title: str) -> str:
+def outlet_title(title: str) -> str:
     t = (title or "").strip()
     return t if t.casefold().endswith("outlet") else f"{t} - Outlet"
 
@@ -296,7 +296,7 @@ def _plan_sku(register: Any, transport: Any, promo: str, sg: _SkuGroups) -> Plan
     warnings: List[str] = []
     shelf = register.shelf(sku)
     pr = sku_prices(shelf)
-    ok, why = _validate_price(pr.price, pr.compare_at)
+    ok, why = validate_price(pr.price, pr.compare_at)
     out_pairs = set(pr.no_compare_at_pairs)
     q_gid = product_gid(next((p.outlet_product_id for p in shelf if p.outlet_product_id), None))
     try:
@@ -352,7 +352,7 @@ def _plan_sku(register: Any, transport: Any, promo: str, sg: _SkuGroups) -> Plan
         return _nonpub(sku, None, "multi_source", warnings=warnings, price=pr.price, compare_at=pr.compare_at,
                        plan_hash=_plan_hash(sku, "multi_source", ""))
     source_gid = srcs[0]["product_gid"]
-    title = _outlet_title(srcs[0].get("title") or "")
+    title = outlet_title(srcs[0].get("title") or "")
     ph = _plan_hash(source_gid, BRANCH_CREATE, "")
     if not ok:
         return _nonpub(sku, BRANCH_CREATE, "price_invalid", warnings=warnings + [f"price:{why}"],
@@ -453,7 +453,7 @@ def _settled(ctx: flows.Context, fresh: PlanAction, branch: str, gid: Optional[s
              ok_status: str) -> ApplyOutcome:
     pending_before = {e.event_id: e for e in ctx.register.unstamped_events()}
     result = ctx.ledger.settle(group_id)
-    if result != "stamped":
+    if result not in ("stamped", "closed"):     # closed: a re-level of a key with nothing unstamped
         return ApplyOutcome(fresh.sku, branch, "INCOMPLETE" if result == "waiting" else "PARTIAL", gid,
                             fresh.warnings + (f"group:{result}",))
     rows = ctx.ledger.group_rows(group_id)
@@ -468,7 +468,10 @@ def _settled(ctx: flows.Context, fresh: PlanAction, branch: str, gid: Optional[s
     return ApplyOutcome(fresh.sku, branch, ok_status, gid, fresh.warnings, tuple(stamped))
 
 
-def _revive(ctx: flows.Context, fresh: PlanAction, approved: PlanAction) -> ApplyOutcome:
+def revive_outlet(ctx: flows.Context, fresh: PlanAction, approved: PlanAction, *,
+            zero_titles: frozenset = frozenset()) -> ApplyOutcome:
+    """``zero_titles``: real-size variants zeroed whatever their key — a
+    re-level's zero-then-revive (§3.4) zeroes its own key's variant first."""
     gid = fresh.target_gid
     num = product_number(gid)
     sku = fresh.sku
@@ -490,7 +493,7 @@ def _revive(ctx: flows.Context, fresh: PlanAction, approved: PlanAction) -> Appl
         if variants.is_customisation_only(v):
             return True
         title = variants.variant_title(v)
-        return title not in shelf_sizes or (sku, title) in held
+        return title in zero_titles or title not in shelf_sizes or (sku, title) in held
 
     zero = [s for s in flows.zero_rows_for(ctx, inv, keys=keys, product=num, purpose=L.P_ZERO, which=must_zero)]
     tail = L.RowSpec(action=L.A_TAIL, keys=keys, product_id=num,
@@ -517,7 +520,7 @@ class _CreateAbort(RuntimeError):
     pass
 
 
-def _create(ctx: flows.Context, fresh: PlanAction, approved: PlanAction) -> ApplyOutcome:
+def create_outlet(ctx: flows.Context, fresh: PlanAction, approved: PlanAction) -> ApplyOutcome:
     sku = fresh.sku
     targets = _approved_targets(fresh, approved, ctx)
     if not targets:
@@ -585,11 +588,11 @@ def _execute(ctx: flows.Context, fresh: PlanAction, approved: PlanAction) -> App
         return ApplyOutcome(fresh.sku, fresh.branch, _reason_status(fresh.reason), fresh.target_gid,
                             ((fresh.reason,) if fresh.reason else ()) + fresh.warnings)
     if fresh.branch == BRANCH_CREATE:
-        return _create(ctx, fresh, approved)
+        return create_outlet(ctx, fresh, approved)
     if fresh.branch == BRANCH_ACTIVE:
         return _active(ctx, fresh, approved)
     if fresh.branch == BRANCH_DRAFT:
-        return _revive(ctx, fresh, approved)
+        return revive_outlet(ctx, fresh, approved)
     return ApplyOutcome(fresh.sku, fresh.branch, "SKIPPED", fresh.target_gid, ("unknown_branch",))
 
 

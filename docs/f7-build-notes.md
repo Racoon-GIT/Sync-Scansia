@@ -145,6 +145,33 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   pair of the SKU (post-cutover returns, which have no J, included). `DISCOUNT` is not seeded (B-2 names J only).
 - Catalogue notes for (c) keys with N > 0: the source resolver and its variants → `not_in_catalogue`,
   `multi_source`, `size_absent_on_source` (+ twins) — a person.
+- A key with no shelf pair and a `committed` unit on its variant is held (`n0_committed_unit`): its −1
+  waits for a unit only held, as D33 reads rule 4 for the N-0 release (which then releases it). A DRAFT key whose
+  unit is parked (P + Σ pending = N, nothing to zero) is left as it is, not held — a re-level exposes it.
+
+## The per-key re-level (§3.4, the lane's mechanism)
+
+- `services/relevel_service.py`; API `/relevel` in `api/init.py` (same plan custody and confirm gate as `/init`;
+  ≤ 50 keys a run; `GET /relevel/held` lists the holds). A publish-class holder: `passes.prologue` at the take
+  (recovery + the held-key lowering — it refuses before the whole-register `BASELINE`), the lease released and
+  re-taken between SKUs (prologue again when another holder came in between).
+- Per key, target N: one ACTIVE outlet with the size → a group [`normalise` if a variant is not DENY + tracked,
+  `activate` if the level is absent or inactive, `relevel` target N carrying every unstamped event of the key —
+  pending and held, a `HELD` row's included], settled (stamp + `DONE`), then the publish re-run as a group of its
+  own (a `revive-tail` row with no prices: DENY + tracked, ACTIVE, publish — idempotent; its refusal surfaced, the
+  key still released); DRAFT → `outlet_service.revive_outlet` with the key's own title in `zero_titles`
+  (zero-then-revive: N, never N + Σ pending); no outlet → `outlet_service.create_outlet` with N; N 0 → every outlet's
+  real-size Promo lowered to 0 and the events stamped by the per-key `BASELINE` row. Success → a per-key
+  `BASELINE` row (`reason` "relevel", `branch`, `n`, `shelf_pair_ids`, `event_ids`, `released` kinds, `dlq`)
+  releasing the key's older holds; `ONLINE` 1 on its shelf pairs.
+- Refused (nothing written, listed): blank SKU, a row of the key not closed (an in-flight hold ends with its row),
+  unclean / unreadable, multi-outlet with N > 0 (its exit first), no variant titled SIZE with N > 0, an upward
+  write meeting `committed` > 0, N 0 with a `committed` unit (`n0_committed_unit`, D33), FIX4 (`price_conflict` / the price checks /
+  a shelf pair of the key with no compare-at, D25), no single source holding the size. At confirm a key whose N,
+  max event id, events or live level moved is held — a `HOLD` row (`relevel-moved`, the snapshot's events) when
+  it was not — and the newly held keys are lowered by their excess.
+- `outlet_service._settled` accepts a group "closed" (no event to stamp: a re-level of a key whose events were
+  all stamped) as settled.
 
 ## Parameters the plan proposes, fixed here (each one tested)
 

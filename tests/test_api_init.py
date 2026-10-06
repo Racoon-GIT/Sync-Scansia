@@ -70,6 +70,9 @@ class World:
     def apply(self, body: dict):
         return self.client.post("/init/apply", headers=_auth(), json=body)
 
+    def apply_relevel(self, result: dict):
+        return self.client.post("/relevel/apply", headers=_auth(), json=self.body(result))
+
     def mutations(self):
         return [c[0] for c in self.shop.calls if c[0] in MUTATIONS]
 
@@ -152,3 +155,40 @@ def test_the_preview_after_the_baseline_reports_it_done(monkeypatch):
 def test_init_routes_require_auth(monkeypatch, method, path):
     w = World(monkeypatch)
     assert getattr(w.client, method)(path).status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# /relevel — the per-key re-level behind the same custody and confirm gate
+# ---------------------------------------------------------------------------
+
+def _job(w, path: str, sub) -> dict:
+    assert sub.status_code == 202, sub.json()
+    return w.client.get(f"{path}/{sub.json()['job_id']}", headers=_auth()).json()
+
+
+def test_relevel_lists_previews_and_releases_a_held_key(monkeypatch):
+    w = World(monkeypatch)
+    w.shop.products[w.out.gid].status = "ARCHIVED"            # the baseline holds SKU1/42 (unexpected status)
+    w.apply(w.body(w.preview()))
+    held = w.client.get("/relevel/held", headers=_auth()).json()["held"]
+    assert [h["key"] for h in held] == [["SKU1", "42"]]
+    w.shop.products[w.out.gid].status = "ACTIVE"
+    for p in w.be.register().shelf():                       # FIX4 needs the SKU's price and compare-at
+        w.be.db.state.pairs[p.pair_id].update(PRICE_OUTLET=50, PRICE_HIGH=100)
+    res = _job(w, "/relevel/preview", w.client.post("/relevel/preview", headers=_auth(),
+                                                    json={"keys": [["SKU1", "42"]]}))["result"]
+    assert res["plan"]["keys"][0]["branch"] == "active"
+    out = _job(w, "/relevel/apply", w.apply_relevel(res))
+    assert out["result"]["status"] == "APPLIED", out
+    assert out["result"]["report"]["outcomes"][0]["result"] == "released"
+    assert w.client.get("/relevel/held", headers=_auth()).json()["held"] == []
+    assert w.shop.available(w.out.gid, "42") == 1
+
+
+def test_relevel_refuses_bad_keys_and_an_init_token(monkeypatch):
+    w = World(monkeypatch)
+    bad = w.client.post("/relevel/preview", headers=_auth(), json={"keys": [["SKU1"]]})
+    assert bad.status_code == 422 and bad.json()["error"]["code"] == "invalid_keys"
+    res = w.preview()                                          # an INIT token never confirms a re-level
+    resp = w.client.post("/relevel/apply", headers=_auth(), json=w.body(res))
+    assert resp.status_code == 409 and resp.json()["error"]["code"] == "confirm_invalid"

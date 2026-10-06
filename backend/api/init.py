@@ -18,6 +18,9 @@
   :func:`~backend.services.baseline_service.baseline_apply`, which checks the
   precondition again on the server clock and keeps it in the ``BASELINE`` row.
 * ``GET /init/status`` — ``{"baseline_done": bool}`` (the GUI's first-run banner).
+* ``/relevel`` — the per-key re-level (:mod:`backend.services.relevel_service`):
+  ``GET /relevel/held`` lists the held keys; ``POST /relevel/preview`` ({keys})
+  and ``POST /relevel/apply`` follow the same custody and the same confirm gate.
 """
 from __future__ import annotations
 
@@ -26,10 +29,11 @@ import threading
 from collections import OrderedDict
 from dataclasses import asdict
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from backend.api.jobs import JobBusyError
 from backend.api.mutations import (
@@ -40,13 +44,14 @@ from backend.api.mutations import (
     MutationVertical,
     _close,
     _error,
+    _run_preview_job,
     _store_factory,
     poll_job,
     submit_preview,
 )
 from backend.auth.basic_auth import require_basic_auth
 from backend.persistence.audit_sink import RegisterAuditSink
-from backend.services import baseline_service
+from backend.services import baseline_service, relevel_service
 from backend.services.delete_service import CONFIRM_WORD
 
 logger = logging.getLogger("backend.api.init")
@@ -68,31 +73,31 @@ _PLANS_LOCK = threading.Lock()
 # =============================================================================
 # The previewed plans, kept by hash until confirmed
 # =============================================================================
-def _plans(state: Any) -> "OrderedDict[str, Any]":
-    plans = getattr(state, "init_plans", None)
-    if plans is None:
-        plans = OrderedDict()
-        state.init_plans = plans
-    return plans
+def _plans(state: Any, kind: str) -> "OrderedDict[str, Any]":
+    kept = getattr(state, "kept_plans", None)
+    if kept is None:
+        kept = {}
+        state.kept_plans = kept
+    return kept.setdefault(kind, OrderedDict())
 
 
-def remember_plan(state: Any, plan: Any) -> None:
+def remember_plan(state: Any, plan: Any, kind: str = TOKEN_KIND_INIT) -> None:
     with _PLANS_LOCK:
-        plans = _plans(state)
+        plans = _plans(state, kind)
         plans[plan.plan_hash] = plan
         plans.move_to_end(plan.plan_hash)
         while len(plans) > PLANS_KEPT:
             plans.popitem(last=False)
 
 
-def recall_plan(state: Any, plan_hash: str) -> Optional[Any]:
+def recall_plan(state: Any, plan_hash: str, kind: str = TOKEN_KIND_INIT) -> Optional[Any]:
     with _PLANS_LOCK:
-        return _plans(state).get(plan_hash)
+        return _plans(state, kind).get(plan_hash)
 
 
-def forget_plan(state: Any, plan_hash: str) -> None:
+def forget_plan(state: Any, plan_hash: str, kind: str = TOKEN_KIND_INIT) -> None:
     with _PLANS_LOCK:
-        _plans(state).pop(plan_hash, None)
+        _plans(state, kind).pop(plan_hash, None)
 
 
 # =============================================================================
@@ -206,21 +211,30 @@ def _run_baseline_job(
         _close(register)
 
 
-def submit_init_apply(request: Request, body: InitApplyRequest, actor: str) -> Any:
-    state = request.app.state
-    if not state.token_service.verify(body.confirm_token, body.plan_hash, kind=TOKEN_KIND_INIT):
-        return _error(409, CODE_CONFIRM_INVALID, "Confirm token invalid or expired.")
-    plan = recall_plan(state, body.plan_hash)
+def _gesture(state: Any, body: InitApplyRequest, kind: str) -> Tuple[Optional[Any], Any, Optional[Any]]:
+    """The synchronous confirm gate shared by the baseline and the re-level:
+    ``(plan, dlq, None)``, or ``(None, None, the 409 response)``."""
+    if not state.token_service.verify(body.confirm_token, body.plan_hash, kind=kind):
+        return None, None, _error(409, CODE_CONFIRM_INVALID, "Confirm token invalid or expired.")
+    plan = recall_plan(state, body.plan_hash, kind)
     if plan is None:
-        return _error(409, CODE_PREVIEW_EXPIRED, "Preview no longer available: run it again.")
+        return None, None, _error(409, CODE_PREVIEW_EXPIRED, "Preview no longer available: run it again.")
     if (body.confirm or "").strip() != CONFIRM_WORD:
-        return _error(409, CODE_GESTURE_REQUIRED, "Type CONFERMO to apply.")
+        return None, None, _error(409, CODE_GESTURE_REQUIRED, "Type CONFERMO to apply.")
     dlq, why = baseline_service.parse_dlq(body.dlq_checked_at, body.dlq_count)
     if why is None:
         why = baseline_service.check_dlq(dlq, previewed_at=plan.previewed_at, now=datetime.now(timezone.utc))
     if why is not None:
-        return JSONResponse(status_code=409, content={"error": {
+        return None, None, JSONResponse(status_code=409, content={"error": {
             "code": CODE_GESTURE_REQUIRED, "message": "The /dlqs precondition is not met.", "reason": why}})
+    return plan, dlq, None
+
+
+def submit_init_apply(request: Request, body: InitApplyRequest, actor: str) -> Any:
+    state = request.app.state
+    plan, dlq, refused = _gesture(state, body, TOKEN_KIND_INIT)
+    if refused is not None:
+        return refused
     try:
         rec = state.job_store.create(KIND_APPLY)
     except JobBusyError:
@@ -230,6 +244,116 @@ def submit_init_apply(request: Request, body: InitApplyRequest, actor: str) -> A
         _store_factory(state, INIT_VERTICAL, actor), state.transport_factory, plan, dlq, actor,
     )
     return {"job_id": rec.job_id, "status": rec.status}
+
+
+# =============================================================================
+# The per-key re-level (§3.4): the gesture that releases a held key
+# =============================================================================
+RELEVEL_PREFIX = "/relevel"
+KIND_RELEVEL_PREVIEW = "relevel_preview"
+KIND_RELEVEL_APPLY = "relevel_apply"
+TOKEN_KIND_RELEVEL = "relevel"
+# Keys one re-level may carry (each costs a re-read and its writes under the lease).
+RELEVEL_MAX_KEYS = 50
+
+
+class RelevelPreviewRequest(BaseModel):
+    keys: List[List[str]]
+
+
+def serialize_relevel_plan(plan: Any) -> Dict[str, Any]:
+    return {"dry_run": plan.dry_run, "previewed_at": _iso(plan.previewed_at),
+            "keys": [asdict(k) for k in plan.keys]}
+
+
+def _run_relevel_job(store: Any, job_id: str, state: Any, register_factory: Callable[[], Any],
+                     transport_factory: Callable[[], Any], plan: Any, dlq: Any) -> None:
+    from backend.api.errors import map_exception  # local import: keep module light
+
+    store.mark_running(job_id)
+    register = None
+    try:
+        register = register_factory()
+        report = relevel_service.relevel_apply(register, transport_factory(), plan,
+                                               promo_location_id=state.promo_location_id, dlq=dlq)
+        if report.status == relevel_service.ST_APPLIED:
+            forget_plan(state, plan.plan_hash, TOKEN_KIND_RELEVEL)
+        store.mark_done(job_id, {"status": report.status, "applied": report.status == relevel_service.ST_APPLIED,
+                                 "plan_hash": plan.plan_hash, "report": asdict(report)})
+    except Exception as e:  # noqa: BLE001 - top-level job guard; bounded code only
+        err = map_exception(e)
+        logger.error("relevel apply job %s failed: %s -> %s", job_id, type(e).__name__, err.error_code)
+        store.mark_failed(job_id, err.error_code)
+    finally:
+        _close(register)
+
+
+def build_relevel_router() -> APIRouter:
+    """``GET /relevel/held`` (the held keys, a read), ``POST /relevel/preview``
+    ({keys}), ``POST /relevel/apply`` (the same confirm gate as the baseline)."""
+    router = APIRouter(prefix=RELEVEL_PREFIX, tags=["relevel"])
+
+    @router.get("/held")
+    def held(request: Request, actor: str = Depends(require_basic_auth)) -> Any:
+        register = request.app.state.register_factory(actor=actor)
+        try:
+            out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            for h in register.held_keys():
+                cur = out.setdefault(h.key, {"key": list(h.key), "kinds": [], "reasons": [], "events": 0})
+                cur["kinds"] = sorted(set(cur["kinds"]) | {h.kind})
+                cur["reasons"] = sorted(set(cur["reasons"]) | {h.reason})
+                cur["events"] += len(h.event_ids)
+        finally:
+            _close(register)
+        return {"held": [out[k] for k in sorted(out)]}
+
+    @router.post("/preview", status_code=202)
+    async def preview(request: Request, body: RelevelPreviewRequest, actor: str = Depends(require_basic_auth)) -> Any:
+        keys = [k for k in body.keys if len(k) == 2]
+        if not keys or len(keys) != len(body.keys) or len(keys) > RELEVEL_MAX_KEYS:
+            return _error(422, "invalid_keys", f"Give 1 to {RELEVEL_MAX_KEYS} keys, each [SKU, SIZE].")
+        state = request.app.state
+        try:
+            rec = state.job_store.create(KIND_RELEVEL_PREVIEW)
+        except JobBusyError:
+            return _error(409, CODE_JOB_BUSY, "An operation is already in flight.")
+        promo = state.promo_location_id
+
+        def _preview(register: Any, transport: Any) -> Any:
+            plan = relevel_service.relevel_preview(register, transport, keys, promo_location_id=promo)
+            remember_plan(state, plan, TOKEN_KIND_RELEVEL)
+            return plan
+
+        state.executor.submit(
+            _run_preview_job, state.job_store, rec.job_id, _store_factory(state, INIT_VERTICAL),
+            state.transport_factory, _preview, init_plan_hash, serialize_relevel_plan, state.token_service,
+            TOKEN_KIND_RELEVEL, INIT_VERTICAL.ttl_s, None,
+        )
+        return {"job_id": rec.job_id, "status": rec.status}
+
+    @router.get("/preview/{job_id}")
+    async def get_preview(job_id: str, request: Request, actor: str = Depends(require_basic_auth)) -> Any:
+        return poll_job(request, job_id)
+
+    @router.post("/apply", status_code=202)
+    async def apply(request: Request, body: InitApplyRequest, actor: str = Depends(require_basic_auth)) -> Any:
+        state = request.app.state
+        plan, dlq, refused = _gesture(state, body, TOKEN_KIND_RELEVEL)
+        if refused is not None:
+            return refused
+        try:
+            rec = state.job_store.create(KIND_RELEVEL_APPLY)
+        except JobBusyError:
+            return _error(409, CODE_JOB_BUSY, "An operation is already in flight.")
+        state.executor.submit(_run_relevel_job, state.job_store, rec.job_id, state,
+                              _store_factory(state, INIT_VERTICAL, actor), state.transport_factory, plan, dlq)
+        return {"job_id": rec.job_id, "status": rec.status}
+
+    @router.get("/apply/{job_id}")
+    async def get_apply(job_id: str, request: Request, actor: str = Depends(require_basic_auth)) -> Any:
+        return poll_job(request, job_id)
+
+    return router
 
 
 def build_init_router() -> APIRouter:
@@ -280,4 +404,8 @@ __all__ = [
     "forget_plan",
     "submit_init_apply",
     "build_init_router",
+    "RELEVEL_PREFIX",
+    "TOKEN_KIND_RELEVEL",
+    "RELEVEL_MAX_KEYS",
+    "build_relevel_router",
 ]

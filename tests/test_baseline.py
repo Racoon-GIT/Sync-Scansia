@@ -206,6 +206,27 @@ def test_a_upward_write_meeting_committed_holds_the_key_and_writes_nothing():
 # Level (b) and (c), and keys with no shelf pair
 # ---------------------------------------------------------------------------
 
+def test_b_a_draft_parked_key_is_left_at_n_not_held():
+    env = Env()
+    out = env.shop.product("Nike - Outlet", status="DRAFT", promo={"42": 1})
+    env.be.add_shelf_pair("SKU1", "42", reconciled=True)          # N 1, its unit parked, nothing pending
+    plan = env.preview()
+    assert (by_key(plan)[("SKU1", "42")].action, by_key(plan)[("SKU1", "42")].delta) == (B.ACT_ZERO, 0)
+    env.apply(plan)
+    assert env.mutations() == [] and env.shop.available(out.gid, "42") == 1 and env.held() == {}
+    assert env.invariant() == {}
+
+
+def test_a_key_with_no_shelf_pair_and_a_committed_unit_keeps_its_events_held():
+    env = Env()
+    env.shop.product("Nike - Outlet", promo={"42": 0}, committed={"42": 1})
+    gone = env.departed(size="42")
+    plan = env.preview()
+    assert by_key(plan)[("SKU1", "42")].reason == B.R_UNIT_HELD      # rule 4, D33: the −1 waits
+    env.apply(plan)
+    assert set(env.unstamped()) == set(gone)
+
+
 def test_b_zeroes_a_draft_outlet_leaves_the_shelf_events_pending_and_the_revive_restores_n():
     env = Env()
     out = env.shop.product("Nike - Outlet", status="DRAFT", promo={"42": 2})

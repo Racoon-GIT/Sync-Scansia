@@ -246,6 +246,116 @@
     }
   }
 
+  // ===========================================================================
+  // RE-LEVEL (per key, plan §3.4) — the held keys listed (or a key typed), the
+  // plan previewed, then the same confirm as the baseline (CONFERMO + /dlqs).
+  // ===========================================================================
+  const relevelState = { pending: null };
+
+  function addRelevelRow(key, h) {
+    const tbody = document.getElementById("relevel-held-tbody");
+    const tr = document.createElement("tr");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "relevel-key";
+    box.dataset.sku = key[0];
+    box.dataset.size = key[1];
+    box.checked = !h;
+    const td = document.createElement("td");
+    td.appendChild(box);
+    tr.appendChild(td);
+    [key[0], key[1], h ? h.kinds.join(", ") : "", h ? h.reasons.join(", ") : "", h ? h.events : ""].forEach(function (c) {
+      const cell = document.createElement("td");
+      cell.textContent = String(c);
+      tr.appendChild(cell);
+    });
+    tbody.appendChild(tr);
+  }
+
+  async function relevelHeld() {
+    const statusEl = document.getElementById("relevel-status");
+    try {
+      const data = await api("GET", "/relevel/held");
+      document.getElementById("relevel-held-tbody").innerHTML = "";
+      (data.held || []).forEach(function (h) { addRelevelRow(h.key, h); });
+      setStatus(statusEl, (data.held || []).length + " chiavi trattenute", "ok");
+    } catch (e) {
+      setStatus(statusEl, "errore: " + e.message, "error");
+    }
+  }
+
+  function relevelAdd() {
+    const sku = document.getElementById("relevel-sku").value.trim();
+    const size = document.getElementById("relevel-size").value.trim();
+    if (sku && size) addRelevelRow([sku, size], null);
+  }
+
+  async function relevelPreview() {
+    const statusEl = document.getElementById("relevel-status");
+    const keys = Array.prototype.slice.call(document.querySelectorAll(".relevel-key:checked"))
+      .map(function (b) { return [b.dataset.sku, b.dataset.size]; });
+    if (!keys.length) {
+      setStatus(statusEl, "seleziona almeno una chiave", "error");
+      return;
+    }
+    setStatus(statusEl, "calcolo piano...");
+    try {
+      const sub = await api("POST", "/relevel/preview", { keys: keys });
+      const rec = await pollJob("/relevel/preview/" + sub.job_id, INIT_POLL);
+      if (rec.status === "failed") {
+        setStatus(statusEl, jobFailureMessage(rec), "error");
+        return;
+      }
+      relevelState.pending = { plan_hash: rec.result.plan_hash, confirm_token: rec.result.confirm_token };
+      document.getElementById("relevel-plan-panel").classList.remove("hidden");
+      document.getElementById("relevel-outcome-panel").classList.add("hidden");
+      renderRows("relevel-plan-tbody", rec.result.plan.keys, function (k) {
+        return [k.sku, k.size, k.n, k.branch, k.reason, k.delta, (k.held || []).join(", ")]; });
+      setStatus(statusEl, "piano pronto — verifica e conferma", "ok");
+    } catch (e) {
+      setStatus(statusEl, "errore: " + e.message, "error");
+    }
+  }
+
+  async function relevelApply() {
+    if (!relevelState.pending) return;
+    const statusEl = document.getElementById("relevel-apply-status");
+    const btn = document.getElementById("btn-relevel-apply");
+    const dlqCount = document.getElementById("relevel-dlq-count").value;
+    const body = Object.assign({}, relevelState.pending, {
+      confirm: document.getElementById("relevel-confirm-word").value.trim(),
+      dlq_checked_at: document.getElementById("relevel-dlq-at").value || null,
+      dlq_count: dlqCount === "" ? null : Number(dlqCount),
+    });
+    btn.disabled = true;
+    setStatus(statusEl, "applico...");
+    try {
+      const sub = await api("POST", "/relevel/apply", body);
+      const rec = await pollJob("/relevel/apply/" + sub.job_id, INIT_POLL);
+      if (rec.status === "failed" || !rec.result || !rec.result.report) {
+        setStatus(statusEl, rec.status === "failed" ? jobFailureMessage(rec) : "risposta inattesa dal server.", "error");
+        return;
+      }
+      document.getElementById("relevel-outcome-panel").classList.remove("hidden");
+      renderRows("relevel-outcome-tbody", rec.result.report.outcomes, function (o) {
+        return [o.sku, o.size, o.branch, o.result, o.reason]; });
+      setStatus(statusEl, rec.result.applied ? "riallineamento eseguito" : "non applicato: " + rec.result.status,
+        rec.result.applied ? "ok" : "error");
+      if (rec.result.applied) relevelState.pending = null;
+    } catch (e) {
+      setStatus(statusEl, "errore: " + e.message + (e.reason ? " (" + e.reason + ")" : ""), "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function initRelevel() {
+    document.getElementById("btn-relevel-held").addEventListener("click", relevelHeld);
+    document.getElementById("btn-relevel-add").addEventListener("click", relevelAdd);
+    document.getElementById("btn-relevel-preview").addEventListener("click", relevelPreview);
+    document.getElementById("btn-relevel-apply").addEventListener("click", relevelApply);
+  }
+
   function initInitBanner() {
     document.getElementById("btn-init-preview").addEventListener("click", initPreview);
     document.getElementById("btn-init-apply").addEventListener("click", initApply);
@@ -895,6 +1005,7 @@
   // ===========================================================================
   document.addEventListener("DOMContentLoaded", function () {
     initInitBanner();
+    initRelevel();
     initTabs();
     initScansiaTab();
     initPublishTab();
