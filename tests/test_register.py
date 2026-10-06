@@ -352,3 +352,29 @@ def test_mark_sent_first_send_then_outcome(be):
     assert row.sent_at is not None and row.closed_at is None
     with pytest.raises(GuardMismatch):
         reg.record_outcome(lease, rid, expect=OPEN, status=FAILED)
+
+
+def test_supersede_writes_the_successor_and_closes_the_old_row_atomically(be):
+    from backend.persistence.records import SUPERSEDED
+
+    reg = be.register()
+    lease = StubLease(reg)
+    (old_id,) = reg.write_ahead(lease, [_row(group_id=9, event_ids=[1])])
+    old = reg.reconcile_rows(row_ids=[old_id])[0]
+    succ = _row(group_id=9, event_ids=[1], action="adjust")
+    new_id = reg.supersede(lease, old, succ, reason="past_window")
+    old, new = reg.reconcile_rows(row_ids=[old_id, new_id])
+    assert old.status == SUPERSEDED and old.outcome == {"reason": "past_window", "successor": new_id}
+    assert new.status == OPEN and new.group_id == 9
+
+    def crash(i, op):
+        if i == 1:
+            raise SimulatedCrash("between the two statements")
+
+    be.db.crash_hook = crash
+    with pytest.raises(SimulatedCrash):
+        reg.supersede(lease, new, _row(group_id=9, event_ids=[1]))
+    be.db.crash_hook = None
+    assert len(reg.reconcile_rows(group_id=9)) == 2          # no third row: rolled back whole
+    with pytest.raises(ValueError):
+        reg.supersede(lease, new, _row(group_id=10))         # the successor keeps the GROUP_ID

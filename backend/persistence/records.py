@@ -225,6 +225,21 @@ class InsertAudit:
 
 
 @dataclass(frozen=True)
+class InsertedId:
+    """In an ``UpdateAudit.outcome`` value: the id the ``index``-th
+    ``InsertAudit`` of the SAME transaction received (a successor named in its
+    predecessor's outcome, atomically — §3.3 rule 2)."""
+
+    index: int
+
+
+def resolve_inserted(outcome: Optional[Mapping[str, Any]], inserted: Sequence[int]) -> Optional[Dict[str, Any]]:
+    if outcome is None:
+        return None
+    return {k: (inserted[v.index] if isinstance(v, InsertedId) else v) for k, v in outcome.items()}
+
+
+@dataclass(frozen=True)
 class UpdateAudit:
     """Guarded ``UPDATE sm_outlet_audit … WHERE ID = ? AND STATUS = ?`` of a
     ``RECONCILE`` row — only the granted columns (SENT_AT, SENT_AVAILABLE,
@@ -414,7 +429,7 @@ __all__ = [
     "HOLD_BASELINE", "HOLD_RECOVERY", "HOLD_ROW", "HOLD_IN_FLIGHT",
     "PAIR_WRITABLE", "MAX_STAMP_IDS", "Key",
     "PairRow", "EventRow", "AuditRow", "LeaseRow", "Fence",
-    "InsertAudit", "UpdateAudit", "StampEvents", "UpdatePairs", "WriteOp", "REGISTER_OPS",
+    "InsertAudit", "InsertedId", "resolve_inserted", "UpdateAudit", "StampEvents", "UpdatePairs", "WriteOp", "REGISTER_OPS",
     "check_op_order", "Hold", "PendingDeltas",
     "StoreError", "LeaseLost", "GuardMismatch", "BaselineMissing", "DuplicateKey",
     "StoreClosed", "DatabaseUnavailable", "CommitUnknown", "LockWaitTimeout", "Deadlock",

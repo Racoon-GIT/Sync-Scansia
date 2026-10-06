@@ -66,6 +66,31 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   `racoon_staging`; its rows are marked (`f7test:` keys, order ids `73570…`, audit actor `f7test`) and deleted at
   each start — SERVER's A10 fixtures are left alone.
 
+## The reconciliation engine (§4.4, the lane's mechanism)
+
+- `services/ledger.py` — one `RECONCILE` row per Shopify write. `ACTION`: `adjust` (relative `available`
+  write; `PAYLOAD.purpose` `add` / `lower` carry a signed `share` of the group's Δ; `zero`, `excess`, `custom`,
+  `orphan`, `nonpromo`, `relevel` carry an absolute `target` and compute the delta at the send from the live
+  read), `activate` (explicit 0/0, only on an absent or inactive level), `deactivate` (no key), the state rows
+  `create`, `revive-tail`, `normalise` (`SENT_AT` + `STEP` before every call, `STEP` `<step>:ok` after), and
+  `stamp-only` (`DONE` at insert). First send: write-ahead (group) → rule 8 read (`ops.read_level`,
+  `includeInactive`) → premise check (else `FAILED` never sent) → `SENT_AT` + `SENT_AVAILABLE` + `REQUEST`
+  → send → outcome. Settle: all non-`SUPERSEDED` rows `APPLIED` → stamp (distinct union of the rows' event ids)
+  + `DONE`; beside `FAILED` / `HELD` → `APPLIED` rows `CARRIED` (`OUTCOME.moved` = what they moved).
+- Interpretation recorded: terminal path (ii) on a row never sent closes it `FAILED` "never sent", whatever its
+  kind (nothing sent → nothing landed; (ii)'s `HELD` protects a landed +Δ, which a never-sent row cannot be).
+- `referenceDocumentUri` of every inventory write: `gid://scansia-manager/OutletReconcile/<row id>` (Shopify's
+  inventory history names the row). Reason `correction`.
+- Transport (rule 9): a mutation is re-sent only after HTTP 429 or a `THROTTLED` top-level error (refused
+  before execution — shopify.dev GraphQL Admin rate limits); timeout / connection error / 5xx / unparseable /
+  `INTERNAL_SERVER_ERROR` / data beside errors → `ShopifyOutcomeUnknown`; other 4xx and top-level errors →
+  `ShopifyRefused` (nothing ran). Throttle waits capped at 10 s.
+- Admin API pin `2026-10` (`config.PINNED_API_VERSION`; `SHOPIFY_API_VERSION` may only restate it, else no boot),
+  read 2026-10-06 at shopify.dev/docs/api/usage/versioning ("Latest stable", accessible until 2027-10-16 15:00
+  UTC). Migrated at the pin: `productUpdate(product:)`; `Collection.sources` (`smart` = a sub-collections
+  source or a conditions source with inclusion conditions); inventory reads with `includeInactive: true`,
+  `isActive`, `tracked`, variant `title`. Raw doc pages were read as `.md` (curl), not through a summariser.
+
 ## Parameters the plan proposes, fixed here (each one tested)
 
 - Re-send window margin 1 h (§3.3 rule 2): the window is the first `SENT_AT` + 23 h.

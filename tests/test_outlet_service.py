@@ -1,438 +1,212 @@
-"""backend.services.outlet_service — PUBLISH orchestration on the register.
+"""backend.services.outlet_service — PUBLISH (the Δ > 0 flows) on the register
+and the RECONCILE ledger, end to end: the real ``ops`` documents against the
+stateful fake Shopify (``tests/fake_shop.py``), the register on the in-memory
+store.
 
-Every collaborator is in-memory: the register is the fake store
-(``backend.persistence.memory_store``, MySQL semantics), resolvers and ops are
-patched on their module objects so a single ``OpsMock`` records the exact
-orchestration call ORDER (the point of the anti-phantom-stock branch). NO HTTP,
-NO live store, NO database.
-
-These are the sheet-era publish tests ported to the register — the parity oracle
-of the positive-delta flows (plan §4 step 2): CREATE order, phantom-stock
-isolation, ACTIVE no-re-inflate, TOCTOU VERIFY_FAILED, FIX4, size-primary
-matching (now exact, §3.2), DRY_RUN read-only, the post-review fixes. Retired
-with the ``frozen_pre`` branches (§3.3, not ported): the sheet era's
-"delta exactly-once" pair (compare-mismatch "already applied" / strict
-mismatch) — the register stamps events, and §4 step 4 replaces the
-compare-with-frozen decision by a relative write with ``changeFromQuantity``.
+Part 1 is the parity oracle (plan §4 step 2): the sheet-era publish tests
+re-expressed on the register — CREATE's anti-phantom-stock order, phantom-stock
+isolation, no re-inflate, TOCTOU, FIX4, size-primary matching (exact, §3.2),
+DRY_RUN read-only, the post-review fixes. Retired with the ``frozen_pre``
+branches (§3.3, not ported): the "delta exactly-once" compare-with-frozen pair.
+Part 2 is F7's own (§3.3's Δ > 0 row, rules 2, 6, 7, 9; §3.5's one price per SKU).
 """
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import List
 
 import pytest
 
 from backend.persistence.records import (
     DONE,
-    HOLD_BASELINE,
+    FAILED,
+    HELD,
+    OPEN,
     BaselineMissing,
+    Fence,
     InsertAudit,
 )
-from backend.services import outlet_service
-from backend.services import resolvers
+from backend.services import ledger as L
+from backend.services import outlet_service, passes
 from backend.services.lease import PassLease
 from backend.shopify import ops
 
+from tests.fake_shop import MAG, PROMO, FakeShop
 from tests.register_fixtures import MemoryBackend
 
-PROMO = "gid://shopify/Location/PROMO"
-MAG = "gid://shopify/Location/MAG"
-PUB = "gid://shopify/Publication/OS"
-OUT = "gid://shopify/Product/500"
+MUTATIONS = {"duplicate", "adjust", "activate", "deactivate", "bulk", "status", "publish", "delete"}
 
-_MUTATION_OPS = {
-    "product_duplicate",
-    "inventory_set_quantities",
-    "inventory_deactivate",
-    "product_variants_bulk_update",
-    "product_update_status",
-    "product_publish",
-}
-
-
-# ---------------------------------------------------------------------------
-# Builders
-# ---------------------------------------------------------------------------
 
 class World:
-    """The register (fake) with its whole-register baseline already recorded."""
-
-    def __init__(self) -> None:
+    def __init__(self, *, baseline: bool = True) -> None:
         self.be = MemoryBackend()
-        self.be.seed_baseline()
+        if baseline:
+            self.be.seed_baseline()
+        self.shop = FakeShop()
 
-    def returned(self, sku, size, n=1, *, price_outlet="50.00", price_high="100.00", **kw) -> List[int]:
-        """``n`` pairs of (sku, size) on the shelf, each with its pending +1."""
+    def returned(self, sku="SKU1", size="42", n=1, *, price_outlet="50.00", price_high="100.00", **kw) -> List[int]:
         out = []
         for _ in range(n):
-            _, eid = self.be.add_shelf_pair(sku, size, price_outlet=price_outlet,
-                                            price_high=price_high, **kw)
+            _, eid = self.be.add_shelf_pair(sku, size, price_outlet=price_outlet, price_high=price_high, **kw)
             out.append(eid)
         return out
 
     def register(self):
         return self.be.register(actor="tester")
 
+    def preview(self):
+        return outlet_service.publish_preview(self.register(), self.shop, promo_location_id=PROMO)
+
+    def apply(self, plan, **kw):
+        reg = self.register()
+        lease = kw.pop("lease", None) or PassLease(reg, "publish", sleep=lambda s: None)
+        return outlet_service.publish_apply(reg, self.shop, plan, promo_location_id=PROMO, lease=lease,
+                                            take_bound_s=0, **kw)
+
+    def run(self):
+        plan = self.preview()
+        return plan, self.apply(plan)
+
     def unstamped(self) -> List[int]:
         return [e.event_id for e in self.be.store().read_unstamped_events()]
 
-    def writes(self) -> List[str]:
-        return [x[0] for x in self.be.db.log if x[0] in ("renew", "insert_audit", "stamp", "update_pairs",
-                                                          "update_audit", "commit")]
+    def rows(self, **kw):
+        return self.register().reconcile_rows(**kw)
+
+    def mutated(self) -> List[str]:
+        return [n for n in self.shop.names() if n in MUTATIONS]
 
 
-def _level(loc_id, available, on_hand=None, committed=0):
-    return {"location_id": loc_id, "location_name": loc_id.split("/")[-1],
-            "available": available, "committed": committed,
-            "on_hand": available if on_hand is None else on_hand}
+def _source(w: World, sizes=("42", "43"), **kw):
+    return w.shop.product("Nike Air", outlet=False, sizes=sizes, **kw)
 
 
-def _inv_variant(vid, size, item_id, levels, policy="DENY", truncated=False, sku=None):
-    return {"id": vid, "sku": sku, "title": size, "inventoryPolicy": policy,
-            "selectedOptions": [{"name": "Size", "value": size}],
-            "inventoryItemId": item_id, "levels": levels, "levels_truncated": truncated}
+# =============================================================================
+# Part 1 — the parity oracle
+# =============================================================================
 
-
-def _src_variant(vid, size, item_id, sku="SKU1"):
-    return {"id": vid, "sku": sku, "title": size, "price": "100.00",
-            "compareAtPrice": "100.00", "inventoryItem": {"id": item_id},
-            "selectedOptions": [{"name": "Size", "value": size}]}
-
-
-def _outlet_match(gid, status):
-    return {"product_gid": gid, "title": "Nike - Outlet", "handle": "nike-outlet",
-            "status": status, "is_outlet_member": True, "title_is_outlet": True,
-            "review": False, "matched_variant_gids": [gid + "/v"]}
-
-
-def _source_match(gid, title="Nike Air"):
-    return {"product_gid": gid, "title": title, "handle": "nike-air",
-            "status": "ACTIVE", "is_outlet_member": False, "title_is_outlet": False,
-            "review": False, "matched_variant_gids": [gid + "/v"]}
-
-
-class OpsMock:
-    """Patches every ops.* / resolvers.* used by the service and records calls."""
-
-    def __init__(self, monkeypatch, *, inv_by_gid=None, source_variants=None,
-                 outlet=None, source=None, new_gid="gid://shopify/Product/900",
-                 outlet_by_sku=None, source_by_sku=None, read_inv_raises=None):
-        self.calls: List[tuple] = []
-        self.inv_by_gid: Dict[str, list] = inv_by_gid or {}
-        self.source_variants: list = source_variants or []
-        self.new_gid = new_gid
-        self.outlet = outlet if outlet is not None else {"matches": [], "warning": None}
-        self.source = source if source is not None else {"matches": [], "warning": None}
-        self.outlet_by_sku: Dict[str, dict] = outlet_by_sku or {}
-        self.source_by_sku: Dict[str, dict] = source_by_sku or {}
-        self.status_by_gid: Dict[str, str] = {}
-        self.status_history: List[tuple] = []
-        self.read_inv_raises: Dict[str, Exception] = read_inv_raises or {}
-        self.on_set = None  # hook: called on each inventory_set_quantities
-
-        monkeypatch.setattr(resolvers, "outlet_resolver", lambda t, sku: self.outlet_by_sku.get(sku, self.outlet))
-        monkeypatch.setattr(resolvers, "source_resolver", lambda t, sku: self.source_by_sku.get(sku, self.source))
-        monkeypatch.setattr(ops, "product_duplicate", self._duplicate)
-        monkeypatch.setattr(ops, "read_variant_inventory", self._read_inv)
-        monkeypatch.setattr(ops, "get_product_variants", self._get_variants)
-        monkeypatch.setattr(ops, "inventory_set_quantities", self._set_qty)
-        monkeypatch.setattr(ops, "inventory_deactivate", self._deactivate)
-        monkeypatch.setattr(ops, "product_variants_bulk_update", self._bulk)
-        monkeypatch.setattr(ops, "product_update_status", self._status)
-        monkeypatch.setattr(ops, "product_publish", self._publish)
-        monkeypatch.setattr(ops, "get_online_store_publication_id", lambda t: PUB)
-
-    def _duplicate(self, t, src, title):
-        self.calls.append(("product_duplicate", src, title))
-        self.status_by_gid[self.new_gid] = "DRAFT"
-        self.status_history.append((self.new_gid, "DRAFT"))
-        return self.new_gid
-
-    def _read_inv(self, t, gid):
-        self.calls.append(("read_variant_inventory", gid))
-        if gid in self.read_inv_raises:
-            raise self.read_inv_raises[gid]
-        return [dict(v) for v in self.inv_by_gid.get(gid, [])]
-
-    def _get_variants(self, t, gid):
-        self.calls.append(("get_product_variants", gid))
-        return list(self.source_variants)
-
-    def _set_qty(self, t, item, loc, qty, *a, **k):
-        self.calls.append(("inventory_set_quantities", item, loc, qty))
-        if self.on_set is not None:
-            self.on_set(item, loc, qty)
-        return {}
-
-    def _deactivate(self, t, item, loc):
-        self.calls.append(("inventory_deactivate", item, loc))
-
-    def _bulk(self, t, gid, variants):
-        self.calls.append(("product_variants_bulk_update", gid, variants))
-        return {}
-
-    def _status(self, t, gid, status):
-        self.calls.append(("product_update_status", gid, status))
-        self.status_by_gid[gid] = status
-        self.status_history.append((gid, status))
-        return {}
-
-    def _publish(self, t, gid, pub):
-        self.calls.append(("product_publish", gid, pub))
-        return {}
-
-    @property
-    def names(self) -> List[str]:
-        return [c[0] for c in self.calls]
-
-    def idx(self, name) -> List[int]:
-        return [i for i, c in enumerate(self.calls) if c[0] == name]
-
-    def sets(self, name="inventory_set_quantities") -> List[tuple]:
-        return [c for c in self.calls if c[0] == name]
-
-
-def _dup_inv_two_sizes():
-    """Duplicate inherits stock on Promo (both sizes) AND Magazzino (non-Promo)."""
-    return [
-        _inv_variant("gid/DUP/v42", "42", "gid/DUP/i42", [_level(PROMO, 5), _level(MAG, 3)]),
-        _inv_variant("gid/DUP/v43", "43", "gid/DUP/i43", [_level(PROMO, 5), _level(MAG, 3)]),
-    ]
-
-
-def _preview_apply(w: World, **kw):
-    reg = w.register()
-    plan = outlet_service.publish_preview(reg, object(), promo_location_id=PROMO)
-    report = outlet_service.publish_apply(reg, object(), plan, promo_location_id=PROMO, **kw)
-    return plan, report
-
-
-# ---------------------------------------------------------------------------
-# 1) CREATE — exact anti-phantom-stock ORDER
-# ---------------------------------------------------------------------------
-
-def test_create_branch_exact_order(monkeypatch):
+def test_create_branch_exact_order():
     w = World()
-    events = w.returned("SKU1", "42", 2)
-    m = OpsMock(
-        monkeypatch,
-        source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
-        source_variants=[_src_variant("V42", "42", "IIT42"), _src_variant("V43", "43", "IIT43")],
-        inv_by_gid={"gid://shopify/Product/900": _dup_inv_two_sizes()},
-    )
-    plan, report = _preview_apply(w)
+    events = w.returned(n=2)
+    _source(w, promo={"42": 5, "43": 5}, mag={"42": 3, "43": 3})
+    plan, rep = w.run()
     assert plan.actions[0].branch == "CREATE"
-    assert report.outcomes[0].status == "APPLIED"
-    assert sorted(report.outcomes[0].stamped_event_ids) == sorted(events)
-
-    names = m.names
-    dup_i = m.idx("product_duplicate")
-    assert len(dup_i) == 1
-    dup_i = dup_i[0]
-    inv_mut = [i for i, c in enumerate(m.calls) if c[0] in _MUTATION_OPS - {"product_duplicate"}]
-    assert dup_i < min(inv_mut)
-    last_deact = max(m.idx("inventory_deactivate"))
-    promo_zeros = [i for i, c in enumerate(m.calls)
-                   if c[0] == "inventory_set_quantities" and c[2] == PROMO and c[3] == 0]
-    assert last_deact < min(promo_zeros)
-    delta_i = next(i for i, c in enumerate(m.calls)
-                   if c[0] == "inventory_set_quantities" and c[2] == PROMO and c[3] == 2)
-    assert max(promo_zeros) < delta_i
-    bulk_i = m.idx("product_variants_bulk_update")[0]
-    assert delta_i < bulk_i
-    assert names[-2] == "product_update_status" and m.calls[-2][2] == "ACTIVE"
-    assert names[-1] == "product_publish"
-    variants_input = m.calls[bulk_i][2]
-    assert all(v["inventoryPolicy"] == "DENY" for v in variants_input)
-    assert all(v["price"] == "50.00" and v["compareAtPrice"] == "100.00" for v in variants_input)
+    (o,) = rep.outcomes
+    assert o.status == "APPLIED" and sorted(o.stamped_event_ids) == sorted(events)
+    names = w.mutated()
+    assert names[0] == "duplicate"                                     # (1) before every other mutation
+    adj = [(i, c) for i, c in enumerate(w.shop.calls) if c[0] == "adjust"]
+    deact = [i for i, c in enumerate(w.shop.calls) if c[0] == "deactivate"]
+    mag_zero = [i for i, c in adj if c[1]["input"]["changes"][0]["locationId"] == MAG]
+    promo_zero = [i for i, c in adj if c[1]["input"]["changes"][0]["locationId"] == PROMO
+                  and c[1]["input"]["changes"][0]["delta"] < 0]
+    add = [i for i, c in adj if c[1]["input"]["changes"][0]["delta"] > 0]
+    for i in deact:                                                    # (2) each level zeroed, then disconnected
+        assert any(j < i for j in mag_zero)
+    assert max(deact) < min(promo_zero)                                # every non-Promo before the Promo zeros
+    assert max(promo_zero) < min(add)                                  # (3)/(4) the Δ after the zeros
+    bulk = [i for i, c in enumerate(w.shop.calls) if c[0] == "bulk"]
+    assert max(add) < min(bulk)                                        # (5) DENY after the Δ
+    assert names[-2:] == ["status", "publish"]                         # (6) ACTIVE, publish LAST
+    dup = next(g for g, p in w.shop.products.items() if p.title == "Nike Air - Outlet")
+    assert w.shop.products[dup].status == "ACTIVE" and w.shop.products[dup].published
+    assert all(v.policy == "DENY" and v.tracked and v.price == "50.00" and v.compare_at == "100.00"
+               for v in w.shop.products[dup].variants)
     assert w.unstamped() == []
 
 
-# ---------------------------------------------------------------------------
-# 2) CREATE — phantom-stock: only the returned size ends up with Promo stock
-# ---------------------------------------------------------------------------
-
-def test_create_isolates_returned_size_only(monkeypatch):
+def test_create_isolates_returned_size_only():
     w = World()
-    w.returned("SKU1", "42", 2)  # size 43 NOT returned
-    m = OpsMock(
-        monkeypatch,
-        source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
-        source_variants=[_src_variant("V42", "42", "IIT42"), _src_variant("V43", "43", "IIT43")],
-        inv_by_gid={"gid://shopify/Product/900": _dup_inv_two_sizes()},
-    )
-    _preview_apply(w)
-    nonzero = [c for c in m.sets() if c[3] > 0]
-    assert nonzero == [("inventory_set_quantities", "gid/DUP/i42", PROMO, 2)]
-    assert ("inventory_deactivate", "gid/DUP/i42", MAG) in m.calls
-    assert ("inventory_deactivate", "gid/DUP/i43", MAG) in m.calls
-    assert ("inventory_set_quantities", "gid/DUP/i43", PROMO, 0) in m.calls
+    w.returned(n=2)                                                    # size 43 NOT returned
+    _source(w, promo={"42": 5, "43": 5}, mag={"42": 3, "43": 3})
+    w.run()
+    dup = next(g for g, p in w.shop.products.items() if p.title == "Nike Air - Outlet")
+    assert w.shop.available(dup, "42") == 2 and w.shop.available(dup, "43") == 0
+    for size in ("42", "43"):
+        mag = w.shop.levels[(w.shop.variant(dup, size).item, MAG)]
+        assert mag.available == 0 and mag.active is False
 
 
-# ---------------------------------------------------------------------------
-# 3) ACTIVE — a stamped event is never re-applied (no re-inflate)
-# ---------------------------------------------------------------------------
-
-def test_active_does_not_reapply_a_stamped_event(monkeypatch):
+def test_active_does_not_reapply_a_stamped_event():
     w = World()
-    p_old, e_old = w.be.add_shelf_pair("SKU1", "42", reconciled=True,
-                                       price_outlet="50.00", price_high="100.00")
-    (e_new,) = w.returned("SKU1", "43")
-    inv = [
-        _inv_variant("v42", "42", "i42", [_level(PROMO, 2)]),
-        _inv_variant("v43", "43", "i43", [_level(PROMO, 0)]),
-    ]
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
-                inv_by_gid={OUT: inv})
-    plan, report = _preview_apply(w)
-    assert plan.actions[0].branch == "ACTIVE"
-    assert report.outcomes[0].status == "APPLIED"
-    assert m.sets() == [("inventory_set_quantities", "i43", PROMO, 1)]
-    assert report.outcomes[0].stamped_event_ids == (e_new,)
-    assert w.unstamped() == []
+    w.be.add_shelf_pair("SKU1", "42", reconciled=True, price_outlet="50.00", price_high="100.00")
+    (e_new,) = w.returned(size="43")
+    out = w.shop.product("Nike - Outlet", promo={"42": 1, "43": 0})
+    plan, rep = w.run()
+    assert plan.actions[0].branch == "ACTIVE" and rep.outcomes[0].status == "APPLIED"
+    adds = [c for c in w.shop.calls if c[0] == "adjust"]
+    assert len(adds) == 1 and adds[0][1]["input"]["changes"][0]["delta"] == 1
+    assert (w.shop.available(out.gid, "42"), w.shop.available(out.gid, "43")) == (1, 1)
+    assert rep.outcomes[0].stamped_event_ids == (e_new,)
 
 
-# ---------------------------------------------------------------------------
-# 4) A key's Δ is the SUM of its events; every event of the group is stamped
-# ---------------------------------------------------------------------------
-
-def test_a_key_group_sums_its_events_and_stamps_all_of_them(monkeypatch):
+def test_a_key_group_sums_its_events_and_stamps_all_of_them():
     w = World()
-    e1, e2 = w.returned("SKU1", "42", 2)
-    e3 = w.be.consume("SKU1", "42")                       # a full-price sale: −1
-    inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 0)])]
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
-                inv_by_gid={OUT: inv})
-    plan, report = _preview_apply(w)
+    e1, e2 = w.returned(n=2)
+    e3 = w.be.consume("SKU1", "42")                                    # −1: Δ = +1
+    out = w.shop.product("Nike - Outlet", promo={"42": 0})
+    plan, rep = w.run()
     (st,) = plan.actions[0].size_targets
     assert st.delta == 1 and sorted(st.event_ids) == sorted([e1, e2, e3])
-    assert m.sets() == [("inventory_set_quantities", "i42", PROMO, 1)]
-    assert sorted(report.outcomes[0].stamped_event_ids) == sorted([e1, e2, e3])
+    assert w.shop.available(out.gid, "42") == 1
+    assert sorted(rep.outcomes[0].stamped_event_ids) == sorted([e1, e2, e3])
 
 
-# ---------------------------------------------------------------------------
-# 5) No Δ > 0 group → nothing planned, nothing written (Δ ≤ 0 is the decrement's)
-# ---------------------------------------------------------------------------
-
-def test_no_positive_group_plans_nothing_and_writes_nothing(monkeypatch):
+def test_no_positive_group_plans_nothing_and_writes_nothing():
     w = World()
-    p, _ = w.be.add_shelf_pair("SKU1", "42", reconciled=True)
-    e0 = w.be.consume("SKU1", "42", outlet_line=True)      # Δ 0: an outlet-line sale
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "DRAFT")], "warning": None})
-    plan, report = _preview_apply(w)
-    assert plan.actions == () and report.outcomes == ()
-    assert not any(n in _MUTATION_OPS for n in m.names)
-    assert w.unstamped() == [e0]
+    w.be.add_shelf_pair("SKU1", "42", reconciled=True)
+    w.be.add_shelf_pair("SKU1", "42", reconciled=True)
+    e0 = w.be.consume("SKU1", "42", outlet_line=True)                  # Δ 0: the decrement's
+    w.shop.product("Nike - Outlet", status="DRAFT", promo={"42": 0})
+    plan, rep = w.run()
+    assert plan.actions == () and rep.outcomes == ()
+    assert w.mutated() == [] and w.unstamped() == [e0]
 
 
-# ---------------------------------------------------------------------------
-# 6) TOCTOU — live branch changed between preview and apply => VERIFY_FAILED
-# ---------------------------------------------------------------------------
-
-def test_toctou_branch_drift_aborts_verify_failed(monkeypatch):
+def test_toctou_branch_drift_aborts_verify_failed():
     w = World()
-    w.returned("SKU1", "42", 2)
-    inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 0)])]
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
-                inv_by_gid={OUT: inv})
-    reg = w.register()
-    plan = outlet_service.publish_preview(reg, object(), promo_location_id=PROMO)
-    assert plan.actions[0].branch == "ACTIVE"
-    m.outlet = {"matches": [_outlet_match(OUT, "DRAFT")], "warning": None}  # drift ACTIVE->DRAFT
-    report = outlet_service.publish_apply(reg, object(), plan, promo_location_id=PROMO)
-    assert report.outcomes[0].status == "VERIFY_FAILED"
-    assert not any(n in _MUTATION_OPS for n in m.names)
-    assert len(w.unstamped()) == 2
+    w.returned(n=2)
+    out = w.shop.product("Nike - Outlet", promo={"42": 0})
+    plan = w.preview()
+    w.shop.products[out.gid].status = "DRAFT"                          # drift ACTIVE -> DRAFT
+    rep = w.apply(plan)
+    assert rep.outcomes[0].status == "VERIFY_FAILED"
+    assert w.mutated() == [] and len(w.unstamped()) == 2
 
-
-# ---------------------------------------------------------------------------
-# 7) FIX4 — price 0 and price >= compareAt both BLOCK publish
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("outlet_price,high", [("0.00", "100.00"), ("120.00", "100.00"), (None, "100.00")])
-def test_fix4_invalid_price_blocks_publish(monkeypatch, outlet_price, high):
+def test_fix4_invalid_price_blocks_publish(outlet_price, high):
     w = World()
-    w.returned("SKU1", "42", 2, price_outlet=outlet_price, price_high=high)
-    m = OpsMock(monkeypatch,
-                source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
-                source_variants=[_src_variant("V42", "42", "IIT42")])
-    plan, report = _preview_apply(w)
+    w.returned(n=2, price_outlet=outlet_price, price_high=high)
+    _source(w)
+    plan, rep = w.run()
     act = plan.actions[0]
     assert act.publishable is False and act.reason == "price_invalid"
-    assert report.outcomes[0].status == "PRICE_INVALID"
-    assert "product_duplicate" not in m.names
+    assert rep.outcomes[0].status == "PRICE_INVALID" and "duplicate" not in w.shop.names()
     assert len(w.unstamped()) == 2
 
 
-# ---------------------------------------------------------------------------
-# 8) Size-primary match, now EXACT (§3.2): SKU mismatch only surfaced
-# ---------------------------------------------------------------------------
-
-def test_size_primary_exact_match_ignores_sku(monkeypatch):
+def test_size_primary_exact_match_ignores_sku():
     w = World()
-    w.returned("SKU1", "42", 2)
-    src = [_src_variant("V42", "42", "IIT42", sku="ZZZ"),
-           _src_variant("V43", "43", "IIT43", sku="SKU1")]
-    dup_inv = [_inv_variant("dV42", "42", "dI42", [_level(PROMO, 0)]),
-               _inv_variant("dV43", "43", "dI43", [_level(PROMO, 0)])]
-    m = OpsMock(monkeypatch,
-                source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
-                source_variants=src, inv_by_gid={"gid://shopify/Product/900": dup_inv})
-    plan, _ = _preview_apply(w)
+    w.returned(n=2)
+    src = _source(w)
+    w.shop.variant(src.gid, "42").sku = "ZZZ"                          # SKU mismatch on the 42 variant
+    plan, rep = w.run()
     st = plan.actions[0].size_targets[0]
-    assert st.size == "42" and st.matched is True and st.variant_id == "V42"
-    assert any(x.startswith("sku_mismatch_on_size:42") for x in plan.actions[0].warnings)
-    assert ("inventory_set_quantities", "dI42", PROMO, 2) in m.calls
+    assert st.size == "42" and st.matched and st.variant_id == w.shop.variant(src.gid, "42").id
+    assert any(x.startswith("sku_mismatch_on_size:42:ZZZ") for x in plan.actions[0].warnings)
 
 
-def test_a_spelling_twin_is_surfaced_never_published(monkeypatch):
+def test_dry_run_preview_is_read_only():
     w = World()
-    (e_twin,) = w.returned("AR-K-33PC", "42L")
-    (e_ok,) = w.returned("AR-K-33PC", "43")
-    inv = [_inv_variant("v42", "42 L", "i42", [_level(PROMO, 0)]),
-           _inv_variant("v43", "43", "i43", [_level(PROMO, 0)])]
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
-                inv_by_gid={OUT: inv})
-    plan, report = _preview_apply(w)
-    act = plan.actions[0]
-    assert act.unmatched_sizes == ("42L",)
-    assert "size_twin:42L:42 L" in act.warnings
-    assert m.sets() == [("inventory_set_quantities", "i43", PROMO, 1)]   # never "42 L"
-    assert report.outcomes[0].stamped_event_ids == (e_ok,)
-    assert w.unstamped() == [e_twin]                                     # pending, surfaced
-
-
-def test_customisation_only_variant_never_matches(monkeypatch):
-    w = World()
-    (e,) = w.returned("SKU1", "Solo Personalizzazione")
-    inv = [_inv_variant("vc", "Solo Personalizzazione", "ic", [_level(PROMO, 0)])]
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
-                inv_by_gid={OUT: inv})
-    plan, _ = _preview_apply(w)
-    assert plan.actions[0].unmatched_sizes == ("Solo Personalizzazione",)
-    assert m.sets() == [] and w.unstamped() == [e]
-
-
-# ---------------------------------------------------------------------------
-# 9) DRY_RUN — preview mutates NOTHING (Shopify nor register)
-# ---------------------------------------------------------------------------
-
-def test_dry_run_preview_is_read_only(monkeypatch):
-    w = World()
-    w.returned("SKU1", "42", 2)
-    m = OpsMock(monkeypatch,
-                source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
-                source_variants=[_src_variant("V42", "42", "IIT42")])
+    w.returned(n=2)
+    _source(w)
     w.be.db.log.clear()
-    plan = outlet_service.publish_preview(w.register(), object(), promo_location_id=PROMO)
+    plan = w.preview()
     assert plan.dry_run is True and plan.actions[0].branch == "CREATE"
-    assert w.writes() == []                                    # no lease, no write, no stamp
-    assert not any(x[0].startswith("lease") for x in w.be.db.log)
-    assert not any(n in _MUTATION_OPS for n in m.names)
+    assert not any(x[0] in ("renew", "commit", "insert_audit", "stamp") or x[0].startswith("lease")
+                   for x in w.be.db.log)
+    assert w.mutated() == []
 
-
-# ---------------------------------------------------------------------------
-# 10) main.py FIX2 — DRY_RUN fail-closed
-# ---------------------------------------------------------------------------
 
 def test_main_resolve_dry_run_fail_closed(monkeypatch):
     import main
@@ -460,234 +234,435 @@ def test_legacy_run_mode_sync_is_retired():
         outlet_service.run(dry_run=True)
 
 
-# ---------------------------------------------------------------------------
-# POST-REVIEW FIXES (fix1..fix6) — business-critical publish-outlet hardening
-# ---------------------------------------------------------------------------
-
-def test_create_duplicate_is_draft_atomically_fix1(monkeypatch):
+def test_create_duplicate_is_draft_atomically_fix1():
     w = World()
-    w.returned("SKU1", "42", 2)
-    m = OpsMock(
-        monkeypatch,
-        source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
-        source_variants=[_src_variant("V42", "42", "IIT42")],
-        inv_by_gid={"gid://shopify/Product/900": [_inv_variant("dV42", "42", "dI42", [_level(PROMO, 0)])]},
-    )
-    _, report = _preview_apply(w)
-    assert report.outcomes[0].status == "APPLIED"
-    assert m.status_history[0] == (m.new_gid, "DRAFT")
-    assert m.status_history[-1] == (m.new_gid, "ACTIVE")
-    assert m.status_by_gid[m.new_gid] == "ACTIVE"
+    w.returned(n=2)
+    _source(w)
+    w.run()
+    (dup_call,) = [c for c in w.shop.calls if c[0] == "duplicate"]
+    assert dup_call[1]["newStatus"] == "DRAFT"
+    status_calls = [c[1]["product"]["status"] for c in w.shop.calls if c[0] == "status"]
+    assert status_calls == ["ACTIVE"]                                  # the only flip, the last but one
 
 
-def test_draft_revive_quarantines_non_promo_stock_fix2(monkeypatch):
+def test_draft_revive_quarantines_non_promo_stock_fix2():
     w = World()
-    w.returned("SKU1", "42", 2)
-    inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 0), _level(MAG, 3)])]
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "DRAFT")], "warning": None},
-                inv_by_gid={OUT: inv})
-    plan, report = _preview_apply(w)
-    assert plan.actions[0].branch == "DRAFT"
-    assert plan.actions[0].reason == "quarantine" and plan.actions[0].publishable is False
-    assert report.outcomes[0].status == "QUARANTINED"
-    assert not any(n in _MUTATION_OPS for n in m.names)
-    assert len(w.unstamped()) == 2
+    w.returned(n=2)
+    w.shop.product("Nike - Outlet", status="DRAFT", promo={"42": 0}, mag={"42": 3})
+    plan, rep = w.run()
+    assert plan.actions[0].branch == "DRAFT" and plan.actions[0].reason == "quarantine"
+    assert rep.outcomes[0].status == "QUARANTINED" and w.mutated() == [] and len(w.unstamped()) == 2
 
 
-def test_draft_revive_adds_on_the_live_level_then_activates_last(monkeypatch):
+def test_draft_revive_adds_on_the_live_level_then_activates_last():
     w = World()
-    (e,) = w.returned("SKU1", "42")
-    inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 1)])]
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "DRAFT")], "warning": None},
-                inv_by_gid={OUT: inv})
-    _, report = _preview_apply(w)
-    assert report.outcomes[0].status == "REVIVED"
-    assert m.sets() == [("inventory_set_quantities", "i42", PROMO, 2)]    # E9: live + Δ
-    assert m.names[-2:] == ["product_update_status", "product_publish"]
-    assert report.outcomes[0].stamped_event_ids == (e,)
+    (e,) = w.returned()
+    out = w.shop.product("Nike - Outlet", status="DRAFT", promo={"42": 1, "43": 2})   # 43: no shelf pair
+    _plan, rep = w.run()
+    assert rep.outcomes[0].status == "REVIVED"
+    assert w.shop.available(out.gid, "42") == 2                        # E9: live + Δ
+    assert w.shop.available(out.gid, "43") == 0                        # zeroed: no shelf pair (R4)
+    assert w.mutated()[-2:] == ["status", "publish"] and w.shop.products[out.gid].status == "ACTIVE"
+    assert rep.outcomes[0].stamped_event_ids == (e,)
 
 
-def test_error_isolation_runtime_error_does_not_abort_batch_fix3(monkeypatch):
+def test_error_isolation_runtime_error_does_not_abort_batch_fix3():
     w = World()
-    w.returned("SKU1", "42", 1)
-    (e2,) = w.returned("SKU2", "42", 1)
-    gid2 = "gid://shopify/Product/502"
-    OpsMock(
-        monkeypatch,
-        outlet={"matches": [], "warning": None},
-        source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
-        source_variants=[_src_variant("V42", "42", "IIT42", sku="SKU1")],
-        outlet_by_sku={"SKU2": {"matches": [_outlet_match(gid2, "ACTIVE")], "warning": None}},
-        inv_by_gid={gid2: [_inv_variant("v42", "42", "i42", [_level(PROMO, 0)])]},
-        read_inv_raises={"gid://shopify/Product/900": RuntimeError("boom")},
-    )
-    plan, report = _preview_apply(w)
-    assert {a.sku: a.branch for a in plan.actions} == {"SKU1": "CREATE", "SKU2": "ACTIVE"}
-    by_sku = {o.sku: o for o in report.outcomes}
-    assert by_sku["SKU1"].status == "ERROR"
-    assert any(x.startswith("unexpected_error:RuntimeError") for x in by_sku["SKU1"].warnings)
-    assert by_sku["SKU2"].status == "APPLIED"
-    assert by_sku["SKU2"].stamped_event_ids == (e2,)
+    w.returned(sku="SKU1", n=1)
+    (e2,) = w.returned(sku="SKU2", n=1)
+    _source(w, sku="SKU1")
+    w.shop.product("Nike2 - Outlet", sku="SKU2", promo={"42": 0})
+    w.shop.fault("duplicate", "refuse")                                # SKU1's CREATE is refused
+    plan, rep = w.run()
+    by = {o.sku: o for o in rep.outcomes}
+    assert by["SKU1"].status == "ERROR" and by["SKU2"].status == "APPLIED"
+    assert by["SKU2"].stamped_event_ids == (e2,)
 
 
 def test_publication_resolved_eager_before_any_mutation_fix4(monkeypatch):
     w = World()
-    w.returned("SKU1", "42", 2)
-    m = OpsMock(
-        monkeypatch,
-        source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
-        source_variants=[_src_variant("V42", "42", "IIT42")],
-        inv_by_gid={"gid://shopify/Product/900": [_inv_variant("dV42", "42", "dI42", [_level(PROMO, 0)])]},
-    )
+    w.returned(n=2)
+    _source(w)
 
-    def _boom(_t):
+    def boom(_t):
         raise RuntimeError("Online Store publication not found")
 
-    monkeypatch.setattr(ops, "get_online_store_publication_id", _boom)
-    _, report = _preview_apply(w)
-    assert len(report.outcomes) == 1 and report.outcomes[0].status == "ERROR"
-    assert any(x.startswith("publication_resolve_failed") for x in report.outcomes[0].warnings)
-    assert not any(n in _MUTATION_OPS for n in m.names)
-    assert len(w.unstamped()) == 2
+    monkeypatch.setattr(ops, "get_online_store_publication_id", boom)
+    _plan, rep = w.run()
+    assert rep.outcomes[0].status == "ERROR"
+    assert any(x.startswith("publication_resolve_failed") for x in rep.outcomes[0].warnings)
+    assert w.mutated() == [] and len(w.unstamped()) == 2
 
 
-def test_fix5_sku_cross_check_fires_on_active_branch(monkeypatch):
+def test_fix5_sku_cross_check_fires_on_active_branch():
     w = World()
-    w.returned("SKU1", "42", 2)
-    inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 0)], sku="OTHER-SKU")]
-    OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
-            inv_by_gid={OUT: inv})
-    plan = outlet_service.publish_preview(w.register(), object(), promo_location_id=PROMO)
-    st = plan.actions[0].size_targets[0]
-    assert st.matched is True and st.size == "42"
+    w.returned(n=2)
+    out = w.shop.product("Nike - Outlet", promo={"42": 0})
+    w.shop.variant(out.gid, "42").sku = "OTHER-SKU"
+    w.shop.variant(out.gid, "43").sku = "SKU1"                         # still resolves by SKU
+    plan = w.preview()
     assert any(x.startswith("sku_mismatch_on_size:42:OTHER-SKU") for x in plan.actions[0].warnings)
 
 
-def test_create_quarantines_when_levels_truncated_after_duplicate_fix6b(monkeypatch):
+def test_create_quarantines_when_levels_truncated_after_duplicate_fix6b():
     w = World()
-    w.returned("SKU1", "42", 2)
-    dup_gid = "gid://shopify/Product/900"
-    m = OpsMock(
-        monkeypatch,
-        source={"matches": [_source_match("gid://shopify/Product/SRC")], "warning": None},
-        source_variants=[_src_variant("V42", "42", "IIT42")],
-        inv_by_gid={dup_gid: [_inv_variant("dV42", "42", "dI42", [_level(PROMO, 0)], truncated=True)]},
-    )
-    _, report = _preview_apply(w)
-    assert report.outcomes[0].status == "QUARANTINED"
-    assert any(x.startswith("quarantine:levels_truncated") for x in report.outcomes[0].warnings)
-    assert {n for n in m.names if n in _MUTATION_OPS} == {"product_duplicate"}
+    w.returned(n=2)
+    _source(w, promo={"42": 4})
+    w.shop.duplicate_truncated = True
+    _plan, rep = w.run()
+    assert rep.outcomes[0].status == "QUARANTINED"
+    (create,) = [r for r in w.rows() if r.action == L.A_CREATE]
+    assert create.status == HELD                                       # every key of its list held
+    dup = next(g for g, p in w.shop.products.items() if p.title == "Nike Air - Outlet")
+    assert w.shop.products[dup].status == "DRAFT" and w.shop.available(dup, "42") == 0   # the orphan zeroed
     assert len(w.unstamped()) == 2
 
 
-# ---------------------------------------------------------------------------
-# The register side of the apply (F7)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Part 2 — F7
+# =============================================================================
 
-def test_preview_refuses_before_the_whole_register_baseline(monkeypatch):
-    from tests.register_fixtures import MemoryBackend as Fresh
-
-    be = Fresh()                                  # no BASELINE row
-    be.add_shelf_pair("SKU1", "42")
-    OpsMock(monkeypatch)
+def test_preview_refuses_before_the_whole_register_baseline():
+    w = World(baseline=False)
+    w.returned()
     with pytest.raises(BaselineMissing):
-        outlet_service.publish_preview(be.register(), object(), promo_location_id=PROMO)
+        w.preview()
 
 
-def test_each_stamp_is_carried_by_its_reconcile_row_in_one_transaction(monkeypatch):
+def test_an_add_is_relative_fenced_and_keyed_with_no_level_precondition():
     w = World()
-    (e,) = w.returned("SKU1", "42")
-    inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 3)])]
-    OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
-            inv_by_gid={OUT: inv})
-    w.be.db.log.clear()
-    _preview_apply(w)
-    assert w.writes() == ["renew", "insert_audit", "stamp", "commit"]
-    (row,) = w.register().reconcile_rows()
-    assert row.status == DONE and row.action == "add" and row.product_id == 500
-    assert row.payload["event_ids"] == [e] and row.keys == (("SKU1", "42"),)
-    assert (row.payload["level_before"], row.payload["level_after"]) == (3, 4)
-    assert row.lease_gen == 1
+    w.returned()
+    out = w.shop.product("Nike - Outlet", promo={"42": 3})
+    w.run()
+    (adj,) = [c[1] for c in w.shop.calls if c[0] == "adjust"]
+    ch = adj["input"]["changes"][0]
+    assert (ch["delta"], ch["changeFromQuantity"]) == (1, 3) and adj["idempotencyKey"]
+    assert w.shop.available(out.gid, "42") == 4
+    add = next(r for r in w.rows() if L.purpose(r) == L.P_ADD)
+    assert add.status == DONE and add.sent_available == 3 and add.request
 
 
-def test_a_held_positive_key_is_never_added(monkeypatch):
+def test_every_exposed_variant_is_deny_and_tracked_before_the_add():
     w = World()
-    (e_held,) = w.returned("SKU1", "42")
-    (e_free,) = w.returned("SKU1", "43")
-    w.be.seed_audit(InsertAudit(
-        kind="HOLD", actor="t", action="hold",
-        payload={"keys": [["SKU1", "42"]], "reason": "moved", "event_ids": [e_held]}))
-    inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 0)]),
-           _inv_variant("v43", "43", "i43", [_level(PROMO, 0)])]
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
-                inv_by_gid={OUT: inv})
-    plan, report = _preview_apply(w)
-    assert [st.size for st in plan.actions[0].size_targets] == ["43"]
-    assert m.sets() == [("inventory_set_quantities", "i43", PROMO, 1)]
-    assert w.unstamped() == [e_held]
+    w.returned()
+    out = w.shop.product("Nike - Outlet", promo={"42": 0}, policy="CONTINUE", tracked=False)
+    w.run()
+    names = w.mutated()
+    assert names.index("bulk") < names.index("adjust")
+    assert all(v.policy == "DENY" and v.tracked for v in w.shop.products[out.gid].variants)
 
 
-def test_a_baseline_held_key_with_a_post_hold_return_is_surfaced_not_added(monkeypatch):
-    from tests.register_fixtures import MemoryBackend as Fresh
-
-    be = Fresh()
-    _, e_snap = be.add_shelf_pair("SKU1", "42")                 # held with the snapshot
-    be.seed_baseline(held=[{"key": ["SKU1", "42"], "reason": "moved", "event_ids": [e_snap]}])
-    _, e_new = be.add_shelf_pair("SKU1", "42", price_outlet="50.00", price_high="100.00")
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None})
-    plan = outlet_service.publish_preview(be.register(), object(), promo_location_id=PROMO)
-    assert plan.actions == ()
-    assert "held_positive:SKU1:42:1" in plan.anomalies
-    assert {h.kind for h in be.register().held_keys()} == {HOLD_BASELINE}
-    assert not any(n in _MUTATION_OPS for n in m.names)
-
-
-def test_the_keyless_miss_is_surfaced_never_stamped(monkeypatch):
+def test_activation_is_explicit_and_only_for_an_absent_or_inactive_level():
     w = World()
-    e = w.be.consume("NOPE", "40")
-    OpsMock(monkeypatch)
-    plan, _ = _preview_apply(w)
-    assert plan.anomalies == (f"consume_miss:{e}",)
+    w.returned(size="42")
+    w.returned(size="43")
+    w.returned(size="44")
+    out = w.shop.product("Nike - Outlet", sizes=("42", "43", "44"), promo={"42": 0, "43": 0},
+                         inactive=("43",), absent=("44",))
+    w.run()
+    acts = [c[1] for c in w.shop.calls if c[0] == "activate"]
+    items = {c["inventoryItemId"] for c in acts}
+    assert items == {w.shop.variant(out.gid, "43").item, w.shop.variant(out.gid, "44").item}
+    assert all((c["available"], c["onHand"]) == (0, 0) and c["idempotencyKey"] for c in acts)
+    assert [w.shop.available(out.gid, s) for s in ("42", "43", "44")] == [1, 1, 1]
+
+
+def test_an_add_is_never_sent_beside_an_activation_that_failed():
+    w = World()
+    (e,) = w.returned()
+    w.shop.product("Nike - Outlet", promo={"42": 0}, inactive=("42",))
+    w.shop.fault("activate", "user_error:X")                           # refused; the level stays inactive
+    _plan, rep = w.run()
+    add = next(r for r in w.rows() if L.purpose(r) == L.P_ADD)
+    act = next(r for r in w.rows() if r.action == L.A_ACTIVATE)
+    assert act.status == FAILED and add.status == FAILED and add.outcome["never_sent"] is True
+    assert w.shop.count("adjust") == 0 and w.unstamped() == [e]
+    assert rep.outcomes[0].status == "PARTIAL"
+
+
+def test_a_lost_add_answer_is_never_re_added_and_holds_the_key_past_the_window():
+    w = World()
+    (e,) = w.returned()
+    out = w.shop.product("Nike - Outlet", promo={"42": 0})
+    w.shop.fault("adjust", "lose_after")                               # landed; answer lost
+    w.run()
+    assert w.shop.available(out.gid, "42") == 1
+    add = next(r for r in w.rows() if L.purpose(r) == L.P_ADD)
+    assert add.status == OPEN
+    w.be.advance(23 * 3600 * 1000 + 1000)
+    w.run()                                                            # recovery: past the window
+    add = w.register().reconcile_rows(row_ids=[add.row_id])[0]
+    assert add.status == HELD and w.shop.available(out.gid, "42") == 1    # never re-added
+    assert ("SKU1", "42") in {h.key for h in w.register().held_keys()} and w.unstamped() == [e]
+
+
+def test_an_unknown_add_inside_the_window_is_re_sent_and_answered_by_its_key():
+    w = World()
+    w.returned()
+    out = w.shop.product("Nike - Outlet", promo={"42": 0})
+    w.shop.fault("adjust", "lose_after")
+    w.run()
+    w.run()                                                            # in window: the identical re-send
+    assert w.shop.available(out.gid, "42") == 1 and w.unstamped() == []
+
+
+def test_the_decrements_recovery_leaves_a_sent_plus_for_the_publish():
+    w = World()
+    (e,) = w.returned()
+    w.shop.product("Nike - Outlet", promo={"42": 0})
+    w.shop.fault("adjust", "lose_after")
+    w.run()
+    reg = w.register()
+    rep = passes.decrement_pass(reg, w.shop, PROMO, lease=PassLease(reg, "decrement", sleep=lambda s: None),
+                                sleep=lambda s: None)
+    add = next(r for r in w.rows() if L.purpose(r) == L.P_ADD)
+    assert add.status == OPEN and "left_for_publish" in rep.report.kinds()
     assert w.unstamped() == [e]
 
 
-def test_lease_unavailable_writes_nothing(monkeypatch):
+def test_one_price_per_sku_conflicting_prices_block_it():
     w = World()
-    w.returned("SKU1", "42")
-    inv = [_inv_variant("v42", "42", "i42", [_level(PROMO, 0)])]
-    m = OpsMock(monkeypatch, outlet={"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
-                inv_by_gid={OUT: inv})
+    w.returned(size="42", price_outlet="50.00")
+    w.returned(size="43", price_outlet="55.00")
+    w.shop.product("Nike - Outlet", promo={"42": 0, "43": 0})
+    plan, rep = w.run()
+    assert plan.actions[0].reason == "price_conflict" and rep.outcomes[0].status == "PRICE_CONFLICT"
+    assert w.mutated() == []
+
+
+def test_a_new_return_with_no_price_takes_the_skus_and_is_written():
+    w = World()
+    w.returned(size="42", price_outlet="50.00")
+    w.be.add_shelf_pair("SKU1", "42", reconciled=True, price_outlet="50.00", price_high="100.00")
+    (e_new,) = w.returned(size="43", price_outlet=None)               # PRICE_OUTLET NULL
+    w.shop.product("Nike - Outlet", promo={"42": 0, "43": 0})
+    plan, _rep = w.run()
+    assert plan.actions[0].price == "50.00"
+    assert all(p.price_outlet is not None for p in w.register().shelf("SKU1"))
+
+
+def test_compare_at_is_price_high_else_price_b2():
+    w = World()
+    w.returned(size="42", price_high="0.00", price="159.00")         # 0.00 → PRICE
+    w.returned(size="43", price_high=None, price="159.00")           # NULL → PRICE
+    w.shop.product("Nike - Outlet", promo={"42": 0, "43": 0})
+    plan, _rep = w.run()
+    assert plan.actions[0].compare_at == "159.00" and plan.actions[0].publishable
+
+
+def test_a_pair_with_no_compare_at_is_kept_out_and_never_lent_one_d25():
+    """D25 / D16: pair 221-like (PRICE_HIGH NULL, PRICE NULL) beside pair 118-like
+    (compare-at 159.00) on the same SKU — 221's +1 stays out, 118's publishes."""
+    w = World()
+    (e118,) = w.returned(size="37", price_high="159.00")
+    (e221,) = w.returned(size="38", price_high=None, price=None)
+    out = w.shop.product("Nike - Outlet", sizes=("37", "38"), promo={"37": 0, "38": 0})
+    plan, rep = w.run()
+    assert [st.size for st in plan.actions[0].size_targets] == ["37"]
+    assert w.shop.available(out.gid, "37") == 1 and w.shop.available(out.gid, "38") == 0
+    assert w.unstamped() == [e221] and e118 not in w.unstamped()
+
+
+def test_a_spelling_twin_is_surfaced_never_published():
+    w = World()
+    (e_twin,) = w.returned(sku="AR-K-33PC", size="42L")
+    (e_ok,) = w.returned(sku="AR-K-33PC", size="43")
+    out = w.shop.product("AR - Outlet", sku="AR-K-33PC", sizes=("42 L", "43"), promo={"42 L": 0, "43": 0})
+    plan, rep = w.run()
+    act = plan.actions[0]
+    assert act.unmatched_sizes == ("42L",) and "size_twin:42L:42 L" in act.warnings
+    assert w.shop.available(out.gid, "42 L") == 0 and w.shop.available(out.gid, "43") == 1
+    assert w.unstamped() == [e_twin]
+
+
+def test_customisation_only_variant_never_matches():
+    w = World()
+    (e,) = w.returned(size="Solo Personalizzazione")
+    w.shop.product("Nike - Outlet", sizes=("42",), extra_variants=(("Solo Personalizzazione", "SKU1"),),
+                   promo={"42": 0, "Solo Personalizzazione": 0})
+    plan, _rep = w.run()
+    assert plan.actions[0].unmatched_sizes == ("Solo Personalizzazione",)
+    assert w.shop.count("adjust") == 0 and w.unstamped() == [e]
+
+
+def test_a_revive_lowers_customisation_only_and_held_keys_to_zero():
+    w = World(baseline=False)
+    _, e_held = w.be.add_shelf_pair("SKU1", "43", price_outlet="50.00", price_high="100.00")
+    w.be.seed_baseline(held=[{"key": ["SKU1", "43"], "reason": "moved", "event_ids": [e_held]}])
+    w.returned(size="42")
+    out = w.shop.product("Nike - Outlet", status="DRAFT", promo={"42": 0, "43": 2, "Solo Personalizzazione": 1},
+                         extra_variants=(("Solo Personalizzazione", "SKU1"),))
+    _plan, rep = w.run()
+    assert rep.outcomes[0].status == "REVIVED"
+    assert [w.shop.available(out.gid, s) for s in ("42", "43", "Solo Personalizzazione")] == [1, 0, 0]
+
+
+def test_a_revive_stopped_at_a_zeroing_row_activates_adds_and_exposes_nothing():
+    w = World()
+    (e,) = w.returned()
+    out = w.shop.product("Nike - Outlet", status="DRAFT", promo={"42": 0, "43": 2})
+    w.shop.fault("adjust", "user_error:ADJUST_QUANTITIES_FAILED")      # the zeroing refused
+    _plan, rep = w.run()
+    assert rep.outcomes[0].status == "REVIVE_STOPPED"
+    tail = next(r for r in w.rows() if r.action == L.A_TAIL)
+    assert tail.status == FAILED and tail.outcome["never_run"] is True
+    assert w.shop.products[out.gid].status == "DRAFT" and w.shop.available(out.gid, "42") == 0
+    assert w.unstamped() == [e]
+    plan2, rep2 = w.run()                                              # the retry is a new revive, not deferred
+    assert rep2.outcomes[0].status == "REVIVED"
+
+
+def test_a_revive_is_deferred_while_a_row_of_its_product_is_open():
+    w = World()
+    w.returned()
+    out = w.shop.product("Nike - Outlet", status="DRAFT", promo={"42": 0}, policy="CONTINUE")
     reg = w.register()
-    plan = outlet_service.publish_preview(reg, object(), promo_location_id=PROMO)
-    other = PassLease(w.register(), "decrement")
-    other.take()                                            # another pass holds it
-    report = outlet_service.publish_apply(reg, object(), plan, promo_location_id=PROMO)
-    assert [o.warnings for o in report.outcomes] == [("lease_unavailable",)]
-    assert not any(n in _MUTATION_OPS for n in m.names)
-    assert len(w.unstamped()) == 1
+    lease = PassLease(reg, "x")
+    lease.take()
+    reg.write_ahead(lease, [L.RowSpec(action=L.A_NORMALISE, keys=(("SKU9", "99"),),   # not the revive's key:
+                                      product_id=outlet_service.product_number(out.gid)).to_insert(actor="t", group_id=1)])
+    reg.mark_sent(lease, reg.reconcile_rows()[0].row_id, first=False, step="x")
+    lease.release()
+    w.shop.fault("bulk", "timeout_before", times=5)                   # the open row's re-runs stay unknown
+    _plan, rep = w.run()
+    assert rep.outcomes[0].status == "DEFERRED"
 
 
-def test_a_lost_lease_stops_the_apply(monkeypatch):
+def test_a_create_failing_after_step_1_leaves_an_orphan_drafted_zeroed_and_held():
     w = World()
-    (e1,) = w.returned("SKU1", "42")
-    w.returned("SKU2", "42")
-    gid2 = "gid://shopify/Product/502"
-    m = OpsMock(
-        monkeypatch,
-        outlet_by_sku={"SKU1": {"matches": [_outlet_match(OUT, "ACTIVE")], "warning": None},
-                       "SKU2": {"matches": [_outlet_match(gid2, "ACTIVE")], "warning": None}},
-        inv_by_gid={OUT: [_inv_variant("v1", "42", "i1", [_level(PROMO, 0)])],
-                    gid2: [_inv_variant("v2", "42", "i2", [_level(PROMO, 0)])]},
-    )
+    w.returned(n=2)
+    _source(w, promo={"42": 3})
+    w.shop.fault("status", "user_error:X")                            # step 6 refused
+    _plan, rep = w.run()
+    assert rep.outcomes[0].status == "CREATE_ABORTED"
+    (create,) = [r for r in w.rows() if r.action == L.A_CREATE]
+    assert create.status == HELD and create.product_id is not None and create.step
+    dup = outlet_service.product_gid(create.product_id)
+    assert w.shop.available(dup, "42") == 0
+    assert ("SKU1", "42") in {h.key for h in w.register().held_keys()}
 
-    def expire_after_first_write(item, loc, qty):
-        if item == "i1":
-            w.be.advance(400_000)                           # the lease expires mid-SKU
-            PassLease(w.register(), "decrement").take()     # and is taken over
 
-    m.on_set = expire_after_first_write
-    _, report = _preview_apply(w)
-    assert [(o.sku, o.status, o.warnings) for o in report.outcomes] == [
-        ("SKU1", "ERROR", ("lease_lost",)), ("SKU2", "ERROR", ("lease_lost",))]
-    assert ("inventory_set_quantities", "i2", PROMO, 1) not in m.calls      # SKU2 never written
-    assert e1 in w.unstamped()                       # the stamp after the take-over rolled back
+def test_a_lost_duplicate_answer_leaves_an_orphan_unknown_found_later_by_title():
+    w = World()
+    w.returned(n=2)
+    _source(w)
+    w.shop.fault("duplicate", "lose_after")
+    _plan, rep = w.run()
+    (create,) = [r for r in w.rows() if r.action == L.A_CREATE]
+    assert create.status == OPEN and create.product_id is None and create.sent_at is not None
+    dup = next(g for g, p in w.shop.products.items() if p.title == "Nike Air - Outlet")
+    w.shop.products[dup].outlet_member = True                         # re-indexed: an outlet match by title
+    w.run()                                                            # recovery searches by title
+    create = w.register().reconcile_rows(row_ids=[create.row_id])[0]
+    assert create.status == HELD and create.product_id == outlet_service.product_number(dup)
+    assert w.shop.products[dup].status == "DRAFT"
+
+
+def test_a_re_derived_plus_larger_than_confirmed_is_deferred():
+    w = World()
+    w.returned()
+    out = w.shop.product("Nike - Outlet", promo={"42": 0})
+    plan = w.preview()
+    w.returned()                                                       # a second return after the preview
+    rep = w.apply(plan)
+    assert rep.outcomes[0].status == "NOTHING_TO_ADD" and w.shop.available(out.gid, "42") == 0
+    assert any(i["kind"] == "deferred_larger_than_confirmed" for i in rep.surfaced)
+
+
+def test_a_held_positive_key_is_never_added():
+    w = World()
+    (e_held,) = w.returned(size="42")
+    w.returned(size="43")
+    (e_post,) = w.returned(size="42")                                  # a post-hold return: surfaced
+    w.be.seed_audit(InsertAudit(kind="HOLD", actor="t", action="hold",
+                                payload={"keys": [["SKU1", "42"]], "reason": "moved", "event_ids": [e_held]}))
+    out = w.shop.product("Nike - Outlet", promo={"42": 0, "43": 0})
+    plan, _rep = w.run()
+    assert [st.size for st in plan.actions[0].size_targets] == ["43"]
+    assert w.shop.available(out.gid, "42") == 0 and sorted(w.unstamped()) == sorted([e_held, e_post])
+    assert "held_positive:SKU1:42:1" in plan.anomalies
+
+
+def test_a_positive_group_of_a_key_with_n0_is_never_added():
+    w = World()
+    p, e = w.be.add_shelf_pair("SKU1", "42", price_outlet="50.00", price_high="100.00")
+    w.be.leave_shelf(p, "ANNULLATO", event_type="MANUAL_CANCEL", delta=0)   # N 0, Σ +1 pending
+    plan = w.preview()
+    assert plan.actions == () and "n0_positive:SKU1:42:1" in plan.anomalies
+
+
+def test_the_publish_yields_the_lease_between_skus_to_a_waiting_decrement():
+    w = World()
+    w.returned(sku="SKU1")
+    w.returned(sku="SKU2")
+    w.shop.product("A - Outlet", sku="SKU1", promo={"42": 0})
+    b = w.shop.product("B - Outlet", sku="SKU2", promo={"42": 0})
+    plan = w.preview()
+    reg = w.register()
+    order = []
+
+    def decrement_between(shop):
+        if shop.count("adjust") == 0 and not order:               # SKU1's add in flight: the decrement waits
+            order.append("waiter")
+            reg.lease_wait("decrement:x", 60_000)
+
+    w.shop.on("adjust", decrement_between)
+    lease = PassLease(reg, "publish", sleep=lambda s: None)
+    real_try = lease.try_take
+
+    def try_take():
+        if order == ["waiter"]:                                    # the waiting decrement goes first
+            order.append("decrement ran")
+            g = reg.lease_take("decrement:x", 60_000)
+            assert g is not None
+            reg.store.lease_release(Fence("decrement:x", g, 60_000))
+        return real_try()
+
+    lease.try_take = try_take
+    rep = outlet_service.publish_apply(reg, w.shop, plan, promo_location_id=PROMO, lease=lease, take_bound_s=5)
+    assert [o.status for o in rep.outcomes] == ["APPLIED", "APPLIED"] and order == ["waiter", "decrement ran"]
+    assert w.shop.available(b.gid, "42") == 1
+
+
+def test_a_lost_lease_stops_the_apply():
+    w = World()
+    w.returned(sku="SKU1")
+    w.returned(sku="SKU2")
+    w.shop.product("A - Outlet", sku="SKU1", promo={"42": 0})
+    b = w.shop.product("B - Outlet", sku="SKU2", promo={"42": 0})
+    plan = w.preview()
+
+    def take_over(shop):
+        if shop.count("adjust") == 0:
+            w.be.advance(400_000)
+            PassLease(w.register(), "decrement").take()
+
+    w.shop.on("adjust", take_over)
+    rep = w.apply(plan)
+    assert [o.warnings[-1] for o in rep.outcomes] == ["lease_lost", "lease_lost"]
+    assert w.shop.available(b.gid, "42") == 0                          # SKU2 never written
+
+
+def test_lease_unavailable_writes_nothing():
+    w = World()
+    w.returned()
+    w.shop.product("Nike - Outlet", promo={"42": 0})
+    plan = w.preview()
+    PassLease(w.register(), "decrement").take()
+    rep = w.apply(plan)
+    assert [o.warnings for o in rep.outcomes] == [("lease_unavailable",)] and w.mutated() == []
+
+
+def test_online_is_set_on_the_pairs_whose_plus_one_applied():
+    w = World()
+    w.returned(n=2)
+    w.shop.product("Nike - Outlet", promo={"42": 0})
+    w.run()
+    assert all(p.online for p in w.register().shelf("SKU1"))
+
+
+def test_the_keyless_miss_is_surfaced_never_stamped():
+    w = World()
+    e = w.be.consume("NOPE", "40")
+    plan, _rep = w.run()
+    assert plan.anomalies == (f"consume_miss:{e}",) and w.unstamped() == [e]

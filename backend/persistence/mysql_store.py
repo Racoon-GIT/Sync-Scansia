@@ -72,6 +72,7 @@ from backend.persistence.records import (
     UpdatePairs,
     WriteOp,
     check_op_order,
+    resolve_inserted,
 )
 
 logger = logging.getLogger("backend.persistence.mysql_store")
@@ -558,7 +559,7 @@ class MySQLStore:
                     raise LeaseLost("renew matched no row")
                 inserted: List[int] = []
                 for i, op in enumerate(ops):
-                    new_id = self._apply(cur, i, op, fence)
+                    new_id = self._apply(cur, i, op, fence, inserted)
                     if new_id is not None:
                         inserted.append(new_id)
                 in_commit = True
@@ -585,7 +586,7 @@ class MySQLStore:
                 _quiet_close(cur)
         raise DatabaseUnavailable("unreachable")  # pragma: no cover
 
-    def _apply(self, cur: Any, i: int, op: WriteOp, fence: Fence) -> Optional[int]:
+    def _apply(self, cur: Any, i: int, op: WriteOp, fence: Fence, inserted: Sequence[int] = ()) -> Optional[int]:
         if isinstance(op, InsertAudit):
             cur.execute(SQL_INSERT_AUDIT, (
                 op.kind, op.actor, op.action, op.plan_hash, op.intent_id,
@@ -610,7 +611,7 @@ class MySQLStore:
                 params.append(op.step)
             if op.outcome is not None:
                 sets.append("OUTCOME = %s")
-                params.append(_dumps(op.outcome))
+                params.append(_dumps(resolve_inserted(op.outcome, inserted)))
             if op.status is not None:
                 sets.append("STATUS = %s")
                 params.append(op.status)

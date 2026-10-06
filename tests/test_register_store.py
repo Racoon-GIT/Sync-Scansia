@@ -309,3 +309,14 @@ def test_a_closed_handle_refuses_every_call(backend):
     s.close()
     with pytest.raises(StoreError):
         s.read_pairs()
+
+
+def test_an_outcome_can_name_an_id_inserted_in_the_same_transaction(backend):
+    from backend.persistence.records import InsertedId, SUPERSEDED
+
+    s = backend.store()
+    f = _take(s)
+    (old,) = s.fenced_write(f, [_recon(group_id=5)])
+    new, = s.fenced_write(f, [_recon(group_id=5), UpdateAudit(old, OPEN, status=SUPERSEDED,
+                                                               outcome={"successor": InsertedId(0)})])
+    assert s.read_audit(KIND_RECONCILE, row_ids=[old])[0].outcome == {"successor": new}

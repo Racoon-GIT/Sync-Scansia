@@ -48,11 +48,13 @@ from backend.persistence.records import (
     SCOPE_KEY,
     SCOPE_REGISTER,
     SHELF,
+    SUPERSEDED,
     AuditRow,
     BaselineMissing,
     GuardMismatch,
     Hold,
     InsertAudit,
+    InsertedId,
     Key,
     LeaseRow,
     PairRow,
@@ -503,6 +505,21 @@ class Register:
             row_id=row_id, expect_status=expect, status=status, outcome=outcome,
             product_id=product_id, step=step,
         )])
+
+    def supersede(self, lease: Any, old: AuditRow, successor: InsertAudit, **outcome: Any) -> int:
+        """Re-apply with new parameters (§3.3 rule 2): the successor row (new key,
+        the old row's ``GROUP_ID``) is written ahead and the old row closed
+        ``SUPERSEDED`` (outcome: the successor's id) in ONE transaction — a crash
+        cannot leave both open. Returns the successor's id."""
+        if successor.kind != KIND_RECONCILE or successor.status != OPEN:
+            raise ValueError("a successor is a RECONCILE row, OPEN")
+        if successor.group_id != old.group_id:
+            raise ValueError("a successor inherits its predecessor's GROUP_ID")
+        close = UpdateAudit(
+            row_id=old.row_id, expect_status=old.status or OPEN, status=SUPERSEDED,
+            outcome={**(old.outcome or {}), **outcome, "successor": InsertedId(0)},
+        )
+        return self._write(lease, [successor, close])[0]
 
     def close_rows(self, lease: Any, closes: Sequence[UpdateAudit]) -> None:
         """Several guarded row updates in one transaction (e.g. a group's

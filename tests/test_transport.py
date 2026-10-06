@@ -126,3 +126,123 @@ def test_4xx_other_than_429_raises_without_retry(transport):
         transport.graphql("query {}", {})
 
     transport.sess.post.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Rule 9 (F7 §3.3): a mutation is never re-posted blind
+# ---------------------------------------------------------------------------
+from backend.shopify.transport import (  # noqa: E402
+    ShopifyOutcomeUnknown,
+    ShopifyRefused,
+    request_body,
+)
+
+MUTATION = "mutation($x: Int!) { thing(x: $x) { id userErrors { field message } } }"
+
+
+@pytest.mark.parametrize("exc", [requests.exceptions.Timeout("slow"), requests.exceptions.ConnectionError("rst")])
+def test_a_mutation_whose_answer_was_lost_is_unknown_and_sent_once(transport, exc):
+    transport.sess.post = MagicMock(side_effect=exc)
+    with pytest.raises(ShopifyOutcomeUnknown):
+        transport.graphql(MUTATION, {"x": 1})
+    transport.sess.post.assert_called_once()
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_a_mutation_answered_5xx_is_unknown_and_sent_once(transport, status):
+    transport.sess.post = MagicMock(return_value=FakeResponse(status, text="upstream"))
+    with pytest.raises(ShopifyOutcomeUnknown):
+        transport.graphql(MUTATION, {"x": 1})
+    transport.sess.post.assert_called_once()
+
+
+def test_a_mutation_answered_internal_server_error_is_unknown(transport):
+    body = {"errors": [{"message": "Internal error", "extensions": {"code": "INTERNAL_SERVER_ERROR"}}]}
+    transport.sess.post = MagicMock(return_value=FakeResponse(200, json_body=body))
+    with pytest.raises(ShopifyOutcomeUnknown):
+        transport.graphql(MUTATION, {"x": 1})
+    transport.sess.post.assert_called_once()
+
+
+def test_a_mutation_with_partial_data_beside_errors_is_unknown(transport):
+    body = {"data": {"thing": {"id": "1", "userErrors": []}}, "errors": [{"message": "late field"}]}
+    transport.sess.post = MagicMock(return_value=FakeResponse(200, json_body=body))
+    with pytest.raises(ShopifyOutcomeUnknown):
+        transport.graphql(MUTATION, {"x": 1})
+
+
+def test_a_mutation_answered_429_did_not_run_and_is_re_sent(transport, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("backend.shopify.transport.time.sleep", lambda s: sleeps.append(s))
+    ok = FakeResponse(200, json_body={"data": {"thing": {"id": "1", "userErrors": []}}})
+    transport.sess.post = MagicMock(side_effect=[FakeResponse(429, headers={"Retry-After": "2"}), ok])
+    assert transport.graphql(MUTATION, {"x": 1}) == {"thing": {"id": "1", "userErrors": []}}
+    assert transport.sess.post.call_count == 2 and 2.0 in sleeps
+
+
+def test_a_throttled_mutation_did_not_run_and_is_re_sent_after_the_restore_wait(transport, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("backend.shopify.transport.time.sleep", lambda s: sleeps.append(s))
+    throttled = FakeResponse(200, json_body={
+        "errors": [{"message": "Throttled", "extensions": {"code": "THROTTLED"}}],
+        "extensions": {"cost": {"requestedQueryCost": 110, "throttleStatus": {
+            "maximumAvailable": 2000, "currentlyAvailable": 50, "restoreRate": 100}}},
+    })
+    ok = FakeResponse(200, json_body={"data": {"thing": {"id": "1", "userErrors": []}}})
+    transport.sess.post = MagicMock(side_effect=[throttled, ok])
+    transport.graphql(MUTATION, {"x": 1})
+    assert transport.sess.post.call_count == 2 and sleeps[-1] == 1.0   # ceil((110-50)/100)
+
+
+def test_a_mutation_throttled_every_time_is_refused_never_unknown(transport, monkeypatch):
+    monkeypatch.setattr("backend.shopify.transport.time.sleep", lambda s: None)
+    transport.max_retries = 3
+    transport.sess.post = MagicMock(return_value=FakeResponse(429))
+    with pytest.raises(ShopifyRefused):
+        transport.graphql(MUTATION, {"x": 1})
+    assert transport.sess.post.call_count == 3
+
+
+@pytest.mark.parametrize("status", [400, 401, 402, 403, 404, 423])
+def test_a_mutation_refused_4xx_is_refused_and_sent_once(transport, status):
+    transport.sess.post = MagicMock(return_value=FakeResponse(status, text="no"))
+    with pytest.raises(ShopifyRefused):
+        transport.graphql(MUTATION, {"x": 1})
+    transport.sess.post.assert_called_once()
+
+
+def test_a_mutation_failing_validation_is_refused(transport):
+    body = {"errors": [{"message": "Field 'nope' doesn't exist", "extensions": {"code": "undefinedField"}}]}
+    transport.sess.post = MagicMock(return_value=FakeResponse(200, json_body=body))
+    with pytest.raises(ShopifyRefused):
+        transport.graphql(MUTATION, {"x": 1})
+
+
+def test_send_body_posts_the_stored_bytes_unchanged(transport):
+    stored = '{"query":"mutation { a }","variables":{"z":1,"a":2}}'
+    transport.sess.post = MagicMock(return_value=FakeResponse(200, json_body={"data": {"a": 1}}))
+    transport.send_body(stored)
+    _, kwargs = transport.sess.post.call_args
+    assert kwargs["data"] == stored.encode("utf-8") and kwargs["timeout"] == 30
+
+
+def test_request_body_is_compact_and_keeps_key_order():
+    assert request_body("q", {"z": 1, "a": {"y": 2, "b": 3}}) == '{"query":"q","variables":{"z":1,"a":{"y":2,"b":3}}}'
+
+
+def test_a_query_throttled_is_retried(transport, monkeypatch):
+    monkeypatch.setattr("backend.shopify.transport.time.sleep", lambda s: None)
+    throttled = FakeResponse(200, json_body={"errors": [{"message": "Throttled", "extensions": {"code": "THROTTLED"}}]})
+    ok = FakeResponse(200, json_body={"data": {"shop": {"id": "1"}}})
+    transport.sess.post = MagicMock(side_effect=[throttled, ok])
+    assert transport.graphql("query { shop { id } }", {}) == {"shop": {"id": "1"}}
+
+
+def test_the_served_api_version_is_recorded_and_a_mismatch_logged_once(transport, caplog):
+    served = FakeResponse(200, json_body={"data": {"ok": 1}}, headers={"X-Shopify-API-Version": "2027-01"})
+    transport.sess.post = MagicMock(return_value=served)
+    with caplog.at_level("WARNING", logger="backend.shopify.transport"):
+        transport.graphql("query { ok }", {})
+        transport.graphql("query { ok }", {})
+    assert transport.last_api_version == "2027-01"
+    assert sum("pinned 2026-10" in r.message for r in caplog.records) == 1

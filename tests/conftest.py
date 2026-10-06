@@ -21,6 +21,6 @@ def shopify_config() -> ShopifyConfig:
     return ShopifyConfig(
         store="test-store.myshopify.com",
         token="shpat_test_token",
-        api_version="2025-07",
+        api_version="2026-10",
         promo_location_id="gid://shopify/Location/123",
     )

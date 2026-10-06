@@ -51,6 +51,7 @@ from backend.persistence.records import (
     UpdatePairs,
     WriteOp,
     check_op_order,
+    resolve_inserted,
 )
 
 
@@ -465,7 +466,7 @@ class MemoryStore:
                 for i, op in enumerate(ops):
                     if db.crash_hook is not None:
                         db.crash_hook(i, op)
-                    new_id = self._apply(db, i, op, now, fence)
+                    new_id = self._apply(db, i, op, now, fence, inserted)
                     if new_id is not None:
                         inserted.append(new_id)
                 db.log.append(("commit",))
@@ -475,7 +476,9 @@ class MemoryStore:
                 db.log.append(("rollback",))
                 raise
 
-    def _apply(self, db: MemoryDB, i: int, op: WriteOp, now: datetime, fence: Fence) -> Optional[int]:
+    def _apply(
+        self, db: MemoryDB, i: int, op: WriteOp, now: datetime, fence: Fence, inserted: Sequence[int] = ()
+    ) -> Optional[int]:
         st = db.state
         if isinstance(op, InsertAudit):
             db.log.append(("insert_audit", op.kind, op.status))
@@ -501,7 +504,7 @@ class MemoryStore:
             if op.step is not None:
                 a["STEP"] = op.step
             if op.outcome is not None:
-                a["OUTCOME"] = _mysql_json(dict(op.outcome))
+                a["OUTCOME"] = _mysql_json(resolve_inserted(op.outcome, inserted))
             if op.status is not None:
                 a["STATUS"] = op.status
                 if op.status in TERMINAL:
