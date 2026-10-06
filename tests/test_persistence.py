@@ -27,11 +27,7 @@ from backend.services.delete_service import (
     SnapshotCollection,
     SnapshotVariant,
 )
-from backend.services.init_service import (
-    InitBeforeSnapshot,
-    InitDemotedRowSnapshot,
-    InitTargetSnapshot,
-)
+from backend.services.baseline_service import ACT_LEVEL, InitBeforeSnapshot, KeyPlan
 from backend.services.pricing_service import PriceIntent, ProductPrior, VariantPrior
 
 _SECRET_ENV = "TOKEN_SIGNING_SECRET"
@@ -210,16 +206,10 @@ def _snapshot(gid="gid://shopify/Product/1"):
 
 def _init_before_snapshot():
     return InitBeforeSnapshot(
-        plan_hash="agg-hash-1",
-        rows=(
-            InitDemotedRowSnapshot(
-                row_uuid="u1", sku="SKU1", size="42",
-                prior_online="SI", prior_vendute_il="",
-            ),
-        ),
-        targets=(
-            InitTargetSnapshot(gid="gid://shopify/Product/1", prior_status="ACTIVE"),
-        ),
+        plan_hash="agg-hash-1", rule="level", dlq_checked_at="2026-10-08T07:40:00+00:00", dlq_count=0,
+        keys=(KeyPlan(sku="SKU1", size="42", n=1, shelf_pair_ids=(7,), event_ids=(70,), departed_event_ids=(),
+                      max_event_id=70, action=ACT_LEVEL, target=1, delta=1),),
+        products=(), online=((7, True),), prices=(),
     )
 
 
@@ -318,16 +308,13 @@ def test_write_init_before_appends_snapshot_json():
     GSheetAuditSink(ss, actor="racoon").write_init_before(_init_before_snapshot())
     assert TAB_INIT in ss.titles()
     rows = ss.tab(TAB_INIT).get_all_values()
-    assert rows[0] == ["ts", "actor", "plan_hash", "rows_json", "targets_json"]
+    assert rows[0] == ["ts", "actor", "plan_hash", "snapshot_json"]
     body = rows[1]
     assert body[1] == "racoon"
     assert body[2] == "agg-hash-1"
-    rows_parsed = json.loads(body[3])
-    assert rows_parsed[0]["sku"] == "SKU1"
-    assert rows_parsed[0]["prior_online"] == "SI"
-    targets_parsed = json.loads(body[4])
-    assert targets_parsed[0]["gid"] == "gid://shopify/Product/1"
-    assert targets_parsed[0]["prior_status"] == "ACTIVE"
+    snap = json.loads(body[3])
+    assert snap["keys"][0]["sku"] == "SKU1" and snap["keys"][0]["action"] == "level"
+    assert snap["online"] == [[7, True]]
 
 
 def test_write_init_before_raises_sheetioerror_on_append_failure():

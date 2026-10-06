@@ -99,7 +99,59 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   source or a conditions source with inclusion conditions); inventory reads with `includeInactive: true`,
   `isActive`, `tracked`, variant `title`. Raw doc pages were read as `.md` (curl), not through a summariser.
 
+## "Inizializza" — the baseline (§3.4, the lane's mechanism)
+
+- `services/baseline_service.py`, Level only (B-1, D20); Parity — the option not taken — is not built. Preview:
+  `register.snapshot()` (the one consistent read) and `held_keys()`; per register SKU the resolver (as every pass
+  resolves) and one inventory read per outlet; the outlet collection (`enumerate_outlet_products`) for products of
+  no register SKU. A collection product carrying a register SKU the resolver did not return makes that SKU unclean
+  (anomaly listed, its keys held `unresolved`, the product untouched).
+- Keys: shelf keys ∪ keys of unstamped events ∪ real-size variants with Promo > 0 and no pair, no event, on any
+  outlet (a stale unit: `lower` to 0, never held — a hold with no event keeps nothing, and the N-0 release never
+  sees a key with no event). Decision: `level` (a), `zero` (b), `none` (c), `stamp` (no shelf pair, no variant
+  titled SIZE: the events stamped), `hold`. Hold reasons: `blank_sku`; `held_before_baseline:<kinds>` (a key
+  already held — in flight, recovery `HELD`, a `HOLD` row — stays held, all its snapshot events; a re-level
+  releases it); `unresolved`; `outlet_unreadable` (levels truncated, a quantity unread); `multi_outlet`;
+  `size_absent` (+ its twins); `committed_on_upward_adjust`; `unexpected_status:<s>`; `shelf_events_not_n` ((b)
+  and (c) leave the shelf pairs' events pending: §3.4's tested invariant needs them to sum to N, else the key is
+  held). At confirm: `moved_at_confirm`, `normalise_not_applied`, `level_write_not_applied:<statuses>`,
+  `shopify_error:<type>`.
+- (a): `n − live` from any level, a negative included (V8); an upward write to an absent or inactive level first
+  activates it, explicit 0 / 0 (an inactive level's units dropped: fewer); a lowering never activates.
+- Rows: (a) `adjust`/`relevel` target N (+ `activate`); (b) and stale units `adjust`/`zero` target 0;
+  customisation-only Promo > 0 `adjust`/`custom` target 0 on any outlet (a negative left); a `normalise` row on
+  every ACTIVE outlet with a CONTINUE or untracked variant, before any level write (DRAFT outlets: the revive's
+  tail). The baseline's rows carry NO event ids: its stamp is the `BASELINE` row's explicit list, one
+  transaction, written last. A zero row closed `FAILED` "nothing_to_lower" (live ≤ 0 at the send) is at target.
+- Confirm: `api/init.py` keeps each previewed plan by hash in process memory (4 kept) and the confirm applies THAT
+  plan — no re-preview + aggregate hash gate as the other verticals: §3.4 holds a key that moved, it never refuses
+  the whole confirm. Per key, right before its writes: `snapshot(key)` (N, max event id, the unstamped id set),
+  the SKU's resolution (once per SKU per run), a fresh inventory read of its outlets — any difference holds it. A
+  product whose normalisation did not apply holds its keys (checked before the re-read: the refusal may have
+  drafted it). The held keys then go through `flows.held_key_lowering` (P > N lowered, active first, their
+  post-hold events counted).
+- Order: take (bound 120 s; never released mid-run) → whole-register `BASELINE` absent → recovery (publish class)
+  → `INIT_BEFORE` through the audit sink (the abort gate) → normalisations → keys → the held keys' lowering →
+  `OUTLET_PRODUCT_ID` (§3.1: one non-`review` outlet) → J seeds → `ONLINE` (1 on the shelf pairs of keys levelled
+  with N > 0, 0 on every other shelf pair at 1; changed pairs only, one `REGISTER` row per value) → `BASELINE`
+  (`rule`, `dlq` {checked_at, typed, count}, `held` [{key, reason, event_ids}], `stamped`, `keyless`, `counts`,
+  `PLAN_HASH`) + its stamp. A Shopify failure inside one key holds that key; a store error or a lost lease ends
+  the run with no `BASELINE` (re-run from a fresh preview: every write is a target re-read live).
+- Part B under Level: the `ONLINE` = 1 shelf pairs classified (kept-online, demote:missing, demote:draft,
+  demote:sold-out-size, review:multi-match; exact size) — listed, never written.
+- B-2's seed: J = `IMPORTED.PAYLOAD.raw.J` (`{t, v, w}`), parsed by the register's own H/I rule (STOCK_Manager
+  `parsePrice`, `src/lib/returned-pair-legacy.ts` at `92f6f90`). Per SKU: already priced → left; an unparseable J,
+  or two values → listed, never picked; one value ≤ 0 → listed; one value > 0 → `set_outlet_price` on every shelf
+  pair of the SKU (post-cutover returns, which have no J, included). `DISCOUNT` is not seeded (B-2 names J only).
+- Catalogue notes for (c) keys with N > 0: the source resolver and its variants → `not_in_catalogue`,
+  `multi_source`, `size_absent_on_source` (+ twins) — a person.
+
 ## Parameters the plan proposes, fixed here (each one tested)
+
+- The `/dlqs` precondition (§3.4): the typed instant (ISO 8601; no offset → Europe/Rome) and `dlqCount`, which must
+  be 0; the instant no later than now + 2 min and no earlier than the snapshot − 15 min (one confirm-token TTL,
+  `api/mutations.py`) — checked by the API on the app clock, again by the service on the database clock, kept in
+  the `BASELINE` row. The baseline takes the lease within 120 s or refuses.
 
 - Re-send window margin 1 h (§3.3 rule 2): the window is the first `SENT_AT` + 23 h.
 - Session `wait_timeout` 60 s, `innodb_lock_wait_timeout` 5 s (§3.7 rules 4–5).

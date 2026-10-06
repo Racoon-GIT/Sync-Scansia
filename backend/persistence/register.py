@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from backend.persistence.records import (
     APPLIED,
@@ -59,6 +59,7 @@ from backend.persistence.records import (
     LeaseRow,
     PairRow,
     PendingDeltas,
+    Snapshot,
     StampEvents,
     UpdateAudit,
     UpdatePairs,
@@ -197,6 +198,16 @@ class Register:
         """Every unstamped event, held ones included (a re-level's and the N-0
         release's read, §3.3/§3.4) — no baseline gate."""
         return self.store.read_unstamped_events()
+
+    def snapshot(self, key: Optional[Key] = None) -> Snapshot:
+        """The baseline's / a re-level's one consistent read (§3.4): shelf pairs,
+        every unstamped event, each key's max event id — all keys, or one."""
+        return self.store.read_snapshot(key)
+
+    def import_payloads(self, pair_ids: Sequence[int]) -> List[Tuple[int, Any]]:
+        """``(pair_id, PAYLOAD)`` of the pairs' ``IMPORTED`` events (B-2's J seed,
+        ``raw.J``) — events are append-only, so outside any snapshot."""
+        return self.store.read_import_payloads(pair_ids)
 
     def reconcile_rows(
         self,

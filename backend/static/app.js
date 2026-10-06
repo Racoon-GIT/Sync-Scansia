@@ -44,6 +44,7 @@
       const err = (data && data.error) || { code: "unknown_error", message: "HTTP " + res.status };
       const e = new Error(err.message);
       e.code = err.code;
+      e.reason = err.reason;
       e.status = res.status;
       throw e;
     }
@@ -104,37 +105,60 @@
   }
 
   // ===========================================================================
-  // INIT banner (first-run "Inizializza") — same preview->store token->echo-on-
-  // apply flow as publish/cleanup. Hidden by default; shown only when
-  // GET /init/status reports cutover_done === false.
+  // INIT banner ("Inizializza" on MySQL, plan §3.4) — preview -> the kept plan's
+  // hash + token -> confirm with CONFERMO and the /dlqs precondition (the GET's
+  // instant and dlqCount, typed). Hidden by default; shown only while
+  // GET /init/status reports baseline_done === false.
   // ===========================================================================
   const initState = { pending: null };
+  // The baseline reads every outlet (minutes, not seconds): poll patiently.
+  const INIT_POLL = { timeoutMs: 30 * 60 * 1000, intervalMs: 3000 };
 
-  function renderInitDecisionRows(tbodyId, rows, cols) {
+  function renderRows(tbodyId, rows, cells) {
     const tbody = document.getElementById(tbodyId);
     tbody.innerHTML = "";
-    (rows || []).forEach(function (d) {
+    (rows || []).forEach(function (r) {
       const tr = document.createElement("tr");
-      tr.innerHTML = cols.map(function (c) { return "<td>" + esc(d[c]) + "</td>"; }).join("");
+      tr.innerHTML = cells(r).map(function (c) { return "<td>" + esc(c) + "</td>"; }).join("");
       tbody.appendChild(tr);
     });
   }
 
+  function keysOf(plan, action) {
+    return (plan.keys || []).filter(function (k) { return k.action === action; });
+  }
+
   function renderInitPlan(plan) {
-    const panel = document.getElementById("init-plan-panel");
-    panel.classList.remove("hidden");
-    document.getElementById("init-backfill-count").textContent = plan.backfill_pending_rows;
-    document.getElementById("init-anomalies").textContent =
-      (plan.anomalies && plan.anomalies.length) ? "Anomalie: " + plan.anomalies.join(", ") : "";
-    renderInitDecisionRows("init-kept-online-tbody", plan.kept_online, ["sku", "size", "target_gid"]);
-    renderInitDecisionRows("init-demote-missing-tbody", plan.demote_missing, ["sku", "size"]);
-    renderInitDecisionRows("init-demote-draft-tbody", plan.demote_draft, ["sku", "size", "target_gid", "live_status"]);
-    renderInitDecisionRows("init-demote-soldout-tbody", plan.demote_sold_out_size, ["sku", "size", "target_gid"]);
-    renderInitDecisionRows("init-review-tbody", plan.review_multi_match, ["sku", "size"]);
-    const demoteCount = (plan.demote_missing || []).length + (plan.demote_draft || []).length + (plan.demote_sold_out_size || []).length;
-    document.getElementById("init-second-confirm-row").classList.toggle("hidden", demoteCount <= 25);
-    document.getElementById("init-second-confirm").checked = false;
+    document.getElementById("init-plan-panel").classList.remove("hidden");
+    const c = plan.counts || {};
+    document.getElementById("init-counts").textContent = plan.already_done
+      ? "Inizializzazione già eseguita."
+      : "Chiavi " + (c.keys || 0) + ": allineate " + (c.level || 0) + ", bozze azzerate " + (c.zero || 0) +
+        ", senza outlet " + (c.none || 0) + ", solo timbro " + (c.stamp || 0) + ", unità a 0 " + (c.lower || 0) +
+        ", trattenute " + (c.hold || 0) + ". Unità Promo +" + (c.units_up || 0) + " / -" + (c.units_down || 0) +
+        ". Eventi da timbrare " + (c.events_to_stamp || 0) + ", trattenuti " + (c.events_held || 0) + ".";
+    const notes = (plan.anomalies || []).concat(
+      (plan.keyless_event_ids || []).map(function (i) { return "consume_miss:" + i; }));
+    document.getElementById("init-anomalies").textContent = notes.length ? "Anomalie: " + notes.join(", ") : "";
+    renderRows("init-level-tbody", keysOf(plan, "level"), function (k) {
+      return [k.sku, k.size, k.n, k.delta, k.activate ? "sì" : ""]; });
+    renderRows("init-zero-tbody", keysOf(plan, "zero"), function (k) { return [k.sku, k.size, k.n, k.delta]; });
+    renderRows("init-none-tbody", keysOf(plan, "none"), function (k) { return [k.sku, k.size, k.n]; });
+    renderRows("init-lower-tbody", keysOf(plan, "lower"), function (k) { return [k.sku, k.size, k.delta]; });
+    renderRows("init-hold-tbody", keysOf(plan, "hold"), function (k) {
+      return [k.sku, k.size, k.n, k.reason, (k.twins || []).join(" | "), k.delta]; });
+    renderRows("init-products-tbody", plan.products, function (p) {
+      return [p.product_id, p.title, p.status, (p.unsafe_variant_ids || []).length, (p.custom_lowerings || []).length]; });
+    renderRows("init-prices-tbody", plan.prices, function (x) {
+      return [x.sku, x.status, x.price, (x.values || []).join(" | ")]; });
+    renderRows("init-partb-tbody", (plan.part_b || []).filter(function (r) { return r.bucket !== "kept-online"; }),
+      function (r) { return [r.pair_id, r.sku, r.size, r.bucket]; });
+    renderRows("init-catalogue-tbody", plan.catalogue, function (n) {
+      return [n.sku, n.size, n.note, (n.twins || []).join(" | ")]; });
     document.getElementById("init-confirm-word").value = "";
+    document.getElementById("init-dlq-at").value = "";
+    document.getElementById("init-dlq-count").value = "";
+    document.getElementById("btn-init-apply").disabled = !!plan.already_done;
     document.getElementById("init-outcome-panel").classList.add("hidden");
   }
 
@@ -142,10 +166,10 @@
     const statusEl = document.getElementById("init-status");
     const btn = document.getElementById("btn-init-preview");
     btn.disabled = true;
-    setStatus(statusEl, "calcolo piano...");
+    setStatus(statusEl, "calcolo piano (alcuni minuti)...");
     try {
       const sub = await api("POST", "/init/preview", undefined);
-      const rec = await pollJob("/init/preview/" + sub.job_id);
+      const rec = await pollJob("/init/preview/" + sub.job_id, INIT_POLL);
       if (rec.status === "failed") {
         setStatus(statusEl, jobFailureMessage(rec), "error");
         return;
@@ -160,59 +184,54 @@
     }
   }
 
-  function renderInitOutcome(report) {
-    const panel = document.getElementById("init-outcome-panel");
-    panel.classList.remove("hidden");
-    const tbody = document.getElementById("init-outcome-tbody");
-    tbody.innerHTML = "";
-    (report.outcomes || []).forEach(function (o) {
-      const tr = document.createElement("tr");
-      tr.innerHTML =
-        "<td>" + esc(o.sku) + "</td>" + "<td>" + esc(o.size) + "</td>" +
-        "<td>" + esc(o.bucket) + "</td>" + "<td>" + esc(o.status) + "</td>" +
-        "<td>" + esc(o.target_gid) + "</td>" + "<td>" + esc((o.warnings || []).join(", ")) + "</td>";
-      tbody.appendChild(tr);
-    });
+  function renderInitOutcome(result) {
+    const report = result.report;
+    document.getElementById("init-outcome-panel").classList.remove("hidden");
+    document.getElementById("init-outcome-summary").textContent =
+      "Stato " + report.status + (report.baseline_row_id ? " — riga BASELINE #" + report.baseline_row_id : "") +
+      (report.reason ? " (" + report.reason + ")" : "") + ". Eventi timbrati " + report.stamped +
+      ", online +" + report.online_on + " / -" + report.online_off + ", prezzi seminati " +
+      (report.prices_seeded || []).length + ", chiavi trattenute " + (report.held || []).length + ".";
+    renderRows("init-outcome-tbody", report.outcomes, function (o) {
+      return [o.sku, o.size, o.action, o.result, o.reason]; });
   }
 
   async function initApply() {
     if (!initState.pending) return;
     const statusEl = document.getElementById("init-apply-status");
     const btn = document.getElementById("btn-init-apply");
-    const confirmWord = document.getElementById("init-confirm-word").value.trim();
-    const secondConfirm = document.getElementById("init-second-confirm").checked;
+    const dlqCount = document.getElementById("init-dlq-count").value;
+    const body = Object.assign({}, initState.pending, {
+      confirm: document.getElementById("init-confirm-word").value.trim(),
+      // datetime-local carries no offset: the server reads it as Europe/Rome
+      dlq_checked_at: document.getElementById("init-dlq-at").value || null,
+      dlq_count: dlqCount === "" ? null : Number(dlqCount),
+    });
     btn.disabled = true;
-    setStatus(statusEl, "applico...");
+    setStatus(statusEl, "applico (alcuni minuti)...");
     try {
-      const body = Object.assign({}, initState.pending, { confirm: confirmWord, second_confirm: secondConfirm });
       const sub = await api("POST", "/init/apply", body);
-      const rec = await pollJob("/init/apply/" + sub.job_id);
-      const failMsg = jobFailureMessage(rec);
-      if (failMsg) {
-        setStatus(statusEl, failMsg, "error");
+      const rec = await pollJob("/init/apply/" + sub.job_id, INIT_POLL);
+      if (rec.status === "failed") {
+        setStatus(statusEl, jobFailureMessage(rec), "error");
         return;
       }
-      // Defense-in-depth (LOW-c): jobFailureMessage() already maps every known
-      // non-applied result (VERIFY_FAILED, gesture_required) above, but never
-      // call the renderer on an unexpected/missing report — a raw JS crash is
-      // worse than a generic error message.
       if (!rec.result || !rec.result.report) {
         setStatus(statusEl, "risposta inattesa dal server.", "error");
         return;
       }
-      renderInitOutcome(rec.result.report);
-      setStatus(statusEl, "applicato con successo", "ok");
-      initState.pending = null;
-      await checkInitStatus(); // hides the banner once cutover_done becomes true
+      renderInitOutcome(rec.result);
+      if (rec.result.applied) {
+        setStatus(statusEl, "inizializzazione applicata", "ok");
+        initState.pending = null;
+        await checkInitStatus(); // hides the banner once baseline_done becomes true
+      } else {
+        setStatus(statusEl, "non applicata: " + rec.result.status, "error");
+      }
     } catch (e) {
-      // A thrown/rejected `api()` call means the HTTP response itself was non-2xx
-      // (see `api()` above) — in practice ONLY confirm_invalid (bad/expired
-      // confirm_token), which the server answers with a SYNCHRONOUS 409 before
-      // any job exists. A missing/wrong CONFERMO (gesture_required) is NOT a
-      // 409 — the job is created (202) and completes as "done" with
-      // result.status === "gesture_required"; that case is handled above via
-      // jobFailureMessage(), never reaches this catch.
-      setStatus(statusEl, "errore: " + e.message, "error");
+      // A synchronous 409, before any job: confirm_invalid, preview_expired, or
+      // gesture_required (CONFERMO or the /dlqs precondition, with its reason).
+      setStatus(statusEl, "errore: " + e.message + (e.reason ? " (" + e.reason + ")" : ""), "error");
     } finally {
       btn.disabled = false;
     }
@@ -221,7 +240,7 @@
   async function checkInitStatus() {
     try {
       const data = await api("GET", "/init/status");
-      document.getElementById("init-banner").classList.toggle("hidden", !!data.cutover_done);
+      document.getElementById("init-banner").classList.toggle("hidden", !!data.baseline_done);
     } catch (e) {
       // banner stays as-is on a transient error; not fatal to the rest of the app.
     }

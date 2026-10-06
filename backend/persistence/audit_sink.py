@@ -35,7 +35,7 @@ from backend.persistence.records import (
     StoreError,
 )
 from backend.services.delete_service import BeforeSnapshot, DeleteOutcomeEvent
-from backend.services.init_service import InitBeforeSnapshot
+from backend.services.baseline_service import InitBeforeSnapshot
 from backend.services.pricing_service import PriceIntent, ProductPrior, VariantPrior
 
 _ROME = ZoneInfo("Europe/Rome")

@@ -1,314 +1,154 @@
-"""INIT vertical — shared mutation helper + FastAPI TestClient integration.
-
-Mirrors ``test_api_publish``/``test_api_delete``: the compute service
-(``backend.services.init_service``) is mocked at the module boundary so nothing
-touches Shopify or the sheet; only the HTTP/token/gesture machinery is exercised
-here. Runs on a bare interpreter as an import-time no-op (``init_service`` has no
-FastAPI dependency); every test that needs FastAPI/httpx calls
-``pytest.importorskip`` locally, matching the sibling test modules.
-"""
+"""INIT vertical — "Inizializza" on MySQL behind the confirm-token machinery
+(plan §3.4), end to end through the HTTP layer: the real baseline service on the
+in-memory register and the stateful fake Shopify. Every test needs FastAPI/httpx
+and calls ``pytest.importorskip`` locally, like the sibling API test modules."""
 from __future__ import annotations
 
 import base64
-from types import SimpleNamespace
-from typing import Any, List
+from datetime import datetime, timedelta
 
-from backend.services.init_service import (
-    InitOutcome,
-    InitPlan,
-    InitReport,
-    InitRowDecision,
-)
+import pytest
 
-PROMO = "gid://shopify/Location/PROMO"
+from backend.persistence.records import KIND_BASELINE, KIND_INIT_BEFORE
+
+from tests.fake_shop import PROMO, FakeShop
+from tests.register_fixtures import MemoryBackend
+
 _SECRET = "unit-test-signing-secret"
+MUTATIONS = {"duplicate", "adjust", "activate", "deactivate", "bulk", "status", "publish", "delete"}
 
 
-# ---------------------------------------------------------------------------
-# Fakes + plan/report builders
-# ---------------------------------------------------------------------------
-class FakeSheet:
-    """Opaque sheet handle — exposes ``.ws.spreadsheet`` (audit sink builder) and
-    ``cutover_done()`` (the ``GET /init/status`` banner probe)."""
-
-    def __init__(self, *, cutover_done: bool = False) -> None:
-        self.ws = SimpleNamespace(spreadsheet=SimpleNamespace())
-        self._cutover_done = cutover_done
-
-    def cutover_done(self) -> bool:
-        return self._cutover_done
+def _auth(user: str = "racoon", pw: str = "s3cret-pw") -> dict:
+    return {"Authorization": "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()}
 
 
-class FakeTransport:
-    """Opaque transport handle — the service is mocked."""
+class World:
+    def __init__(self, monkeypatch) -> None:
+        pytest.importorskip("fastapi")
+        pytest.importorskip("httpx")
+        monkeypatch.delenv("APP_USERNAME", raising=False)
+        monkeypatch.setenv("APP_PASSWORD", "s3cret-pw")
+        monkeypatch.setenv("TOKEN_SIGNING_SECRET", _SECRET)
+        self.be = MemoryBackend()
+        self.shop = FakeShop()
+        self.out = self.shop.product("Nike - Outlet", promo={"42": 0})
+        pid = self.be.add_pair("SKU1", "42")
+        self.event = self.be.add_event(pid, +1, event_type="IMPORTED", actor="IMPORT", payload={"raw": {}})
+        self.client = self.new_client()
+
+    def new_client(self):
+        from fastapi.testclient import TestClient
+
+        from backend.api.jobs import SynchronousExecutor
+        from backend.app import create_app
+        from backend.config import ShopifyConfig
+
+        app = create_app(
+            config=ShopifyConfig("t.myshopify.com", "shpat_x", "2026-10", PROMO),
+            sheet_factory=lambda: None,
+            register_factory=lambda **kw: self.be.register(**kw),
+            transport_factory=lambda: self.shop,
+            audit_factory=lambda: None,
+            executor=SynchronousExecutor(),
+            promo_location_id=PROMO,
+        )
+        return TestClient(app)
+
+    def preview(self) -> dict:
+        sub = self.client.post("/init/preview", headers=_auth())
+        assert sub.status_code == 202
+        data = self.client.get(f"/init/preview/{sub.json()['job_id']}", headers=_auth()).json()
+        assert data["status"] == "done", data
+        return data["result"]
+
+    def body(self, result: dict, **over) -> dict:
+        # one minute before the snapshot, on the (fake) database clock the service checks against
+        at = datetime.fromisoformat(result["plan"]["previewed_at"]) - timedelta(minutes=1)
+        return {"plan_hash": result["plan_hash"], "confirm_token": result["confirm_token"], "confirm": "CONFERMO",
+                "dlq_checked_at": at.isoformat(), "dlq_count": 0, **over}
+
+    def apply(self, body: dict):
+        return self.client.post("/init/apply", headers=_auth(), json=body)
+
+    def mutations(self):
+        return [c[0] for c in self.shop.calls if c[0] in MUTATIONS]
 
 
-def _decision(sku="SKU1", size="42", bucket="demote:missing", ph="h1") -> InitRowDecision:
-    return InitRowDecision(sku=sku, size=size, row_uuid="", bucket=bucket,
-                            target_gid=None, live_status=None, plan_hash=ph)
-
-
-def _plan(ph: str = "h1", *, demote_missing_count: int = 1) -> InitPlan:
-    return InitPlan(
-        dry_run=True, cutover_already_done=False, backfill_pending_rows=1,
-        demote_missing=tuple(_decision(sku=f"SKU{i}", ph=f"{ph}-{i}") for i in range(demote_missing_count)),
-    )
-
-
-def _report() -> InitReport:
-    return InitReport(
-        backfill_stamped=1, backfill_already_done=False, demoted_rows=1,
-        drafted_products=0, verify_failed_rows=0,
-        outcomes=(InitOutcome("SKU1", "42", "u1", "demote:missing", "DEMOTED", None, ()),),
-    )
-
-
-class _MockInitService:
-    """Stand-in for ``init_service`` — records calls; ``plan`` is mutable so a
-    test can simulate LIVE drift between preview and the apply re-preview."""
-
-    def __init__(self, *, plan: InitPlan, report: InitReport) -> None:
-        self.plan = plan
-        self.report = report
-        self.preview_calls = 0
-        self.apply_calls = 0
-        self.last_approved_plan_hash: Any = None
-
-    def init_preview(self, sheet: Any, transport: Any, *, promo_location_id: str) -> InitPlan:
-        self.preview_calls += 1
-        return self.plan
-
-    def init_apply(self, sheet: Any, transport: Any, approved_plan: InitPlan, audit_sink: Any,
-                   *, promo_location_id: str, now=None, approved_plan_hash=None) -> InitReport:
-        self.apply_calls += 1
-        self.last_approved_plan_hash = approved_plan_hash
-        return self.report
-
-
-# ===========================================================================
-# init_plan_hash — aggregate TOCTOU key (API layer)
-# ===========================================================================
-def test_init_plan_hash_is_order_independent_and_excludes_row_uuid():
-    import pytest
-    pytest.importorskip("fastapi")
-    from backend.api.init import init_plan_hash
-
-    d1 = InitRowDecision(sku="A", size="42", row_uuid="uuid-preview-1", bucket="demote:missing",
-                         target_gid=None, live_status=None, plan_hash="h1")
-    d2 = InitRowDecision(sku="B", size="40", row_uuid="uuid-preview-2", bucket="kept-online",
-                         target_gid="gid://p/1", live_status="ACTIVE", plan_hash="h2")
-    plan_a = InitPlan(dry_run=True, cutover_already_done=False, backfill_pending_rows=0,
-                      demote_missing=(d1,), kept_online=(d2,))
-    plan_b = InitPlan(dry_run=True, cutover_already_done=False, backfill_pending_rows=0,
-                      demote_missing=(d1,), kept_online=(d2,))
-    assert init_plan_hash(plan_a) == init_plan_hash(plan_b)
-
-    # Same rows, DIFFERENT row_uuid (as would happen between an ephemeral preview
-    # read and a real post-backfill read) -> the aggregate hash is UNCHANGED.
-    d1_new_uuid = InitRowDecision(sku="A", size="42", row_uuid="uuid-apply-REAL", bucket="demote:missing",
-                                  target_gid=None, live_status=None, plan_hash="h1")
-    plan_c = InitPlan(dry_run=True, cutover_already_done=False, backfill_pending_rows=0,
-                      demote_missing=(d1_new_uuid,), kept_online=(d2,))
-    assert init_plan_hash(plan_a) == init_plan_hash(plan_c)
-
-    # A genuinely different row plan_hash flips the aggregate.
-    d1_drift = InitRowDecision(sku="A", size="42", row_uuid="x", bucket="kept-online",
-                               target_gid="gid://p/9", live_status="ACTIVE", plan_hash="h9")
-    plan_d = InitPlan(dry_run=True, cutover_already_done=False, backfill_pending_rows=0,
-                      demote_missing=(), kept_online=(d2, d1_drift))
-    assert init_plan_hash(plan_a) != init_plan_hash(plan_d)
-
-
-# ===========================================================================
-# TestClient tier — RUNS ONLY where fastapi/httpx are installed (importorskip).
-# ===========================================================================
-def _basic(user: str, pw: str) -> str:
-    return "Basic " + base64.b64encode(f"{user}:{pw}".encode("utf-8")).decode("ascii")
-
-
-def _auth():
-    return {"Authorization": _basic("racoon", "s3cret-pw")}
-
-
-def _make_client(monkeypatch, svc: _MockInitService, *, cutover_done: bool = False):
-    import pytest
-    pytest.importorskip("fastapi")
-    pytest.importorskip("httpx")
-    from fastapi.testclient import TestClient
-
-    from backend.app import create_app
-    from backend.config import ShopifyConfig
-    from backend.services import init_service
-
-    monkeypatch.delenv("APP_USERNAME", raising=False)
-    monkeypatch.setenv("APP_PASSWORD", "s3cret-pw")
-    monkeypatch.setenv("TOKEN_SIGNING_SECRET", _SECRET)
-
-    monkeypatch.setattr(init_service, "init_preview", svc.init_preview)
-    monkeypatch.setattr(init_service, "init_apply", svc.init_apply)
-
-    cfg = ShopifyConfig("t.myshopify.com", "shpat_x", "2025-07", PROMO)
-    from backend.api.jobs import SynchronousExecutor
-
-    app = create_app(
-        config=cfg,
-        sheet_factory=lambda: FakeSheet(cutover_done=cutover_done),
-        transport_factory=lambda: FakeTransport(),
-        audit_factory=lambda: None,
-        executor=SynchronousExecutor(),
-        promo_location_id=PROMO,
-    )
-    return TestClient(app)
-
-
-def _preview_and_get(client) -> dict:
-    sub = client.post("/init/preview", headers=_auth())
+def test_status_reports_the_baseline_and_requires_auth(monkeypatch):
+    w = World(monkeypatch)
+    assert w.client.get("/init/status").status_code == 401
+    assert w.client.get("/init/status", headers=_auth()).json() == {"baseline_done": False}
+    res = w.preview()
+    sub = w.apply(w.body(res))
     assert sub.status_code == 202
-    job_id = sub.json()["job_id"]
-    poll = client.get(f"/init/preview/{job_id}", headers=_auth())
-    assert poll.status_code == 200
-    data = poll.json()
-    assert data["status"] == "done"
-    return data["result"]
+    assert w.client.get("/init/status", headers=_auth()).json()["baseline_done"] is True
 
 
-# --- status (banner gate) --------------------------------------------------
-def test_init_status_reports_cutover_done(monkeypatch):
-    svc = _MockInitService(plan=_plan(), report=_report())
-    client = _make_client(monkeypatch, svc, cutover_done=False)
-    res = client.get("/init/status", headers=_auth())
-    assert res.status_code == 200
-    assert res.json() == {"cutover_done": False}
-
-
-def test_init_status_requires_auth(monkeypatch):
-    svc = _MockInitService(plan=_plan(), report=_report())
-    client = _make_client(monkeypatch, svc)
-    res = client.get("/init/status")
-    assert res.status_code == 401
-
-
-# --- preview -----------------------------------------------------------
-def test_init_preview_returns_plan_hash_and_token_and_does_not_mutate(monkeypatch):
-    svc = _MockInitService(plan=_plan("h1"), report=_report())
-    client = _make_client(monkeypatch, svc)
-    res = _preview_and_get(client)
+def test_the_preview_returns_the_plan_and_a_token_and_writes_nothing(monkeypatch):
+    w = World(monkeypatch)
+    res = w.preview()
+    plan = res["plan"]
     assert res["plan_hash"] and res["confirm_token"]
-    assert res["plan"]["demote_missing"][0]["sku"] == "SKU0"
-    assert svc.apply_calls == 0
-    assert svc.preview_calls == 1
+    assert plan["counts"]["level"] == 1 and plan["keys"][0]["sku"] == "SKU1" and plan["previewed_at"].endswith("+00:00")
+    assert w.mutations() == [] and w.be.register().audit_rows(KIND_INIT_BEFORE) == []
 
 
-# --- apply: happy path ------------------------------------------------------
-def test_init_apply_valid_token_and_confermo_executes(monkeypatch):
-    svc = _MockInitService(plan=_plan("h1"), report=_report())
-    client = _make_client(monkeypatch, svc)
-    res = _preview_and_get(client)
-    ap = client.post("/init/apply", headers=_auth(), json={
-        "plan_hash": res["plan_hash"], "confirm_token": res["confirm_token"], "confirm": "CONFERMO",
-    })
-    assert ap.status_code == 202
-    out = client.get(f"/init/apply/{ap.json()['job_id']}", headers=_auth()).json()["result"]
-    assert out["status"] == "APPLIED" and out["applied"] is True
-    assert out["report"]["demoted_rows"] == 1
-    assert svc.apply_calls == 1
+def test_a_confirmed_apply_levels_and_writes_the_baseline_row_as_the_acting_user(monkeypatch):
+    w = World(monkeypatch)
+    res = w.preview()
+    sub = w.apply(w.body(res))
+    assert sub.status_code == 202
+    out = w.client.get(f"/init/apply/{sub.json()['job_id']}", headers=_auth()).json()
+    assert out["status"] == "done" and out["result"]["status"] == "APPLIED", out
+    assert out["result"]["report"]["stamped"] == 1
+    base = w.be.register().baseline()
+    assert base.actor == "racoon" and base.payload["dlq"]["count"] == 0
+    assert w.shop.available(w.out.gid, "42") == 1
 
 
-def test_init_apply_threads_the_real_aggregate_plan_hash_into_the_service(monkeypatch):
-    """HIGH-2 (post-review): the api layer must recompute + thread the REAL
-    aggregate plan_hash into init_service.init_apply (used for the durable
-    before-snapshot + AFTER audit event) — never leave it implicit/empty."""
-    import pytest
-    pytest.importorskip("fastapi")
-    from backend.api.init import init_plan_hash
-
-    svc = _MockInitService(plan=_plan("h1"), report=_report())
-    client = _make_client(monkeypatch, svc)
-    res = _preview_and_get(client)
-    ap = client.post("/init/apply", headers=_auth(), json={
-        "plan_hash": res["plan_hash"], "confirm_token": res["confirm_token"], "confirm": "CONFERMO",
-    })
-    client.get(f"/init/apply/{ap.json()['job_id']}", headers=_auth())
-    assert svc.last_approved_plan_hash == init_plan_hash(svc.plan)
-
-
-# --- apply: gesture failures (NO service call) ------------------------------
-def test_init_apply_without_confermo_is_gesture_required_and_skips_apply(monkeypatch):
-    svc = _MockInitService(plan=_plan("h1"), report=_report())
-    client = _make_client(monkeypatch, svc)
-    res = _preview_and_get(client)
-    ap = client.post("/init/apply", headers=_auth(), json={
-        "plan_hash": res["plan_hash"], "confirm_token": res["confirm_token"],
-    })
-    assert ap.status_code == 202  # token verified -> a job IS created
-    out = client.get(f"/init/apply/{ap.json()['job_id']}", headers=_auth()).json()["result"]
-    assert out["status"] == "gesture_required" and out["applied"] is False
-    assert svc.apply_calls == 0
+@pytest.mark.parametrize("over,code,reason", [
+    ({"confirm_token": "nope"}, "confirm_invalid", None),
+    ({"confirm": "confermo?"}, "gesture_required", None),
+    ({"dlq_count": 2}, "gesture_required", "dlq_unresolved_entries"),
+    ({"dlq_checked_at": None}, "gesture_required", "dlq_check_missing"),
+    ({"dlq_checked_at": "2020-01-01T00:00:00Z"}, "gesture_required", "dlq_check_too_old"),
+])
+def test_a_refused_confirm_creates_no_job_and_writes_nothing(monkeypatch, over, code, reason):
+    w = World(monkeypatch)
+    res = w.preview()
+    resp = w.apply(w.body(res, **over))
+    assert resp.status_code == 409
+    err = resp.json()["error"]
+    assert err["code"] == code and err.get("reason") == reason
+    assert w.mutations() == [] and w.be.register().audit_rows(KIND_BASELINE) == []
 
 
-def test_init_apply_over_threshold_without_second_confirm_is_gesture_required(monkeypatch):
-    svc = _MockInitService(plan=_plan("h1", demote_missing_count=26), report=_report())
-    client = _make_client(monkeypatch, svc)
-    res = _preview_and_get(client)
-    ap = client.post("/init/apply", headers=_auth(), json={
-        "plan_hash": res["plan_hash"], "confirm_token": res["confirm_token"], "confirm": "CONFERMO",
-    })
-    out = client.get(f"/init/apply/{ap.json()['job_id']}", headers=_auth()).json()["result"]
-    assert out["status"] == "gesture_required" and out["applied"] is False
-    assert svc.apply_calls == 0
+def test_a_plan_this_process_no_longer_keeps_is_refused(monkeypatch):
+    w = World(monkeypatch)
+    res = w.preview()
+    w.client = w.new_client()                                  # a restart: the kept plans are gone
+    resp = w.apply(w.body(res))
+    assert resp.status_code == 409 and resp.json()["error"]["code"] == "preview_expired"
+    assert w.mutations() == []
 
 
-def test_init_apply_over_threshold_with_second_confirm_executes(monkeypatch):
-    svc = _MockInitService(plan=_plan("h1", demote_missing_count=26), report=_report())
-    client = _make_client(monkeypatch, svc)
-    res = _preview_and_get(client)
-    ap = client.post("/init/apply", headers=_auth(), json={
-        "plan_hash": res["plan_hash"], "confirm_token": res["confirm_token"],
-        "confirm": "CONFERMO", "second_confirm": True,
-    })
-    out = client.get(f"/init/apply/{ap.json()['job_id']}", headers=_auth()).json()["result"]
-    assert out["status"] == "APPLIED" and out["applied"] is True
-    assert svc.apply_calls == 1
+def test_an_applied_plan_cannot_be_confirmed_twice(monkeypatch):
+    w = World(monkeypatch)
+    res = w.preview()
+    assert w.apply(w.body(res)).status_code == 202
+    resp = w.apply(w.body(res))
+    assert resp.status_code == 409 and resp.json()["error"]["code"] == "preview_expired"
 
 
-# --- apply: token failures (NO job, NO service call) ------------------------
-def test_init_apply_bad_token_is_409_and_skips_apply(monkeypatch):
-    svc = _MockInitService(plan=_plan("h1"), report=_report())
-    client = _make_client(monkeypatch, svc)
-    res = _preview_and_get(client)
-    ap = client.post("/init/apply", headers=_auth(), json={
-        "plan_hash": res["plan_hash"], "confirm_token": "not-a-valid-token", "confirm": "CONFERMO",
-    })
-    assert ap.status_code == 409
-    assert ap.json()["error"]["code"] == "confirm_invalid"
-    assert svc.apply_calls == 0
+def test_the_preview_after_the_baseline_reports_it_done(monkeypatch):
+    w = World(monkeypatch)
+    w.apply(w.body(w.preview()))
+    assert w.preview()["plan"]["already_done"] is True
 
 
-def test_init_apply_drift_is_verify_failed_and_skips_apply(monkeypatch):
-    svc = _MockInitService(plan=_plan("h1"), report=_report())
-    client = _make_client(monkeypatch, svc)
-    res = _preview_and_get(client)
-    ph, token = res["plan_hash"], res["confirm_token"]
-
-    svc.plan = _plan("h2")  # LIVE state moved between preview and apply
-    ap = client.post("/init/apply", headers=_auth(), json={
-        "plan_hash": ph, "confirm_token": token, "confirm": "CONFERMO",
-    })
-    assert ap.status_code == 202
-    out = client.get(f"/init/apply/{ap.json()['job_id']}", headers=_auth()).json()["result"]
-    assert out["status"] == "VERIFY_FAILED" and out["applied"] is False
-    assert svc.apply_calls == 0
-
-
-def test_init_routes_require_auth(monkeypatch):
-    import pytest
-    svc = _MockInitService(plan=_plan("h1"), report=_report())
-    client = _make_client(monkeypatch, svc)
-    for method, path, kwargs in [
-        ("post", "/init/preview", {}),
-        ("get", "/init/preview/whatever", {}),
-        ("post", "/init/apply", {"json": {"plan_hash": "h1", "confirm_token": "t"}}),
-        ("get", "/init/apply/whatever", {}),
-    ]:
-        r = getattr(client, method)(path, **kwargs)
-        assert r.status_code == 401
+@pytest.mark.parametrize("method,path", [
+    ("post", "/init/preview"), ("get", "/init/preview/x"), ("post", "/init/apply"), ("get", "/init/apply/x"),
+])
+def test_init_routes_require_auth(monkeypatch, method, path):
+    w = World(monkeypatch)
+    assert getattr(w.client, method)(path).status_code == 401

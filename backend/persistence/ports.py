@@ -39,7 +39,7 @@ from backend.persistence.records import (
     WriteOp,
 )
 from backend.services.delete_service import BeforeSnapshot, DeleteOutcomeEvent
-from backend.services.init_service import InitBeforeSnapshot
+from backend.services.baseline_service import InitBeforeSnapshot
 from backend.services.pricing_service import PriceIntent
 
 
@@ -124,6 +124,10 @@ class RegisterPort(Protocol):
     def held_keys(self) -> List[Hold]: ...
 
     def baseline(self) -> Optional[AuditRow]: ...
+
+    def snapshot(self, key: Optional[Tuple[str, str]] = None) -> Snapshot: ...
+
+    def import_payloads(self, pair_ids: Sequence[int]) -> List[Tuple[int, Any]]: ...
 
     # --- fenced writes (each one transaction, renew first) -------------------
     def stamp(

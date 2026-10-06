@@ -22,54 +22,70 @@
 
   <!-- ============================== INIT (first-run banner) ============================== -->
   <section id="init-banner" class="plan-panel hidden">
-    <h3>Inizializza — prima configurazione</h3>
+    <h3>Inizializza — allineamento iniziale (una volta sola)</h3>
     <p class="warning-banner">
-      Operazione una tantum: allinea il foglio a Shopify (righe "online" non più
-      vendibili vengono spuntate e i relativi prodotti passati in bozza). Da
-      eseguire UNA VOLTA prima di usare il resto dello strumento.
+      Operazione una tantum, dopo il controllo fisico: per ogni chiave (SKU, taglia) porta lo stock Promo
+      dell'outlet al numero di paia in scansia, oppure la trattiene se non è determinabile. Prima del calcolo
+      fai leggere a Claude <code>/dlqs</code> di 678434: nessuna voce irrisolta e nessuna esecuzione in corso.
     </p>
     <div class="toolbar">
       <button id="btn-init-preview">Calcola piano di inizializzazione</button>
       <span id="init-status" class="status-text"></span>
     </div>
     <div id="init-plan-panel" class="plan-panel hidden">
-      <p>Righe da timbrare (backfill): <strong id="init-backfill-count"></strong></p>
+      <p id="init-counts"></p>
       <div id="init-anomalies" class="anomalies"></div>
 
-      <h4>kept-online</h4>
-      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>Target</th></tr></thead>
-        <tbody id="init-kept-online-tbody"></tbody></table>
+      <h4>Chiavi allineate a N (outlet attivo con la taglia)</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>N</th><th>Δ Promo</th><th>Attivazione</th></tr></thead>
+        <tbody id="init-level-tbody"></tbody></table>
 
-      <h4>demote:missing</h4>
-      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th></tr></thead>
-        <tbody id="init-demote-missing-tbody"></tbody></table>
+      <h4>Outlet in bozza: unità azzerate, il pubblica le ripristina</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>N</th><th>Δ Promo</th></tr></thead>
+        <tbody id="init-zero-tbody"></tbody></table>
 
-      <h4>demote:draft</h4>
-      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>Target</th><th>Stato live</th></tr></thead>
-        <tbody id="init-demote-draft-tbody"></tbody></table>
+      <h4>Senza outlet: le crea il pubblica</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>N</th></tr></thead>
+        <tbody id="init-none-tbody"></tbody></table>
 
-      <h4>demote:sold-out-size</h4>
-      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>Target</th></tr></thead>
-        <tbody id="init-demote-soldout-tbody"></tbody></table>
+      <h4>Unità senza paio in scansia: portate a 0</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>Δ Promo</th></tr></thead>
+        <tbody id="init-lower-tbody"></tbody></table>
 
-      <h4>review:multi-match</h4>
-      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th></tr></thead>
-        <tbody id="init-review-tbody"></tbody></table>
+      <h4>Chiavi trattenute (si sbloccano con un riallineamento della chiave)</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>N</th><th>Motivo</th><th>Gemelle</th><th>Δ Promo</th></tr></thead>
+        <tbody id="init-hold-tbody"></tbody></table>
+
+      <h4>Varianti da normalizzare (DENY + tracciata) e personalizzazioni a 0</h4>
+      <table class="data-table"><thead><tr><th>Prodotto</th><th>Titolo</th><th>Stato</th><th>Varianti</th><th>Personalizzazioni</th></tr></thead>
+        <tbody id="init-products-tbody"></tbody></table>
+
+      <h4>Prezzo outlet dal foglio (colonna J)</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Esito</th><th>Prezzo</th><th>Valori letti</th></tr></thead>
+        <tbody id="init-prices-tbody"></tbody></table>
+
+      <h4>Discrepanze "online" (solo elenco)</h4>
+      <table class="data-table"><thead><tr><th>Paio</th><th>SKU</th><th>Taglia</th><th>Classe</th></tr></thead>
+        <tbody id="init-partb-tbody"></tbody></table>
+
+      <h4>Note di catalogo (una persona)</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>Nota</th><th>Gemelle</th></tr></thead>
+        <tbody id="init-catalogue-tbody"></tbody></table>
 
       <div class="gesture-panel">
-        <p class="warning-banner">Gesto umano richiesto: digita <code>CONFERMO</code> per applicare.</p>
+        <p class="warning-banner">Gesto umano richiesto: istante della lettura <code>/dlqs</code>, voci irrisolte (deve essere 0) e <code>CONFERMO</code>.</p>
+        <label>Lettura /dlqs alle <input type="datetime-local" id="init-dlq-at" step="1"></label>
+        <label>Voci irrisolte (dlqCount) <input type="number" id="init-dlq-count" min="0" step="1"></label>
         <label>Digita CONFERMO <input type="text" id="init-confirm-word"></label>
-        <label id="init-second-confirm-row" class="hidden">
-          <input type="checkbox" id="init-second-confirm"> Confermo di aver rivisto il numero elevato di demote (second_confirm)
-        </label>
         <button id="btn-init-apply" class="btn-danger">Applica inizializzazione</button>
         <span id="init-apply-status" class="status-text"></span>
       </div>
     </div>
     <div id="init-outcome-panel" class="plan-panel hidden">
       <h4>Esito</h4>
+      <p id="init-outcome-summary"></p>
       <table class="data-table">
-        <thead><tr><th>SKU</th><th>Taglia</th><th>Bucket</th><th>Stato</th><th>Target</th><th>Warning</th></tr></thead>
+        <thead><tr><th>SKU</th><th>Taglia</th><th>Azione</th><th>Esito</th><th>Motivo</th></tr></thead>
         <tbody id="init-outcome-tbody"></tbody>
       </table>
     </div>

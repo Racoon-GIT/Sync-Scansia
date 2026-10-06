@@ -17,7 +17,7 @@ from backend.persistence.records import (
 )
 from backend.persistence.memory_store import SimulatedCrash
 from backend.services.delete_service import BeforeSnapshot, DeleteOutcomeEvent
-from backend.services.init_service import InitBeforeSnapshot, InitDemotedRowSnapshot, InitTargetSnapshot
+from backend.services.baseline_service import InitBeforeSnapshot
 from backend.services.pricing_service import PriceIntent, ProductPrior, VariantPrior
 
 from tests.register_fixtures import MemoryBackend, StubLease
@@ -89,10 +89,10 @@ def test_a_lost_lease_refuses_the_snapshot(be):
 def test_init_before_snapshot(be):
     reg, sink = _sink(be)
     sink.write_init_before(InitBeforeSnapshot(
-        plan_hash="ph", rows=(InitDemotedRowSnapshot("u", "SKU", "42", "1", ""),),
-        targets=(InitTargetSnapshot("gid://shopify/Product/9", "ACTIVE"),)))
+        plan_hash="ph", rule="level", dlq_checked_at="2026-10-08T07:40:00+00:00", dlq_count=0,
+        keys=(), products=(), online=((3, False),), prices=()))
     (row,) = reg.audit_rows(KIND_INIT_BEFORE)
-    assert row.plan_hash == "ph" and row.payload["targets"][0]["prior_status"] == "ACTIVE"
+    assert row.plan_hash == "ph" and row.payload["online"] == [[3, False]] and row.payload["dlq_count"] == 0
 
 
 def test_events_read_back_newest_window_oldest_first_in_rome_time(be):
