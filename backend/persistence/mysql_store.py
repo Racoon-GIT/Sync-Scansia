@@ -108,12 +108,13 @@ _PAIR_COLS = (
     "OUTLET_PRODUCT_ID, ONLINE, UPDATED_AT, PRODUCT_TITLE"
 )
 SQL_PAIRS = f"SELECT {_PAIR_COLS} FROM sc_returned_pair"
-SQL_UNSTAMPED = (
+_UNSTAMPED_WHERE = (
     "SELECT e.ID, e.PAIR_ID, e.EVENT_TYPE, e.ACTOR, e.OUTLET_DELTA, e.CREATED_AT, "
     "e.OUTLET_RECONCILED_AT, p.SKU, p.SIZE, p.STATE "
     "FROM sc_returned_pair_event e LEFT JOIN sc_returned_pair p ON p.ID = e.PAIR_ID "
-    "WHERE e.OUTLET_RECONCILED_AT IS NULL ORDER BY e.ID"
+    "WHERE e.OUTLET_RECONCILED_AT IS NULL"
 )
+SQL_UNSTAMPED = _UNSTAMPED_WHERE + " ORDER BY e.ID"
 _AUDIT_COLS = (
     "ID, KIND, ACTOR, ACTION, CREATED_AT, PLAN_HASH, INTENT_ID, LEASE_GEN, SENT_AT, "
     "SENT_AVAILABLE, IDEMPOTENCY_KEY, PRODUCT_ID, STEP, GROUP_ID, REQUEST, STATUS, "
@@ -535,8 +536,8 @@ class MySQLStore:
                 kp: Tuple[Any, ...] = tuple(key) if key is not None else ()
                 cur.execute(SQL_SNAP_PAIRS + (" AND SKU = %s AND SIZE = %s" if key else "") + " ORDER BY ID", kp)
                 pairs = tuple(_pair(r) for r in cur.fetchall())
-                cur.execute(SQL_UNSTAMPED.replace(" ORDER BY e.ID", "")
-                            + (" AND p.SKU = %s AND p.SIZE = %s" if key else "") + " ORDER BY e.ID", kp)
+                cur.execute(_UNSTAMPED_WHERE + (" AND p.SKU = %s AND p.SIZE = %s" if key else "")
+                            + " ORDER BY e.ID", kp)
                 unstamped = tuple(_event(r) for r in cur.fetchall())
                 cur.execute(SQL_SNAP_MAX + (" WHERE p.SKU = %s AND p.SIZE = %s" if key else "")
                             + " GROUP BY p.SKU, p.SIZE", kp)

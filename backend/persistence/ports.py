@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Protocol, Sequence, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 from backend.persistence.records import (
     AuditRow,
@@ -35,6 +35,7 @@ from backend.persistence.records import (
     PairRow,
     PendingDeltas,
     EventRow,
+    Snapshot,
     WriteOp,
 )
 from backend.services.delete_service import BeforeSnapshot, DeleteOutcomeEvent
@@ -86,13 +87,13 @@ class RegisterStore(Protocol):
 
     def read_lease(self) -> LeaseRow: ...
 
-    def read_snapshot(self, key: Optional[Any] = None) -> Any:
+    def read_snapshot(self, key: Optional[Tuple[str, str]] = None) -> Snapshot:
         """One READ ONLY consistent-snapshot transaction (the stated exception
         to §3.7 rule 1), closed before returning: shelf pairs, every unstamped
         event, each key's max event id — all keys, or one."""
         ...
 
-    def read_import_payloads(self, pair_ids: Sequence[int]) -> List[Any]:
+    def read_import_payloads(self, pair_ids: Sequence[int]) -> List[Tuple[int, Any]]:
         """``(pair_id, PAYLOAD)`` of the pairs' ``IMPORTED`` events (B-2's J seed)."""
         ...
 

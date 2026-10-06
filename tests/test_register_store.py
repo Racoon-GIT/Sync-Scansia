@@ -67,11 +67,6 @@ def _take(store, holder="f7test-h", ttl=300_000):
     return Fence(holder, gen, ttl)
 
 
-def _mine(rows, ids):
-    ids = set(ids)
-    return [r for r in rows if getattr(r, "pair_id", getattr(r, "event_id", None)) in ids]
-
-
 # ---------------------------------------------------------------------------
 # Reads
 # ---------------------------------------------------------------------------
@@ -126,12 +121,12 @@ def test_a_snapshot_reads_the_shelf_every_unstamped_event_and_each_keys_max_even
     s.close()
 
 
-def test_a_snapshot_is_one_transaction_and_holds_no_lock(backend):
+def test_a_snapshot_transaction_is_closed_before_it_returns(backend):
     s = backend.store()
     s.read_snapshot()
     p, e = backend.add_shelf_pair("F7T-SNAP2", "40")                        # a writer right after
-    assert [x.pair_id for x in s.read_snapshot(("F7T-SNAP2", "40")).pairs] == [p]
-    gen = s.lease_take("f7test-snap", 1000)                                 # the store is free to write
+    assert [x.pair_id for x in s.read_snapshot(("F7T-SNAP2", "40")).pairs] == [p]   # a new snapshot
+    gen = s.lease_take("f7test-snap", 1000)      # autocommit again: inside READ ONLY it fails (1792)
     assert gen is not None
     s.close()
 

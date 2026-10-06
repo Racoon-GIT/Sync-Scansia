@@ -56,7 +56,9 @@ def test_token_verify_altered_signature_false(signing_secret):
     svc = HmacTokenService()
     tok = svc.mint("planhash-abc", ttl_s=300, kind="publish")
     payload_b64, sig_b64 = tok.split(".")
-    flipped = sig_b64[:-1] + ("A" if sig_b64[-1] != "A" else "B")
+    # The FIRST char: the last one of an unpadded 32-byte MAC carries 2 padding bits,
+    # so 'A' → 'B' there can decode to the same bytes (a 1-in-16 flaky pass of verify).
+    flipped = ("A" if sig_b64[0] != "A" else "B") + sig_b64[1:]
     assert svc.verify(f"{payload_b64}.{flipped}", "planhash-abc", kind="publish") is False
 
 

@@ -64,7 +64,14 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   `scansia_mgr_stg`, other writers' DML and `SP_SCANSIA_CONSUME` as `scansia_fixture_stg`, both through the option
   files SERVER wrote (`~/.config/racoon-scansia/<user>.cred`, read by the driver only); refuses any schema but
   `racoon_staging`; its rows are marked (`f7test:` keys, order ids `73570…`, audit actor `f7test`) and deleted at
-  each start — SERVER's A10 fixtures are left alone.
+  each start — SERVER's A10 fixtures are left alone. Liveness margins ×5 on MySQL (`scale`: WAN round trips).
+  `tests/test_consume_beside_f7.py` (staging only) holds F7's COMMIT back 3 s through a connection tap
+  (`register_fixtures.Tap`) while `SP_SCANSIA_CONSUME` runs from the fixture's session, and EXPLAINs the exact
+  statements the store sent.
+- Baseline reads (§3.4): `read_snapshot(key=None)` is the one stated read transaction (`START TRANSACTION READ
+  ONLY WITH CONSISTENT SNAPSHOT`, three plain SELECTs, `COMMIT`): shelf pairs, every unstamped event, each key's
+  max event id over all its events; `read_import_payloads(pair_ids)` returns each pair's `IMPORTED` `PAYLOAD`
+  (B-2's J seed at `raw.J.v`, E14).
 
 ## The reconciliation engine (§4.4, the lane's mechanism)
 
@@ -117,5 +124,11 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   (design §2.2 at `92f6f90`), whose `OUTLET_DELTA` is always 0 (SP spec step 4, `scansia-sp-spec.md:200-202` at
   `92f6f90`; the live CONSUME text, SERVER A07). `pending_deltas()` returns such events apart (`keyless`):
   surfaced, never grouped, never stamped.
+- `racoon_staging` (2026-10-06, after `scansia-f6`'s staging INFO; reads as `scansia_mgr_stg` /
+  `scansia_fixture_stg`): `sm_outlet_lease` time columns are `datetime(3)`; MySQL 8.0.45, `max_connections` 151,
+  uptime 496112 s at the probe; a TLS connect from the Mac took 0.3–1.0 s (15 sequential); across five suite
+  runs a connect failed 5 times (errno 2003; OS error 60, a TCP timeout, in the 3 runs that logged it), each
+  test opening ≥ 2 connections — hence one connect retry (`CONNECT_ATTEMPTS`). The Render → VPS path is not measured (F7.3). After the runs: 0 rows
+  marked `f7test`, the lease free.
 - Render `scansia-manager` deploys `main` on commit (`scansia-f6`, 2026-10-06 14:23Z): this branch deploys nothing;
   `main` is production and stays out of F7.2.
