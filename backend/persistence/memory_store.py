@@ -37,6 +37,7 @@ from backend.persistence.records import (
     SHELF,
     TERMINAL,
     AuditRow,
+    DuplicateKey,
     EventRow,
     Fence,
     GuardMismatch,
@@ -45,20 +46,12 @@ from backend.persistence.records import (
     LeaseRow,
     PairRow,
     StampEvents,
-    StoreError,
+    StoreClosed,
     UpdateAudit,
     UpdatePairs,
     WriteOp,
     check_op_order,
 )
-
-
-class DuplicateKey(StoreError):
-    """A UNIQUE index refused an INSERT (MySQL 1062) — e.g. a repeated ``INTENT_ID``."""
-
-
-class StoreClosed(StoreError):
-    """A call on a handle after :meth:`MemoryStore.close` (no connection outlives a job)."""
 
 
 class SimulatedCrash(RuntimeError):
@@ -359,6 +352,7 @@ class MemoryStore:
         group_id: Optional[int] = None,
         product_id: Optional[int] = None,
         intent_id: Optional[str] = None,
+        last: Optional[int] = None,
     ) -> List[AuditRow]:
         db = self._open()
         with db.lock:
@@ -379,6 +373,8 @@ class MemoryStore:
                 if intent_id is not None and a["INTENT_ID"] != intent_id:
                     continue
                 out.append(_audit_row(a))
+            if last is not None:
+                out = out[-last:] if last > 0 else []
             return out
 
     def read_lease(self) -> LeaseRow:

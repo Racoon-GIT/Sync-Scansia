@@ -39,6 +39,10 @@ class FakeRegister:
     """Opaque register handle — the service is mocked; records its close()."""
 
     closed = 0
+    actors: List[Any] = []
+
+    def __init__(self, actor: Any = None) -> None:
+        FakeRegister.actors.append(actor)
 
     def close(self) -> None:
         FakeRegister.closed += 1
@@ -251,7 +255,7 @@ def _make_client(monkeypatch, svc: _MockService):
 
     app = create_app(
         config=cfg,
-        register_factory=lambda: FakeRegister(),
+        register_factory=lambda **kw: FakeRegister(**kw),
         transport_factory=lambda: FakeTransport(),
         audit_factory=lambda: None,
         executor=SynchronousExecutor(),  # POST completes the job inline
@@ -410,12 +414,14 @@ def test_publish_jobs_get_the_register_and_close_it(monkeypatch):
     svc.publish_preview = recording_preview
     client = _make_client(monkeypatch, svc)
     FakeRegister.closed = 0
+    FakeRegister.actors = []
     res = _preview_and_get(client)
     ap = client.post("/outlet/publish/apply", headers=_auth(),
                      json={"plan_hash": res["plan_hash"], "confirm_token": res["confirm_token"]})
     assert ap.status_code == 202
     assert all(isinstance(r, FakeRegister) for r in seen) and len(seen) == 2
     assert FakeRegister.closed == 2          # the preview's handle and the apply's
+    assert FakeRegister.actors[-1] == "racoon"   # the apply's register writes as the user
 
 
 def test_publish_without_a_configured_register_fails_closed(monkeypatch):
@@ -429,6 +435,9 @@ def test_publish_without_a_configured_register_fails_closed(monkeypatch):
 
     monkeypatch.setenv("APP_PASSWORD", "s3cret-pw")
     monkeypatch.setenv("TOKEN_SIGNING_SECRET", _SECRET)
+    for var in ("SCANSIA_DB_HOST", "SCANSIA_DB_USER", "SCANSIA_DB_PASSWORD", "SCANSIA_DB_NAME",
+                "SCANSIA_DB_CA_PATH", "SCANSIA_DB_CA_B64"):
+        monkeypatch.delenv(var, raising=False)
     app = create_app(
         config=ShopifyConfig("t.myshopify.com", "shpat_x", "2025-07", PROMO),
         sheet_factory=lambda: object(), transport_factory=lambda: FakeTransport(),

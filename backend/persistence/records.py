@@ -256,6 +256,9 @@ class UpdateAudit:
             raise ValueError("first_send requires mark_sent")
         if (self.sent_available is not None or self.request is not None) and not self.first_send:
             raise ValueError("SENT_AVAILABLE / REQUEST are written by the first send only")
+        if not (self.mark_sent or self.status is not None or self.product_id is not None
+                or self.step is not None or self.outcome is not None):
+            raise ValueError("an audit row update changes at least one column")
 
 
 @dataclass(frozen=True)
@@ -374,6 +377,33 @@ class BaselineMissing(StoreError):
     ``BASELINE`` row exists — never read as an empty cut (§3.4)."""
 
 
+class DuplicateKey(StoreError):
+    """A UNIQUE index refused an INSERT (MySQL 1062) — e.g. a repeated ``INTENT_ID``."""
+
+
+class StoreClosed(StoreError):
+    """A call on a store handle after ``close()`` (no connection outlives a job)."""
+
+
+class DatabaseUnavailable(StoreError):
+    """The connection failed or was lost; nothing of the statement in flight
+    committed (a lost ``COMMIT`` is :class:`CommitUnknown` instead)."""
+
+
+class CommitUnknown(StoreError):
+    """The connection failed during ``COMMIT``: the transaction may or may not
+    have committed. Never retried blind — the caller re-reads (recovery)."""
+
+
+class LockWaitTimeout(StoreError):
+    """``innodb_lock_wait_timeout`` (MySQL 1205): the app's own give-up — the
+    transaction was rolled back."""
+
+
+class Deadlock(StoreError):
+    """MySQL 1213: InnoDB chose this transaction as the victim and rolled it back."""
+
+
 __all__ = [
     "SHELF", "ACTOR_IMPORT", "EVENT_CONSUME_MISS",
     "KIND_AUDIT", "KIND_DELETE", "KIND_PRICE", "KIND_REGISTER", "KIND_INIT_BEFORE",
@@ -386,5 +416,6 @@ __all__ = [
     "PairRow", "EventRow", "AuditRow", "LeaseRow", "Fence",
     "InsertAudit", "UpdateAudit", "StampEvents", "UpdatePairs", "WriteOp", "REGISTER_OPS",
     "check_op_order", "Hold", "PendingDeltas",
-    "StoreError", "LeaseLost", "GuardMismatch", "BaselineMissing",
+    "StoreError", "LeaseLost", "GuardMismatch", "BaselineMissing", "DuplicateKey",
+    "StoreClosed", "DatabaseUnavailable", "CommitUnknown", "LockWaitTimeout", "Deadlock",
 ]

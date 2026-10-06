@@ -81,6 +81,7 @@ class RegisterStore(Protocol):
         group_id: Optional[int] = None,
         product_id: Optional[int] = None,
         intent_id: Optional[str] = None,
+        last: Optional[int] = None,
     ) -> List[AuditRow]: ...
 
     def read_lease(self) -> LeaseRow: ...

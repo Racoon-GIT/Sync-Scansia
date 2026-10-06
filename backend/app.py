@@ -51,6 +51,7 @@ from backend.config import ConfigError, ShopifyConfig, load_shopify_config
 from backend.gsheet import ScansiaSheet
 from backend.gsheet.reader import GSheetError
 from backend.persistence.gsheet_audit import GSheetAuditSink
+from backend.persistence.mysql_store import make_register_factory
 from backend.persistence.tokens import HmacTokenService
 from backend.shopify.ops import ShopifyUserError
 from backend.shopify.transport import ShopifyTransport, ShopifyTransportError
@@ -82,12 +83,6 @@ def _register_error_handlers(app: FastAPI) -> None:
     for exc_type in _BOUNDARY_TYPES:
         app.add_exception_handler(exc_type, _boundary_handler)
     app.add_exception_handler(Exception, _boundary_handler)
-
-
-def _register_not_configured() -> Any:
-    """Production default until the MySQL adapter is wired (F7 §4 step 3):
-    fail-closed — a publish job reports ``config_error``, nothing is written."""
-    raise ConfigError("register database not configured")
 
 
 def create_app(
@@ -125,7 +120,9 @@ def create_app(
         if state.sheet_factory is None:
             state.sheet_factory = ScansiaSheet.open
         if state.register_factory is None:
-            state.register_factory = _register_not_configured
+            # A new MySQL connection per job (§3.7 rule 4); the SCANSIA_DB_* env is
+            # read at the first job — missing → that job's config_error, nothing written.
+            state.register_factory = make_register_factory()
         if state.audit_factory is None:
             state.audit_factory = lambda: GSheetAuditSink.from_scansia_sheet(state.sheet_factory())
         if state.executor is None:

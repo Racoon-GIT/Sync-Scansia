@@ -18,3 +18,8 @@ pytest>=8.0.0
 fastapi>=0.115,<0.116
 uvicorn>=0.32,<0.33     # PLAIN uvicorn (no [standard] extra: no uvloop/httptools build)
 httpx>=0.27,<0.28       # TestClient transport for the FastAPI dependency tests
+
+# --- F7: the register on MySQL racoon (plan docs/f7-mysql-adapter-plan.md §4 step 3) ---
+# Same pin as shopify-mysql-sync, ADV-Dashboard/ingest and Feed-Exporter; verifies the
+# in-house CA by IP (SVILUPPO/docs/shared-database.md §TLS).
+mysql-connector-python==9.6.0

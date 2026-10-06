@@ -51,6 +51,20 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   an audit row in its transaction: a new `RECONCILE` row (a stamp with no Shopify write: `STATUS DONE` at insert)
   or the close of `APPLIED` rows; the N-0 release writes its per-key `BASELINE` row even on a key not held.
 - The lease client (`backend/services/lease.py`) reads the renew's START on the holder's own monotonic clock.
+- MySQL store (`mysql_store.py`, §4.3): env `SCANSIA_DB_HOST`, `SCANSIA_DB_PORT` (3306), `SCANSIA_DB_USER`,
+  `SCANSIA_DB_PASSWORD`, `SCANSIA_DB_NAME`, CA as `SCANSIA_DB_CA_PATH` or `SCANSIA_DB_CA_B64` (written once to a
+  0600 temp file) — F7.3 sets them on Render. Driver `mysql-connector-python==9.6.0` (the workspace pin). A handle
+  idle > 45 s re-opens its session before the next statement (session `wait_timeout` 60 s; a job can sit longer in
+  Shopify calls); a connection lost before `COMMIT` rolled back → the fenced transaction is retried once on a fresh
+  session; lost DURING `COMMIT` → `CommitUnknown`, never retried (the caller re-reads); a take whose answer was lost
+  is read back (a row naming the holder is the take). Driver errors surface as type + errno, never their text.
+- Audit sink (`audit_sink.py`): every write fenced under the writer's pass lease (bound at construction or
+  `bind()`; refused unbound); `PRICE` capture rows keyed by a fresh `uuid4().hex` `INTENT_ID`.
+- Staging tests (`tests/register_fixtures.py` `MySQLBackend`): opt-in `SCANSIA_STAGING=1`; app side
+  `scansia_mgr_stg`, other writers' DML and `SP_SCANSIA_CONSUME` as `scansia_fixture_stg`, both through the option
+  files SERVER wrote (`~/.config/racoon-scansia/<user>.cred`, read by the driver only); refuses any schema but
+  `racoon_staging`; its rows are marked (`f7test:` keys, order ids `73570…`, audit actor `f7test`) and deleted at
+  each start — SERVER's A10 fixtures are left alone.
 
 ## Parameters the plan proposes, fixed here (each one tested)
 

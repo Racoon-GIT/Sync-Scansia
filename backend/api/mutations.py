@@ -133,6 +133,15 @@ class MutationVertical:
     collaborator: str = "sheet_factory"
 
 
+def _store_factory(state: Any, spec: "MutationVertical", actor: Optional[str] = None) -> Callable[[], Any]:
+    """The job's store-handle factory; a register is bound to the acting user,
+    whose name every audit row it writes carries."""
+    factory = getattr(state, spec.collaborator)
+    if spec.collaborator == "register_factory" and actor is not None:
+        return lambda: factory(actor=actor)
+    return factory
+
+
 def _close(handle: Any) -> None:
     """End a store handle's connection (no connection outlives a job, F7 §3.7
     rule 4). Handles without ``close`` (the sheet) are left as they are."""
@@ -348,7 +357,7 @@ def submit_preview(request: Request, spec: MutationVertical) -> Any:
         _run_preview_job,
         state.job_store,
         rec.job_id,
-        getattr(state, spec.collaborator),
+        _store_factory(state, spec),
         state.transport_factory,
         preview_fn,
         spec.plan_hash_fn,
@@ -387,7 +396,7 @@ def submit_apply(request: Request, spec: MutationVertical, body: ApplyRequest, a
         state.job_store,
         rec.job_id,
         body.plan_hash,
-        getattr(state, spec.collaborator),
+        _store_factory(state, spec, actor),
         state.transport_factory,
         audit_builder,
         preview_fn,
