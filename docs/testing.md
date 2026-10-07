@@ -18,7 +18,7 @@ Every test module that exercises the web layer gates itself with
 `pytest.importorskip("fastapi")` / `pytest.importorskip("httpx")`. If those
 packages are not installed in the interpreter running `pytest`, those tests
 report as **SKIPPED**, not failed — this is intentional, not a masked failure.
-Measured 2026-10-06 on a bare Python 3.13 (pytest + requests, no fastapi): 642
+Measured 2026-10-07 on a bare Python 3.13 (pytest + requests, no fastapi): 648
 passed, 131 skipped for `fastapi`, 28 for the staging opt-in below.
 
 ## Running the full offline suite (no fastapi skips)
