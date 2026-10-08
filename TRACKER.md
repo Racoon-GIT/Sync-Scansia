@@ -8,7 +8,7 @@
 
 ## Current state
 
-Pipeline: gate-2 · item: F7 — Scansia Manager on MySQL · plan: docs/f7-mysql-adapter-plan.md · gate-1: Ale 2026-10-06 · gate-2: pending
+Pipeline: gate-2 · item: F7 — Scansia Manager on MySQL · plan: docs/f7-mysql-adapter-plan.md · gate-1: Ale 2026-10-06 · gate-2: Ale 2026-10-08
 
 **Phase**: F7.2 (build) of the programme "Scansia → MySQL" — orchestrator `scansia-f6`, mandate `IT/_scansia-programme/briefs/sync-scansia-F7.2.md`, programme state `IT/_scansia-programme/PROGRAM.md`. Gate-1: D25 (`gate1-receipts.log` line 661); spawn D27; fresh contexts D36–D39 (D39: context `edc42fc1`, 2026-10-07 20:20Z). The plan is the contract (sha `6dadcdd7…`, `71dfc51`): never edited here — a statement that looks wrong goes to the orchestrator. Register: `racoon.sc_returned_pair` + `sc_returned_pair_event` (owner STOCK_Manager) since the F6 cutover (2026-09-21); `Scarpe_in_Scansia` frozen, read by no code since §4.5. Build state (2026-10-08): §4.1–§4.6 done; suite 795 offline green (venv) + 28 on `racoon_staging` (opt-in; last staging run 2026-10-06 19:45Z, 28/28 — nothing since touched store code); bare interpreter 664 + 159 skipped (`docs/testing.md`).
 
