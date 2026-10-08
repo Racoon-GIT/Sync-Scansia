@@ -461,6 +461,20 @@ def test_revert_never_touches_a_pair_sold_since():
     assert env.pairs()[a].price_outlet == Decimal("70.00")
 
 
+def test_revert_of_a_repair_push_restores_the_captured_live_priors_and_leaves_the_register():
+    """Gate-2 set V (V70): a SKU the intent only pushed (a repair push writes no
+    register row) is still reverted on Shopify — its captured priors."""
+    env = Env()
+    out = env.outlet(price="99.00", compare_at="100.00")
+    a = env.pair(product=out, price_outlet=Decimal("80.00"), discount=Decimal("20.00"))
+    rep = env.apply(ps.MODE_DIRECT, ps.PriceParams())
+    assert env.prices(out) == [("80.00", "100.00")] * 2 and env.price_rows("set_outlet_price") == []
+    rv = env.revert(rep.intent_id)
+    assert by_sku(rv)["SKU1"].status == ps.STATUS_REVERTED
+    assert (rv.reverted_pairs, rv.reverted_products, rv.reverted_variants) == (0, 1, 2)
+    assert env.prices(out) == [("99.00", "100.00")] * 2 and env.pairs()[a].price_outlet == Decimal("80.00")
+
+
 def test_revert_of_an_unknown_intent_raises():
     from backend.persistence.audit_sink import IntentNotFound
 

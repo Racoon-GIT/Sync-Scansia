@@ -543,6 +543,41 @@ def test_a_re_derived_plus_larger_than_confirmed_is_deferred():
     assert any(i["kind"] == "deferred_larger_than_confirmed" for i in rep.surfaced)
 
 
+def test_a_size_absent_from_the_confirmed_plan_is_deferred_never_written():
+    """Gate-2 set V (V41): the approved plan bounds the writes — a size it never
+    confirmed (a return of another size after the preview) is deferred, not added."""
+    w = World()
+    w.returned(size="42")
+    out = w.shop.product("Nike - Outlet", promo={"42": 0, "43": 0})
+    plan = w.preview()
+    assert [st.size for st in plan.actions[0].size_targets] == ["42"]
+    (e43,) = w.returned(size="43")
+    rep = w.apply(plan)
+    assert rep.outcomes[0].status == "APPLIED" and e43 in w.unstamped()
+    assert (w.shop.available(out.gid, "42"), w.shop.available(out.gid, "43")) == (1, 0)
+    assert [(i["size"], i["confirmed"], i["now"]) for i in rep.surfaced
+            if i["kind"] == "deferred_larger_than_confirmed"] == [("43", 0, 1)]
+
+
+@pytest.mark.parametrize("status", ["ACTIVE", "DRAFT"])
+def test_a_truncated_level_set_quarantines_the_outlet_at_preview_and_at_apply(status):
+    """Gate-2 set V (V36): a level set read truncated is UNKNOWN stock — the outlet is
+    quarantined, never written, whether the truncation shows at preview or at apply."""
+    w = World()
+    (e,) = w.returned()
+    out = w.shop.product("Nike - Outlet", status=status, promo={"42": 0, "43": 1})
+    w.shop.truncated.add(out.gid)
+    (a,) = w.preview().actions
+    assert not a.publishable and a.reason == "quarantine"
+    w.shop.truncated.clear()
+    plan = w.preview()
+    assert plan.actions[0].publishable
+    w.shop.truncated.add(out.gid)                                      # read truncated after the confirm
+    rep = w.apply(plan)
+    assert rep.outcomes[0].status == "QUARANTINED"
+    assert w.mutated() == [] and w.shop.available(out.gid, "42") == 0 and w.unstamped() == [e]
+
+
 def test_a_held_positive_key_is_never_added():
     w = World()
     (e_held,) = w.returned(size="42")

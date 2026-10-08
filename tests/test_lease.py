@@ -121,6 +121,25 @@ def test_keepalive_renews_only_when_due(be):
     assert [x[0] for x in be.db.log if x[0] == "renew"] == ["renew"]
 
 
+def test_the_default_lease_keeps_alive_after_60_s_and_sends_within_240_s_of_a_renew(be):
+    """Gate-2 set V (V50, V51): the defaults every holder runs on (build notes §Parameters) —
+    keepalive once 60 s have passed since the last renew, a send only within TTL 300 s − 60 s."""
+    mono = Mono()
+    lease = _lease(be, "publish", mono=mono)
+    lease.take()
+    be.db.log.clear()
+    mono.t += 59.9
+    lease.keepalive()
+    assert [x for x in be.db.log if x[0] == "renew"] == []
+    mono.t += 0.2                                               # 60.1 s after the take
+    lease.keepalive()
+    assert [x[0] for x in be.db.log if x[0] == "renew"] == ["renew"]
+    mono.t += 239.9                                             # the renew restarted the deadline
+    assert lease.can_send() is True
+    mono.t += 0.2
+    assert lease.can_send() is False
+
+
 def test_the_waiting_decrement_is_handed_the_lease_between_skus(be):
     pub = _lease(be, "publish")
     pub.take()

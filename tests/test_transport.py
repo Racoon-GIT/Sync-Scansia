@@ -238,6 +238,27 @@ def test_a_query_throttled_is_retried(transport, monkeypatch):
     assert transport.graphql("query { shop { id } }", {}) == {"shop": {"id": "1"}}
 
 
+@pytest.mark.parametrize("doc", ["query", "mutation"])
+@pytest.mark.parametrize("answer", ["429", "throttled"])
+def test_a_throttle_wait_is_capped_at_10_s_the_lease_budget(transport, monkeypatch, doc, answer):
+    """Gate-2 set V (V49): a Retry-After or a restore wait of 30 s sleeps 10 s — the
+    cap ``lease.py``'s 177 s budget counts on (build notes §The reconciliation engine)."""
+    sleeps = []
+    monkeypatch.setattr("backend.shopify.transport.time.sleep", lambda s: sleeps.append(s))
+    if answer == "429":
+        first = FakeResponse(429, headers={"Retry-After": "30"})
+    else:                                                        # ceil((3050 - 50) / 100) = 30 s to restore
+        first = FakeResponse(200, json_body={
+            "errors": [{"message": "Throttled", "extensions": {"code": "THROTTLED"}}],
+            "extensions": {"cost": {"requestedQueryCost": 3050, "throttleStatus": {
+                "maximumAvailable": 4000, "currentlyAvailable": 50, "restoreRate": 100}}},
+        })
+    ok = FakeResponse(200, json_body={"data": {"thing": {"id": "1", "userErrors": []}}})
+    transport.sess.post = MagicMock(side_effect=[first, ok])
+    transport.graphql(MUTATION if doc == "mutation" else "query { thing { id } }", {"x": 1})
+    assert transport.sess.post.call_count == 2 and sleeps == [10.0]
+
+
 def test_the_served_api_version_is_recorded_and_a_mismatch_logged_once(transport, caplog):
     served = FakeResponse(200, json_body={"data": {"ok": 1}}, headers={"X-Shopify-API-Version": "2027-01"})
     transport.sess.post = MagicMock(return_value=served)

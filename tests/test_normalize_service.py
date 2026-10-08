@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import List
 
+import pytest
+
 from backend.persistence.records import DONE, FAILED, OPEN
 from backend.services import flows
 from backend.services import ledger as L
@@ -54,9 +56,14 @@ def test_preview_finds_continue_untracked_and_customisation_promo_on_any_status(
     assert got[cont.gid].keys == (("SKU1", "42"), ("SKU1", "43"))
 
 
-def test_apply_makes_every_variant_deny_and_tracked_and_lowers_a_custom_positive_to_zero():
+# A variant not DENY + tracked, each way (gate-2 set V, V17: DENY but untracked is not safe).
+UNSAFE = [("CONTINUE", True), ("CONTINUE", False), ("DENY", False)]
+
+
+@pytest.mark.parametrize("policy,tracked", UNSAFE)
+def test_apply_makes_every_variant_deny_and_tracked_and_lowers_a_custom_positive_to_zero(policy, tracked):
     env = Env()
-    p = env.shop.product("A - Outlet", sku="SKU1", policy="CONTINUE", tracked=False, extra_variants=CUSTOM)
+    p = env.shop.product("A - Outlet", sku="SKU1", policy=policy, tracked=tracked, extra_variants=CUSTOM)
     env.shop.promo(p.gid, "Solo Personalizzazione").available = 1
     rep = env.apply(env.preview())
     (o,) = rep.outcomes
@@ -77,9 +84,10 @@ def test_a_negative_custom_level_is_left_and_only_the_policy_fixed():
     assert env.shop.available(p.gid, "Solo Personalizzazione") == -1 and env.shop.count("adjust") == 0
 
 
-def test_a_refused_normalisation_on_an_active_outlet_closes_failed_and_drafts_it():
+@pytest.mark.parametrize("policy,tracked", UNSAFE)
+def test_a_refused_normalisation_on_an_active_outlet_closes_failed_and_drafts_it(policy, tracked):
     env = Env()
-    p = env.shop.product("A - Outlet", sku="SKU1", policy="CONTINUE")
+    p = env.shop.product("A - Outlet", sku="SKU1", policy=policy, tracked=tracked)
     env.shop.fault("bulk", "user_error:X")
     rep = env.apply(env.preview())
     assert rep.outcomes[0].status == ns.O_FAILED

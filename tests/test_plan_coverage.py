@@ -41,6 +41,7 @@ from tests.fake_shop import MAG, PROMO, SimulatedCrashInShop, Variant
 from tests.register_fixtures import seed_reconcile
 from tests.test_baseline import Env as BaselineEnv
 from tests.test_decrement import Env
+from tests.test_lease import Mono
 from tests.test_outlet_service import World, _source
 from tests.test_relevel import held_keys, relevel, result
 from tests.test_round8_minors import decrement, num, rows_by
@@ -1383,3 +1384,92 @@ def test_rd2_a_failed_locations_read_starts_no_writing_pass_its_transport_error_
     assert (err.status_code, err.error_code) == (502, "shopify_transport_error")   # not promo_anchor_invalid
     assert not _wrote(be.db.log) and reg.lease_state().generation == gen
     assert shop.names()[before:] == ["locations"]                # nothing sent after the failed read
+
+
+# ---------------------------------------------------------------------------
+# Gate-2 set V (2026-10-08): the verifier's survivors in the engine, as test cases
+# ---------------------------------------------------------------------------
+
+def test_f3_f5_a_send_renews_the_lease_before_its_live_read_once_60_s_have_passed():
+    """V06: the ledger's keepalive — a holder 100 s past its renew (inside the 240 s send
+    deadline) renews BEFORE rule 8's read, so every call starts with ≥ 240 s of lease
+    left (build notes §Parameters), not as little as 60 s."""
+    env, out, _e = minus_env()
+    mono = Mono()
+    reg = env.register()
+    lease = PassLease(reg, "decrement", clock=mono, sleep=noop)
+    lease.take()
+    try:
+        led = L.Ledger(reg, env.shop, lease, PROMO, sleep=noop)
+        (row,) = led.write_group([L.RowSpec(
+            action=L.A_ADJUST, keys=(K,), purpose=L.P_ZERO, target=0, location_id=PROMO,
+            inventory_item_id=env.shop.variant(out.gid, "42").item, product_id=num(out))])
+        mono.t += 100.0
+        env.be.db.log.clear()
+        renews_before_read = []
+        env.shop.on("read_level", lambda shop: renews_before_read.append(
+            [x[0] for x in env.be.db.log].count("renew")))
+        assert led.send_adjust(row) == APPLIED
+    finally:
+        lease.release()
+    assert renews_before_read == [1] and env.shop.available(out.gid, "42") == 0
+
+
+def test_w2_aa4_a_re_apply_closed_failed_marks_its_events_and_the_next_lowering_names_it():
+    """V54: a re-apply (the successor of a −Δ whose in-window re-send was unknown) that
+    closes FAILED — STALE at its own first send — records ``possibly_applied``: its
+    superseded original may have landed (rule 2). The next row lowering those events
+    names it and is surfaced."""
+    env, out, _e = minus_env()
+    env.shop.fault("adjust", "timeout_before")                   # the first send: outcome unknown
+    env.decrement()
+    (first,) = env.rows()
+    env.shop.fault("adjust", "timeout_before")                   # its in-window re-send: unknown → re-applied
+    env.shop.fault("adjust", "user_error:CHANGE_FROM_QUANTITY_STALE")    # the re-apply's first send
+    rep = env.decrement()
+    first = env.register().reconcile_rows(row_ids=[first.row_id])[0]
+    (succ,) = env.register().reconcile_rows(row_ids=[first.outcome["successor"]])
+    assert first.status == SUPERSEDED and succ.status == FAILED and succ.outcome["possibly_applied"] is True
+    (nxt,) = [r for r in env.rows() if r.row_id not in (first.row_id, succ.row_id)]
+    assert nxt.status == DONE and L.payload(nxt).get("possibly_applied_before") == [succ.row_id]
+    assert [i["predecessors"] for i in rep.report.items
+            if i["kind"] == "possible_extra_minus_one" and "predecessors" in i] == [[succ.row_id]]
+    assert env.shop.available(out.gid, "42") == 1 and env.unstamped() == []
+
+
+def test_r7_a_creates_sent_add_closed_by_the_orphan_path_is_held_and_the_n0_release_waits_out_its_retention():
+    """V04: "a CREATE's rows follow the CREATE path" — a sent +Δ whose answer was lost
+    is closed HELD by the orphan path (a stalled one may still land), so the N-0
+    release waits out THAT row's key retention, counted from its own first send — not
+    the CREATE row's, which was sent before it."""
+    w = World()
+    events = w.returned(n=2)
+    _source(w, promo={"42": 5, "43": 5}, mag={"42": 3, "43": 3})
+    later = []
+
+    def steps_run_later(shop):                                   # the steps after the duplicate run 200 s on
+        if not later:
+            later.append(1)
+            w.be.advance(200_000)
+
+    w.shop.on("adjust", steps_run_later)
+    w.shop.fault("adjust", "lose_after", when=lambda v: v["input"]["changes"][0]["delta"] > 0)
+    _plan, rep = w.run()
+    assert rep.outcomes[0].status == "CREATE_ABORTED"
+    (create,) = rows_by(w, L.A_CREATE)
+    (add,) = rows_by(w, L.A_ADJUST, L.P_ADD)
+    assert create.status == HELD and add.status == HELD and add.outcome["reason"] == "create_unfinished"
+    assert (add.sent_at - create.sent_at).total_seconds() == 200
+    for _ in events:
+        w.be.consume(*K)                                         # both pairs sold elsewhere: N 0
+
+    def n0_rows():
+        return [b for b in w.register().audit_rows(KIND_BASELINE) if (b.payload or {}).get("reason") == "N 0"]
+
+    w.be.advance(24 * 3600 * 1000 - 100_000)                     # past the CREATE's retention, inside the add's
+    decrement(w)
+    assert n0_rows() == [] and set(events) <= set(w.unstamped())
+    w.be.advance(200_000)                                        # past the add's own retention
+    decrement(w)
+    (rel,) = n0_rows()
+    assert sorted(rel.payload["stamped"]) == sorted(events) and w.unstamped() == []

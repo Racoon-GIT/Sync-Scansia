@@ -53,7 +53,7 @@ test_api_init · `gate` test_promo_gate.
 | R4 | FAILED on `userErrors`, events pending | `dec` a_stale_change_from_quantity_fails_the_row_and_the_next_pass_re_plans |
 | R5 | OPEN −Δ landed / not landed → re-sent identical, re-applied past the window | `dec` a_lost_answer_leaves_the_row_open…; a_send_that_never_ran…; past_the_window_an_unknown_minus… |
 | R6 | OPEN +Δ → HELD, key held | `out` a_lost_add_answer_is_never_re_added_and_holds_the_key_past_the_window |
-| R7 | CREATE: `userErrors` at each step after the duplicate; a crash in each window; id recorded or not; a sale between crash and recovery; recovery at start-up (decrement class: left), before a pass, after a stamp failure | `cov` r7_a_create_refused… ×7; r7_w8_w13_a_crash… ×7; m11_r1; `out` a_create_failing_after_step_1…; a_lost_duplicate_answer…; create_quarantines_when_levels_truncated… |
+| R7 | CREATE: `userErrors` at each step after the duplicate; a crash in each window; id recorded or not; a sale between crash and recovery; recovery at start-up (decrement class: left), before a pass, after a stamp failure | `cov` r7_a_create_refused… ×7; r7_w8_w13_a_crash… ×7; m11_r1; r7_a_creates_sent_add_closed_by_the_orphan_path_is_held… (§12); `out` a_create_failing_after_step_1…; a_lost_duplicate_answer…; create_quarantines_when_levels_truncated… |
 | R8 | close + stamp atomic, fenced, in order | `reg` stamp_closes_its_rows_then_stamps_in_one_transaction; `mysql` fenced_write_is_renew_then_ops_then_commit_register_last |
 | R9 | an already-stamped id counted by the matched count | `store` stamp_coalesces_and_counts_an_already_stamped_id_as_matched |
 | R10 | the stamp by PRIMARY KEY beside CONSUME (EXPLAIN) | `stg` a_consume_beside_an_open_stamp_never_waits_and_the_stamp_is_by_primary_key |
@@ -63,7 +63,7 @@ test_api_init · `gate` test_promo_gate.
 | Id | Case | Pinned by |
 |---|---|---|
 | F1–F2 | a crashed holder taken over; a live one refused | `lease` a_crashed_holder_is_taken_over_once_expired; `store` take_increments_generation_and_refuses_a_live_holder |
-| F3–F5 | a stalled holder after a take-over, right after its renew: write-ahead refused, send past the local deadline refused | `lease` a_stalled_holder_right_after_its_renew_cannot_write; send_deadline_counts_from_the_renew_start; `store` a_stale_generation_is_refused_after_a_take_over |
+| F3–F5 | a stalled holder after a take-over, right after its renew: write-ahead refused, send past the local deadline refused; a send's keepalive before its live read, on the default parameters | `lease` a_stalled_holder_right_after_its_renew_cannot_write; send_deadline_counts_from_the_renew_start; the_default_lease_keeps_alive_after_60_s… (§12); `store` a_stale_generation_is_refused_after_a_take_over; `cov` f3_f5_a_send_renews_the_lease_before_its_live_read… (§12) |
 | F6 | a send that slips through, answered by the idempotency key | `cov` f6 |
 | F7 | a decrement between two SKUs of a publish / re-level; the next SKU re-derived | `out` the_publish_yields_the_lease_between_skus…; `cov` f7_aa12; z14 |
 | F8 | never inside a baseline (refused before its `BASELINE` row) | `base` the_decrement_is_refused_until_the_baseline_row_exists; the_baseline_keeps_the_lease_throughout… |
@@ -73,14 +73,14 @@ test_api_init · `gate` test_promo_gate.
 
 | Id | Item | Pinned by |
 |---|---|---|
-| M1 | no mutation re-posted blind (rule 9) | `tr` a_mutation_whose_answer_was_lost…; …5xx…; …internal_server_error…; …partial_data…; …429…; …throttled…; …refused_4xx…; …failing_validation… |
+| M1 | no mutation re-posted blind (rule 9) | `tr` a_mutation_whose_answer_was_lost…; …5xx…; …internal_server_error…; …partial_data…; …429…; …throttled…; …refused_4xx…; …failing_validation…; a_throttle_wait_is_capped_at_10_s… ×4 (§12) |
 | M2 | `IDEMPOTENCY_CONCURRENT_REQUEST` / `…_KEY_PARAMETER_MISMATCH` (first send) | `cov` m2 ×3 |
 | M3 | revive zeroing relative under `committed` > 0 | `cov` m3 |
 | M4 | a revive's unfinished tail: re-run by a publish-class recovery, left by the decrement's | `cov` w8_w13_m4 |
 | M5 | F7's writes beside `SP_SCANSIA_CONSUME`, CONSUME's wait bounded to one F7 commit | `stg` both tests |
 | M6 | exact size; the normalised-only match surfaced | `out` a_spelling_twin_is_surfaced_never_published; `store` sizes_are_exact_not_normalised; `read` join_matches_sizes_exactly_and_surfaces_a_twin |
 | M7 | a size-absent group pending, never stamped | `dec` a_size_absent_group_stays_pending_never_stamped |
-| M8–M9 | DENY + tracked before exposure; customisation-only normalised, positive → 0, negative left | `out` every_exposed_variant…; `norm` apply_makes_every_variant_deny_and_tracked…; a_negative_custom_level_is_left…; `base` continue_and_untracked_variants_are_normalised_before_any_raise |
+| M8–M9 | DENY + tracked before exposure; customisation-only normalised, positive → 0, negative left | `out` every_exposed_variant…; `norm` apply_makes_every_variant_deny_and_tracked… ×3 and a_refused_normalisation… ×3 (CONTINUE, untracked, or both — §12); a_negative_custom_level_is_left…; `base` continue_and_untracked_variants_are_normalised_before_any_raise |
 | M10 | explicit activation only before a raising write | `out` activation_is_explicit…; `base` a_activates_an_absent_or_inactive_level…; `cov` aa8_a_lowering_of_an_inactive_level… |
 | M11 | the product-total rule on Δ = 0 and on re-applies | `dec` an_outlet_line_sale…; `cov` m11_r1 ×3 |
 | M12 | §3.4's invariant on every key or held — at confirm (moved, committed, multi-outlet, size-absent, twin) and by recovery | `base` the_invariant_holds_on_every_key_of_a_mixed_register; a_live_level_that_moved…; a_upward_write_meeting_committed…; a_multi_outlet_key_is_held…; a_spelling_twin_holds… (size-absent + twin); recovery_runs_first_at_the_take… |
@@ -118,7 +118,7 @@ test_api_init · `gate` test_promo_gate.
 | W12 | event-less rows past the window: re-derived from live | `cov` w12_aa1 ×3 |
 | W13 | the decrement's recovery leaves sent +Δ / CREATE / tail rows; reads an activation off `isActive` | `out` the_decrements_recovery_leaves_a_sent_plus…; `cov` r7_w8_w13; w8_w13_m4; `r8` ab13 |
 | W14 | a decrement waiting on a held lease; the hand-off between SKUs, within its bound | `lease` the_waiting_decrement_is_handed_the_lease_between_skus; the_decrement_ends_its_run_past_its_bound; `cov` z14 |
-| W15 | a re-derived +Δ larger than confirmed: deferred | `out` a_re_derived_plus_larger_than_confirmed_is_deferred |
+| W15 | a re-derived +Δ larger than confirmed: deferred — a size the plan never confirmed included | `out` a_re_derived_plus_larger_than_confirmed_is_deferred; a_size_absent_from_the_confirmed_plan_is_deferred… (§12) |
 | W16 | the held-key lowering on a SKU absent from the plan | `cov` w16 |
 | W17 | an outlet whose gid or status changed since the confirm: deferred | `out` toctou_branch_drift_aborts_verify_failed (status); `cov` w17 (gid) |
 | W18 | a re-level of a mixed pending mix, and of a key not held (DRAFT-parked) | `cov` w18; `rel` a_draft_parked_key_not_held_is_levelled_to_n… |
@@ -153,7 +153,7 @@ test_api_init · `gate` test_promo_gate.
 | AA1 | a terminal path for every row kind; a delete of each kind closing its product's rows; a person's close → HELD | `r8` ab10; ab16; ab5_a_sent_add_whose_product_reads_gone…; ab7 ×2; `norm` a_refused_normalisation_on_an_active_outlet…; `cov` aa1 ×3; w12_aa1 [level_gone]; `del` terminal_path_iii…; a_delete_closes_a_sent_add…; `close` a_persons_close_holds_the_add… |
 | AA2 | a tail / normalise row holds its keys; a second revive deferred by its id | `cov` aa2; `out` a_revive_is_deferred… |
 | AA3 | the bulk cleanup lists apart an outlet whose SKU has a shelf pair, at preview and apply | `del` cleanup_lists_an_outlet_whose_sku_has_a_shelf_pair_apart…; cleanup_rechecks_each_product_right_before_its_delete |
-| AA4 | a −Δ re-send closed FAILED on STALE; its events' next lowering surfaced | `cov` w3_z9_aa4 [STALE, INVALID_INVENTORY_ITEM] |
+| AA4 | a −Δ re-send closed FAILED on STALE; its events' next lowering surfaced — a re-apply closed FAILED likewise | `cov` w3_z9_aa4 [STALE, INVALID_INVENTORY_ITEM]; w2_aa4_a_re_apply_closed_failed… (§12) |
 | AA5 | a premise contradicted at rule 8's read → that row FAILED, never sent | `cov` w4_z5_aa5 [premise] |
 | AA6 | a group stamped whose rows repeat its event ids | `reg` stamp_closes_its_rows_then_stamps_in_one_transaction; `dec` a_minus_two_split_… |
 | AA7 | a −Δ at 0 under `committed` > 0: pending, applied when released, stamped when shipped | `cov` aa7 ×2; `dec` d33 ×2 |
@@ -191,7 +191,7 @@ for the jobs' slot; its own bearer, fail-closed: `trig` ×9. The call's failure 
 | S3 | 20 % on 189 → 151.20, `DISCOUNT` 20.00 | `cov` s3; `price` percent_mode_prices_on_the_compare_at… |
 | S4 | no id → register only; a DRAFT outlet takes the price at its revive, before ACTIVE | `price` no_outlet_product_id_writes_the_register_only…; `cov` s4 |
 | S5 | a refused push: register new, Shopify old, surfaced; the next ACTIVE publish sends it | `price` a_refused_push_leaves_the_register_written_and_surfaced; `cov` s5 |
-| S6 | revert: a sold pair keeps its price; a later pricing → `SKIP_CHANGED_SINCE`; a NULL prior restored | `price` revert_never_touches_a_pair_sold_since; revert_leaves_a_sku_repriced_since…; revert_restores_every_pairs_prior… |
+| S6 | revert: a sold pair keeps its price; a later pricing → `SKIP_CHANGED_SINCE`; a NULL prior restored; a SKU only pushed (a repair push) reverted on Shopify | `price` revert_never_touches_a_pair_sold_since; revert_leaves_a_sku_repriced_since…; revert_restores_every_pairs_prior…; revert_of_a_repair_push… (§12) |
 | S7 | the exit drafts nothing; a STOPPED exit leaves its outlet ACTIVE, listed, nothing deleted | `exit` apply_lowers_every_positive…; a_committed_unit_stops_the_exit…; `cov` s7 |
 | S8 | a DRAFT CONTINUE outlet normalised, then deletable; a customisation-only Promo risen since the preview lowered from live | `cov` s8 ×2 |
 | S9 | a wrong anchor → 503, lease not taken, nothing written; a failed `locations` read → no pass, the next trigger runs it | `gate` ×3; `cov` s9 |
@@ -218,3 +218,22 @@ The two readings (`~/.claude/racoon-bus/msg/20261006-2117-scansia-f6-sync-scansi
 S13 and the standing watch (SQL, plan §5, at go-live); 678434's HTTP module (AUTOMATE, F7.5); the Render → VPS path,
 Shopify's live idempotency answers (cached result vs error, CONCURRENT's shape) and "definitive null" at the pin
 (F7.3, live, under Ale's `confermo`).
+
+## 12. Gate-2 set V (2026-10-08): the verifier's survivors, as test cases
+
+70 mutants by a fresh verifier blind to the tests (`~/.claude/racoon-bus/msg/sync-scansia-gate2/verifier_mutants.jsonl`),
+run by `mutate-verify.sh` on `0f18084`: 60 `PASS`, 10 `SURVIVOR` (`docs/gate-2-log.md`). Each survivor sat on an F7
+line (`git blame`: `2d8c5c7`, `ff69522`, `475e9fe`) — a gap of the diff, not an older one. Each is a test now, re-run
+with a control on the commit that adds them. Suite after: 795 offline green (venv) + 28 on staging (opt-in).
+
+| Mutant | What it broke | Where the two versions diverge | Pinned by |
+|---|---|---|---|
+| V04 | a CREATE's sent +Δ, closed by the orphan path, `FAILED` instead of `HELD` | the N-0 release: the CREATE row's own retention (sent before the add) ends first, and the key is released while the add's key still lives | `cov` r7_a_creates_sent_add_closed_by_the_orphan_path_is_held… |
+| V06 | the send path's keepalive dropped | a holder 60–240 s past its renew reads and sends with less than 240 s of lease left | `cov` f3_f5_a_send_renews_the_lease_before_its_live_read… |
+| V17 | rule 7's check blind to a DENY but untracked variant | a normalise row with no prices sends nothing and closes `APPLIED`; a refused one leaves the product ACTIVE | `norm` (DENY, untracked) ×2 |
+| V36 | a truncated level set no longer quarantines | the publish writes on unknown stock (ACTIVE and DRAFT, at preview and at apply) | `out` a_truncated_level_set_quarantines… ×2 |
+| V41 | a size absent from the confirmed plan bounded by its own Δ | a return of another size after the preview is added | `out` a_size_absent_from_the_confirmed_plan… |
+| V49 | throttle waits capped at 60 s, not 10 s | a 30 s `Retry-After` or restore wait sleeps 30 s inside the lease's 177 s budget | `tr` a_throttle_wait_is_capped_at_10_s… ×4 |
+| V50, V51 | the default keepalive moved to 240 s; the default send margin to 6 s | every holder runs on the defaults; the lease tests that time a renew set their own, and the end-to-end ones last milliseconds of the real clock | `lease` the_default_lease_keeps_alive_after_60_s… |
+| V54 | a re-apply closed `FAILED` records `possibly_applied` false | the next lowering of its events names no predecessor and surfaces nothing | `cov` w2_aa4_a_re_apply_closed_failed… |
+| V70 | the revert skips a SKU the intent only pushed | a repair push (no register row) is never undone on Shopify | `price` revert_of_a_repair_push… |
