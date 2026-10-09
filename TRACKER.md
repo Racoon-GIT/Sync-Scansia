@@ -15,7 +15,7 @@ Pipeline: shipped · item: F7 — Scansia Manager on MySQL · plan: docs/f7-mysq
 **Next**:
 - [x] F7.2 — the engine and every §3 vertical on the register, the sheet removed (`7d6f001`); gate-2 D41 on `1356027` (receipts `docs/gate-2-log.md`; GATE-2 self-grade 10/10, its reasons in the TRACKER at `1356027`).
 - [x] F7.3 — the merge, `/ship`, D42's one push, the orchestrator's deploy checks (above). The stage's GATE-2 prompt on this work: no code written in F7.3 — the merge's tree is `7b2c18d`'s, so gate-2's 10/10 stands; runtime parity with 3.12.4 was static only here (no 3.12 on the Mac), and the first boot on Render reached `BaselineMissing` (the orchestrator's read).
-- [ ] Not granted, each its own gate: F7.4's baseline ("Inizializza") — until then every decrement pass stops at `BaselineMissing`; the live write tests (`f7-plan.md:1024`, Ale's `confermo`); the suspended cron's deletion and the `GSPREAD_*` / Google env vars' removal (SERVER / Ale).
+- [ ] Not granted, each its own gate: F7.4's baseline ("Inizializza") — until then every decrement pass stops at `BaselineMissing`; the live write tests (`f7-plan.md:1024`, Ale's `confermo`) — their list is written (D44, 2026-10-09): `docs/f7.3-live-tests.md` (20 documents, the store tests, the test product, run shape, residue, risks, findings F1–F8; nothing run, runner script not written); the suspended cron's deletion and the `GSPREAD_*` / Google env vars' removal (SERVER / Ale).
 
 **Active constraints & decisions**:
 - No write to `racoon`, Shopify, Make, production Trello, the Scheduler or Render outside a recorded gate; the live write tests need Ale's `confermo`. Integration tests on `racoon_staging` only (`scansia_mgr_stg` / `scansia_fixture_stg`, option files `~/.config/racoon-scansia/<user>.cred`, read by the driver only — never opened, never printed).
@@ -26,7 +26,7 @@ Pipeline: shipped · item: F7 — Scansia Manager on MySQL · plan: docs/f7-mysq
 - No personal data in the repo (ids, SKUs, counts only). DRY-RUN stays the default (project `CLAUDE.md` rule 2).
 - Working tree: the uncommitted `.claude/settings.json` (sha `638e2594…`) is not this programme's — left as found (carried across the switch to `main`: same committed blob on both sides, sha and mtime unchanged).
 
-**Reads made in F7.3**: none on `racoon`, `racoon_staging` or Shopify.
+**Reads made in F7.3**: none on `racoon` or `racoon_staging`; on Shopify only R1–R5 for the test list (read-only, 2026-10-09 10:11Z, run by `scansia-f6`'s `shopify-operator` at this lane's ASK — `docs/f7.3-live-tests.md` §4.1).
 
 **Tried & discarded (still relevant)**:
 - The sheet as store (Q-persistenza, 2026-07-06): voided by the F6 cutover — the register is MySQL.
