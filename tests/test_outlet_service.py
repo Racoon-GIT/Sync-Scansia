@@ -208,6 +208,34 @@ def test_dry_run_preview_is_read_only():
     assert w.mutated() == []
 
 
+def test_create_outlet_carries_the_source_images_and_records_the_job_f3():
+    """§8 F3: the outlet a CREATE makes has its source's images (``includeImages``),
+    and the image copy's job — asynchronous — is on the CREATE row."""
+    w = World()
+    w.returned(n=2)
+    src = _source(w)
+    w.shop.media[src.gid] = ["https://cdn.example/a.jpg", "https://cdn.example/b.jpg"]
+    _plan, rep = w.run()
+    assert rep.outcomes[0].status == "APPLIED"
+    (dup_call,) = [c for c in w.shop.calls if c[0] == "duplicate"]
+    assert dup_call[1]["includeImages"] is True
+    outlet = rep.outcomes[0].target_gid
+    assert w.shop.images(w.shop.products[outlet]) == ["https://cdn.example/a.jpg", "https://cdn.example/b.jpg"]
+    (create,) = [r for r in w.rows() if r.action == L.A_CREATE]
+    assert create.outcome["image_job"].startswith("gid://shopify/Job/") and create.outcome["image_job_done"] is False
+
+
+def test_create_without_an_image_job_applies_and_records_none():
+    w = World()
+    w.returned(n=2)
+    src = _source(w)
+    w.shop.media[src.gid] = []                                          # nothing to copy: no imageJob
+    _plan, rep = w.run()
+    assert rep.outcomes[0].status == "APPLIED"
+    (create,) = [r for r in w.rows() if r.action == L.A_CREATE]
+    assert "image_job" not in (create.outcome or {})
+
+
 def test_create_duplicate_is_draft_atomically_fix1():
     w = World()
     w.returned(n=2)

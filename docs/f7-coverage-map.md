@@ -237,3 +237,15 @@ with a control on the commit that adds them. Suite after: 795 offline green (ven
 | V50, V51 | the default keepalive moved to 240 s; the default send margin to 6 s | every holder runs on the defaults; the lease tests that time a renew set their own, and the end-to-end ones last milliseconds of the real clock | `lease` the_default_lease_keeps_alive_after_60_s… |
 | V54 | a re-apply closed `FAILED` records `possibly_applied` false | the next lowering of its events names no predecessor and surfaces nothing | `cov` w2_aa4_a_re_apply_closed_failed… |
 | V70 | the revert skips a SKU the intent only pushed | a repair push (no register row) is never undone on Shopify | `price` revert_of_a_repair_push… |
+
+## 13. After go-live: F7.3's finding F3 (D46)
+
+`docs/f7.3-live-tests.md` §8 F3: D1 sent no `includeImages` (default false at `2026-10`), so every outlet a CREATE
+made had no images. Fixed on `fix/f7-outlet-media` (decided by the orchestrator, D46): `includeImages: true` on D1,
+atomic with the duplicate; the copy is an asynchronous job, so D1 selects `imageJob { id done }` and CREATE records
+it on its row. Not D7's `productSet` (it carries the deprecated `ProductSetInput.id`, §8 F1).
+
+| Item | Mechanism | Pinned by |
+|---|---|---|
+| F3 | D1 sends `includeImages: true` and selects `imageJob { id done }`; an answer with no job is tolerated | `ops` product_duplicate_copies_the_images_and_returns_the_job_f3; product_duplicate_returns_new_gid; product_duplicate_tolerates_a_null_image_job |
+| F3 | the outlet a CREATE makes carries its source's images; the job's id and `done` on the CREATE row (`image_job`, `image_job_done`), none when no job | `out` create_outlet_carries_the_source_images_and_records_the_job_f3; create_without_an_image_job_applies_and_records_none |

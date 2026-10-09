@@ -64,13 +64,38 @@ def test_product_duplicate_returns_new_gid():
     t = FakeTransport(
         {"productDuplicate": {"newProduct": {"id": "gid://shopify/Product/999"}, "userErrors": []}}
     )
-    gid = ops.product_duplicate(t, "gid://shopify/Product/1", "Nike - OUTLET")
-    assert gid == "gid://shopify/Product/999"
+    dup = ops.product_duplicate(t, "gid://shopify/Product/1", "Nike - OUTLET")
+    assert dup.product_gid == "gid://shopify/Product/999"
+    assert (dup.image_job_id, dup.image_job_done) == (None, None)     # no imageJob in the answer: tolerated
     assert t.calls[0]["variables"] == {
         "productId": "gid://shopify/Product/1",
         "newTitle": "Nike - OUTLET",
         "newStatus": "DRAFT",
+        "includeImages": True,
     }
+
+
+def test_product_duplicate_copies_the_images_and_returns_the_job_f3():
+    """§8 F3 (docs/f7.3-live-tests.md): ``includeImages`` defaults to false at 2026-10,
+    so an outlet duplicated without it has no images. D1 sends ``includeImages: true``
+    and selects ``imageJob { id done }`` — the copy is an asynchronous job."""
+    t = FakeTransport({"productDuplicate": {"newProduct": {"id": "gid://shopify/Product/999"},
+                                            "imageJob": {"id": "gid://shopify/Job/7", "done": False},
+                                            "userErrors": []}})
+    dup = ops.product_duplicate(t, "gid://shopify/Product/1", "Nike - OUTLET")
+    assert t.calls[0]["variables"]["includeImages"] is True
+    assert "$includeImages: Boolean" in t.calls[0]["query"]
+    assert "includeImages: $includeImages" in t.calls[0]["query"]
+    assert "imageJob { id done }" in t.calls[0]["query"]
+    assert (dup.product_gid, dup.image_job_id, dup.image_job_done) == (
+        "gid://shopify/Product/999", "gid://shopify/Job/7", False)
+
+
+def test_product_duplicate_tolerates_a_null_image_job():
+    t = FakeTransport({"productDuplicate": {"newProduct": {"id": "gid://shopify/Product/999"}, "imageJob": None,
+                                            "userErrors": []}})
+    dup = ops.product_duplicate(t, "gid://shopify/Product/1", "Nike - OUTLET")
+    assert (dup.product_gid, dup.image_job_id, dup.image_job_done) == ("gid://shopify/Product/999", None, None)
 
 
 def test_product_duplicate_forces_new_status_draft_fix1():

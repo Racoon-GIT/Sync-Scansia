@@ -536,8 +536,8 @@ def create_outlet(ctx: flows.Context, fresh: PlanAction, approved: PlanAction) -
     (row,) = ctx.ledger.write_group([spec])
     group = row.group_id
     try:
-        new_gid = ctx.ledger.step(row, "1:duplicate",
-                                  lambda: ops.product_duplicate(ctx.transport, fresh.source_gid, fresh.outlet_title))
+        dup = ctx.ledger.step(row, "1:duplicate",
+                              lambda: ops.product_duplicate(ctx.transport, fresh.source_gid, fresh.outlet_title))
     except ShopifyUserError as e:
         ctx.ledger.close(ctx.ledger.reload(row), FAILED, refused=e.mutation, step="1:duplicate")
         return ApplyOutcome(sku, BRANCH_CREATE, "ERROR", None, fresh.warnings + ("duplicate_refused",))
@@ -547,8 +547,14 @@ def create_outlet(ctx: flows.Context, fresh: PlanAction, approved: PlanAction) -
     except ShopifyTransportError:
         ctx.ledger.close(ctx.ledger.reload(row), FAILED, refused="transport", step="1:duplicate")
         return ApplyOutcome(sku, BRANCH_CREATE, "ERROR", None, fresh.warnings + ("duplicate_refused",))
+    new_gid = dup.product_gid
     num = product_number(new_gid)
-    ctx.register.record_outcome(ctx.ledger.lease, row.row_id, expect=OPEN, product_id=num, step="1:duplicate:id")
+    # The image copy runs on after the call (an async job): its id and `done` stay on
+    # the row, so an outlet whose copy failed can be traced (§8 F3).
+    job = ({"image_job": dup.image_job_id, "image_job_done": dup.image_job_done}
+           if dup.image_job_id is not None else None)
+    ctx.register.record_outcome(ctx.ledger.lease, row.row_id, expect=OPEN, product_id=num, step="1:duplicate:id",
+                                outcome=job)
     row = ctx.ledger.reload(row)
     try:
         inv = ctx.inventory(new_gid)

@@ -16,7 +16,9 @@ Semantics modelled (each from the 2026-10 docs the build read):
 * ``inventoryDeactivate`` → inactive (quantities kept);
 * products: status, publication, variants (policy, tracked, title, SKU),
   collection membership (``inCollection``), ``productDuplicate`` (a DRAFT
-  copy that inherits the source's levels), ``productDelete``.
+  copy that inherits the source's levels; its images only with
+  ``includeImages: true``, answered with an ``imageJob``), ``productDelete``;
+  media: a product's image URLs (``media``; default one per handle).
 
 Fault injection: ``shop.fault(op, kind, times=1, when=...)`` with kinds
 ``lose_after`` (applied, then the answer is lost → ``ShopifyOutcomeUnknown``),
@@ -98,6 +100,7 @@ class FakeShop:
         self.truncated: set = set()          # product gids whose level set reads truncated
         self.duplicate_truncated = False     # a duplicate's level set reads truncated
         self.locations: Dict[str, str] = {PROMO: "Promo", MAG: "Magazzino"}   # gid → name (E18's gate)
+        self.media: Dict[str, List[str]] = {}  # product gid → image URLs; unset: one image per handle
 
     # -- building the store ----------------------------------------------------------
     def _id(self, kind: str) -> str:
@@ -298,8 +301,11 @@ class FakeShop:
         self.products[gid] = Product(gid, v["newTitle"], v.get("newStatus") or src.status, vs, outlet_member=False)
         if self.duplicate_truncated:
             self.truncated.add(gid)
+        copied = self.images(src) if v.get("includeImages") is True else []   # includeImages defaults to false
+        self.media[gid] = list(copied)
+        job = {"id": self._id("Job"), "done": False} if copied else None     # the copy is an async job
         return {"productDuplicate": {"newProduct": {"id": gid, "title": v["newTitle"], "handle": "", "status": "DRAFT"},
-                                     "userErrors": []}}
+                                     "imageJob": job, "userErrors": []}}
 
     def _status(self, v: Dict[str, Any], body: Optional[str]) -> Dict[str, Any]:
         p = self.products.get(v["product"]["id"])
@@ -412,12 +418,15 @@ class FakeShop:
         return {"node": {"metafields": {"edges": [{"node": {"namespace": "custom", "key": "k", "type": "single_line_text_field",
                                                              "value": p.title}}]}}}
 
+    def images(self, p: Product) -> List[str]:
+        return self.media.get(p.gid, [f"https://cdn.example/{p.handle}.jpg"])
+
     def _media(self, v: Dict[str, Any], body: Optional[str]) -> Dict[str, Any]:
         p = self.products.get(v["id"])
         if p is None:
             return {"product": None}
-        return {"product": {"media": {"nodes": [{"id": "gid://shopify/MediaImage/1", "alt": "",
-                                                  "image": {"url": f"https://cdn.example/{p.handle}.jpg"}}]}}}
+        return {"product": {"media": {"nodes": [{"id": f"gid://shopify/MediaImage/{i + 1}", "alt": "",
+                                                  "image": {"url": url}} for i, url in enumerate(self.images(p))]}}}
 
 
 __all__ = ["FakeShop", "PROMO", "MAG", "PUB", "SimulatedCrashInShop"]
