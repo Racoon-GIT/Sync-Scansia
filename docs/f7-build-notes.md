@@ -306,6 +306,8 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   equal after case-fold, comma → dot and inner-space removal — §3.2's list, nothing more.
 - Admin API pin: the newest stable version on the build day (`2026-10` per E15) — re-read
   shopify.dev/docs/api/usage/versioning on the day it is pinned.
+  - Census a pin's deprecations from objects' `### Deprecated fields` sections and the inline `Deprecated` /
+    `non-nullDeprecated` markers of arguments and inputs, after stripping U+200B from field names.
 
 ## Facts read during the build (source, date)
 
