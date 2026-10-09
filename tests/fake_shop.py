@@ -12,8 +12,14 @@ Semantics modelled (each from the 2026-10 docs the build read):
   current ``available`` (``CHANGE_FROM_QUANTITY_STALE``), the ``@idempotent``
   key: a duplicate with the same body → the cached answer; other parameters →
   ``IDEMPOTENCY_KEY_PARAMETER_MISMATCH``;
-* ``inventoryActivate`` with explicit quantities (sets them), keyed likewise;
-* ``inventoryDeactivate`` → inactive (quantities kept);
+* ``inventoryActivate``, keyed likewise: ``available`` and ``onHand`` together are
+  refused (the pin's answer, F7.3 run 202610091404, R053); ``available`` alone
+  sets it on an absent level — on an inactive level holding units it sets it
+  too, or keeps them with ``activation_keeps_units`` (unmeasured at the pin, E15);
+* ``inventoryDeactivate`` → inactive (quantities kept); an item's last active
+  level is refused (the pin's answer, R061), each refusal kept in ``refused``;
+* ``publishablePublish`` on a DRAFT: no ``userErrors``, nothing published,
+  ``publishedOnPublication`` false (the pin's answer, R025);
 * products: status, publication, variants (policy, tracked, title, SKU),
   collection membership (``inCollection``), ``productDuplicate`` (a DRAFT
   copy that inherits the source's levels; its images only with
@@ -101,6 +107,8 @@ class FakeShop:
         self.duplicate_truncated = False     # a duplicate's level set reads truncated
         self.locations: Dict[str, str] = {PROMO: "Promo", MAG: "Magazzino"}   # gid → name (E18's gate)
         self.media: Dict[str, List[str]] = {}  # product gid → image URLs; unset: one image per handle
+        self.activation_keeps_units = False    # E15: an inactive level's units kept by an activation
+        self.refused: List[Tuple[str, Dict[str, Any]]] = []   # (op, variables) of every store refusal modelled
 
     # -- building the store ----------------------------------------------------------
     def _id(self, kind: str) -> str:
@@ -265,24 +273,40 @@ class FakeShop:
 
         return self._keyed(v["idempotencyKey"], body, run, "inventoryAdjustQuantities")
 
+    def _location_name(self, loc: str) -> str:
+        return self.locations.get(loc, loc.split("/")[-1])
+
     def _activate(self, v: Dict[str, Any], body: Optional[str]) -> Dict[str, Any]:
         def run() -> Dict[str, Any]:
             k = (v["inventoryItemId"], v["locationId"])
+            if v.get("available") is not None and v.get("onHand") is not None:
+                self.refused.append(("activate", copy.deepcopy(v)))
+                msg = (f"The variant couldn't be stocked at {self._location_name(k[1])} because not allowed "
+                       "to set available and on_hand quantities at the same time.")
+                return {"inventoryActivate": {"inventoryLevel": None,
+                                              "userErrors": [{"field": ["available"], "message": msg},
+                                                             {"field": ["onHand"], "message": msg}]}}
             lvl = self.levels.get(k)
             if lvl is None:
                 lvl = self.levels[k] = Level(self._id("InventoryLevel"))
+            kept = self.activation_keeps_units and not lvl.active
             lvl.active = True
-            if v.get("available") is not None:
+            if v.get("available") is not None and not kept:
+                lvl.on_hand += v["available"] - lvl.available
                 lvl.available = v["available"]
-            if v.get("onHand") is not None:
-                lvl.on_hand = v["onHand"]
             return {"inventoryActivate": {"inventoryLevel": {"id": lvl.id, "isActive": True}, "userErrors": []}}
 
         return self._keyed(v["idempotencyKey"], body, run, "inventoryActivate")
 
     def _deactivate(self, v: Dict[str, Any], body: Optional[str]) -> Dict[str, Any]:
-        for lvl in self.levels.values():
+        for (item, loc), lvl in self.levels.items():
             if lvl.id == v["inventoryLevelId"]:
+                others = [x for (it, lc), x in self.levels.items() if it == item and lc != loc and x.active]
+                if lvl.active and not others:
+                    self.refused.append(("deactivate", copy.deepcopy(v)))
+                    return {"inventoryDeactivate": {"userErrors": [{"field": None, "message": (
+                        f"The variant couldn't be unstocked from {self._location_name(loc)} because variants "
+                        "need to be stocked at a minimum of 1 location.")}]}}
                 lvl.active = False
                 return {"inventoryDeactivate": {"userErrors": []}}
         return {"inventoryDeactivate": {"userErrors": [{"field": None, "message": "not found"}]}}
@@ -330,9 +354,12 @@ class FakeShop:
         return {"productVariantsBulkUpdate": {"product": {"id": p.gid}, "userErrors": []}}
 
     def _publish(self, v: Dict[str, Any], body: Optional[str]) -> Dict[str, Any]:
-        self.products[v["id"]].published = True
-        return {"publishablePublish": {"publishable": {"publishedOnPublication": True,
-                                                       "resourcePublicationsCount": {"count": 1}}, "userErrors": []}}
+        p = self.products[v["id"]]
+        if p.status != "DRAFT":
+            p.published = True
+        return {"publishablePublish": {"publishable": {"publishedOnPublication": p.published,
+                                                       "resourcePublicationsCount": {"count": int(p.published)}},
+                                       "userErrors": []}}
 
     def _delete(self, v: Dict[str, Any], body: Optional[str]) -> Dict[str, Any]:
         gid = v["input"]["id"]

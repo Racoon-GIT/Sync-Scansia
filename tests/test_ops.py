@@ -400,12 +400,14 @@ def test_adjust_request_sends_an_explicit_null_change_from():
     assert inp["changes"][0]["changeFromQuantity"] is None and "referenceDocumentUri" not in inp
 
 
-def test_activate_request_is_explicit_zero_and_keyed():
+def test_activate_request_is_an_explicit_zero_available_only_and_keyed():
+    """The pin refuses ``available`` and ``onHand`` together (F7.3 run 202610091404,
+    R053): the body names ``available`` 0 and nothing else."""
     import json
 
     doc = json.loads(ops.activate_request("i", "l", "k"))
-    v = doc["variables"]
-    assert (v["available"], v["onHand"], v["idempotencyKey"]) == (0, 0, "k")
+    assert doc["variables"] == {"inventoryItemId": "i", "locationId": "l", "available": 0, "idempotencyKey": "k"}
+    assert "onHand" not in doc["query"]
     assert "@idempotent(key: $idempotencyKey)" in doc["query"] and "userErrors { field message }" in doc["query"]
 
 

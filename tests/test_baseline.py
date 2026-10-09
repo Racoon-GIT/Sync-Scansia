@@ -172,7 +172,7 @@ def test_a_activates_an_absent_or_inactive_level_with_explicit_zeros_before_rais
     assert by_key(plan)[("SKU1", "42")].activate and by_key(plan)[("SKU1", "43")].activate
     env.apply(plan)
     acts = [c for c in env.shop.calls if c[0] == "activate"]
-    assert len(acts) == 2 and all(a[1]["available"] == 0 and a[1]["onHand"] == 0 for a in acts)
+    assert len(acts) == 2 and all(a[1]["available"] == 0 and "onHand" not in a[1] for a in acts)
     names = env.mutations()
     assert names.index("activate") < names.index("adjust")
     assert env.shop.available(out.gid, "42") == 1 and env.shop.promo(out.gid, "42").active

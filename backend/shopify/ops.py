@@ -17,9 +17,10 @@ with F7 §3.8; the lines cited are ``git show 8aab2a3:src/sync.py``):
   (:class:`ShopifyUserError`) when they are non-empty. Legacy variously
   ``logger.warning``'d and swallowed them (price update sync.py:465-467,
   metafields sync.py:562, images sync.py:513-515) or raised only on 4xx. The
-  M1a norm is: real failures propagate. The two structurally-benign cases that
-  GraphQL already models as *non*-errors are preserved:
-    - re-activating an already-active inventory item emits no userError;
+  M1a norm is: real failures propagate. Two cases never reach a mutation:
+    - an already-active level is never re-activated (``ledger.send_activate``
+      reads ``isActive`` first; the store answers ``userErrors`` there — F7.3
+      run 202610091404, R053);
     - deactivating a null/absent inventory level is a no-op (the level-id
       lookup returns ``None`` before any mutation runs).
 * **fix7** — image copy is a single declarative ``productSet`` (full replace):
@@ -440,8 +441,8 @@ def get_location_by_name(transport: ShopifyTransport, name: str) -> Optional[Dic
 # Every Promo write is RELATIVE (``inventoryAdjustQuantities`` on ``available``)
 # with ``changeFromQuantity`` = the level just read (rule 9's Shopify-side fence)
 # and the row's ``@idempotent`` key (mandatory from 2026-04). Activation is an
-# explicit step with ``available`` 0 / ``onHand`` 0 (2026-04 stopped defaulting
-# omitted quantities), sent only for an absent or inactive level. A write never
+# explicit step with ``available`` 0 only (the store refuses ``available`` and
+# ``onHand`` together, R053), sent only for an absent or inactive level. A write never
 # activates by itself and never retries on "not stocked" (2026-10 removed
 # ``ITEM_NOT_STOCKED_AT_LOCATION``). Each write is built as a request BODY first
 # (:func:`adjust_request`, …): the ``RECONCILE`` row stores that exact text and
@@ -470,12 +471,11 @@ mutation($input: InventoryAdjustQuantitiesInput!, $idempotencyKey: String!) {
 }"""
 
 _INVENTORY_ACTIVATE = """
-mutation($inventoryItemId: ID!, $locationId: ID!, $available: Int, $onHand: Int, $idempotencyKey: String!) {
+mutation($inventoryItemId: ID!, $locationId: ID!, $available: Int, $idempotencyKey: String!) {
   inventoryActivate(
     inventoryItemId: $inventoryItemId
     locationId: $locationId
     available: $available
-    onHand: $onHand
   ) @idempotent(key: $idempotencyKey) {
     inventoryLevel { id isActive }
     userErrors { field message }
@@ -544,13 +544,15 @@ def adjust_request(
 
 
 def activate_request(inventory_item_gid: str, location_gid: str, idempotency_key: str) -> str:
-    """The body of an explicit activation: ``available`` 0, ``onHand`` 0 (never
-    omitted — E15), for an absent or inactive level only (the caller's rule)."""
+    """The body of an explicit activation: ``available`` 0, never omitted (E15),
+    and no ``onHand`` — the pin refuses the two together («not allowed to set
+    available and on_hand quantities at the same time», F7.3 run 202610091404,
+    R053). For an absent or inactive level only (the caller's rule); what it
+    leaves on an inactive level that held units is unmeasured at the pin (E15)."""
     return request_body(_INVENTORY_ACTIVATE, {
         "inventoryItemId": inventory_item_gid,
         "locationId": location_gid,
         "available": 0,
-        "onHand": 0,
         "idempotencyKey": idempotency_key,
     })
 
@@ -883,6 +885,10 @@ def product_publish(
     :func:`get_online_store_publication_id`); grant them on the custom app or the
     publish fails with access-denied. A non-existent/unpublishable publication is
     reported as a ``userError`` (not a top-level error) and RAISES via fix3.
+
+    No ``userErrors`` is not proof of a publish: on a DRAFT the call answers
+    ``userErrors`` [], ``publishedOnPublication`` false, count 0 (F7.3 run
+    202610091404, R025-S2.10) — the caller reads :func:`publish_confirmed`.
     """
     data = transport.graphql(
         _PRODUCT_PUBLISH,
@@ -893,6 +899,13 @@ def product_publish(
         },
     )
     return _check_user_errors(data, "publishablePublish")
+
+
+def publish_confirmed(answer: Dict[str, Any]) -> bool:
+    """Whether a :func:`product_publish` answer says the product is on the
+    publication (``publishedOnPublication`` true); anything else — false,
+    missing — is not a confirmation."""
+    return ((answer or {}).get("publishable") or {}).get("publishedOnPublication") is True
 
 
 # -----------------------------------------------------------------------------

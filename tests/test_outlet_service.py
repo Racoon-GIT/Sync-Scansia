@@ -365,7 +365,7 @@ def test_activation_is_explicit_and_only_for_an_absent_or_inactive_level():
     acts = [c[1] for c in w.shop.calls if c[0] == "activate"]
     items = {c["inventoryItemId"] for c in acts}
     assert items == {w.shop.variant(out.gid, "43").item, w.shop.variant(out.gid, "44").item}
-    assert all((c["available"], c["onHand"]) == (0, 0) and c["idempotencyKey"] for c in acts)
+    assert all(c["available"] == 0 and "onHand" not in c and c["idempotencyKey"] for c in acts)
     assert [w.shop.available(out.gid, s) for s in ("42", "43", "44")] == [1, 1, 1]
 
 

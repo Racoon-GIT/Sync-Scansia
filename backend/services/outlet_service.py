@@ -30,10 +30,13 @@ The branches (rule 7: every variant a flow exposes is DENY + tracked first):
   (``revive-tail``: DENY + tracked, ACTIVE, publish) only once every zeroing row
   has applied — else nothing is activated, added or exposed.
 * **CREATE** — the ``create`` row written before ``productDuplicate`` (DRAFT
-  atomically), the duplicate's id recorded as soon as it answers; zero +
-  disconnect every non-Promo level, zero every Promo variant, activate and add
-  the returned sizes, DENY + tracked + prices, then ACTIVE and publish LAST. Any
-  failure after step 1 → the orphan drafted and zeroed, the row ``HELD``.
+  atomically), the duplicate's id recorded as soon as it answers; Promo
+  activated on every variant lacking it (no variant's last active level is ever
+  deactivated, F7.3 S3.8), then, from a re-read, zero + disconnect every
+  non-Promo level, zero every Promo variant, add the returned sizes, DENY +
+  tracked + prices, then ACTIVE and publish LAST (an unconfirmed publish
+  surfaced). Any failure after step 1 → the orphan drafted and zeroed, the row
+  ``HELD``.
 """
 from __future__ import annotations
 
@@ -560,8 +563,25 @@ def create_outlet(ctx: flows.Context, fresh: PlanAction, approved: PlanAction) -
         inv = ctx.inventory(new_gid)
         if any(v.get("levels_truncated") for v in inv):
             raise _CreateAbort("levels_truncated_after_duplicate")
-        # FIX1's order: every non-Promo level zeroed and disconnected first, then
-        # every Promo variant zeroed, then the returned sizes' activation + add.
+        # Shopify refuses to deactivate a variant's last active level (F7.3 S3.8), and
+        # the duplicate inherits the source's levels — most variants active only off
+        # Promo. So every variant's Promo level is activated first where absent or
+        # inactive (rule 2's explicit activation, one row each); only once all are
+        # APPLIED, and from a re-read (what an activation leaves on a level that held
+        # units is unmeasured, E15), FIX1's order: every non-Promo level zeroed and
+        # disconnected, then every Promo variant zeroed, then the returned sizes' adds.
+        acts = [L.RowSpec(action=L.A_ACTIVATE, keys=keys, inventory_item_id=variants.item_id(v),
+                          location_id=ctx.promo, variant_id=v.get("id"), product_id=num)
+                for v in inv if not _promo_active(v, ctx.promo)]
+        if acts:
+            for r in ctx.ledger.write_group(acts, group_id=group):
+                if ctx.ledger.send_activate(r) != APPLIED:
+                    raise _CreateAbort("activation_not_applied")
+            inv = ctx.inventory(new_gid)
+            if any(v.get("levels_truncated") for v in inv):
+                raise _CreateAbort("levels_truncated_after_activation")
+            if not all(_promo_active(v, ctx.promo) for v in inv):
+                raise _CreateAbort("activation_not_applied")
         zero_all = flows.zero_rows_for(ctx, inv, keys=keys, product=num, purpose=L.P_ZERO, include_nonpromo=True)
         nonpromo = [s for s in zero_all if s.location_id != ctx.promo]
         promo_zero = [s for s in zero_all if s.location_id == ctx.promo]
@@ -579,7 +599,7 @@ def create_outlet(ctx: flows.Context, fresh: PlanAction, approved: PlanAction) -
             ctx.transport, new_gid, ops.deny_tracked_inputs(inv, **price_extra)))
         ctx.ledger.step(row, "6:active", lambda: ops.product_update_status(ctx.transport, new_gid, "ACTIVE"))
         pub = ctx.publication_id()
-        ctx.ledger.step(row, "6:publish", lambda: ops.product_publish(ctx.transport, new_gid, pub))
+        answer = ctx.ledger.step(row, "6:publish", lambda: ops.product_publish(ctx.transport, new_gid, pub))
     except (_CreateAbort, ShopifyUserError, ShopifyTransportError, ProductNotFound) as e:
         why = str(e) if isinstance(e, _CreateAbort) else type(e).__name__
         flows.orphan(ctx, row, new_gid)
@@ -587,8 +607,13 @@ def create_outlet(ctx: flows.Context, fresh: PlanAction, approved: PlanAction) -
         ctx.ledger.settle(group)
         status = "QUARANTINED" if why.startswith("levels_truncated") else "CREATE_ABORTED"
         return ApplyOutcome(sku, BRANCH_CREATE, status, new_gid, fresh.warnings + (f"create_aborted:{why}",))
-    ctx.ledger.close(ctx.ledger.reload(row), APPLIED, moved=0)
+    ctx.ledger.close(ctx.ledger.reload(row), APPLIED, moved=0, **flows.publish_checked(ctx, row, answer))
     return _settled(ctx, fresh, BRANCH_CREATE, new_gid, group, "APPLIED")
+
+
+def _promo_active(v: Dict[str, Any], promo: str) -> bool:
+    lvl = flows.promo_of(v, promo)
+    return lvl is not None and bool(lvl.get("is_active", True))
 
 
 def _execute(ctx: flows.Context, fresh: PlanAction, approved: PlanAction) -> ApplyOutcome:
