@@ -9,9 +9,9 @@ Wires :func:`backend.services.outlet_service.publish_preview` /
 * ``POST /outlet/publish/apply``             — confirm-gated (``{plan_hash, confirm_token}``).
 * ``GET  /outlet/publish/apply/{job_id}``    — poll: apply outcomes (or VERIFY_FAILED).
 
-Publish has NO audit sink and NO human-gesture gate (only ``mark_reconciled`` on
-the sheet, done inside the service): the spec leaves ``make_audit`` /
-``make_gesture`` unset. The aggregate ``plan_hash`` is derived from the per-SKU
+Publish runs on the register (``app.state.register_factory``) and writes its
+``RECONCILE`` rows through it — NO audit sink and NO human-gesture gate: the spec
+leaves ``make_audit`` / ``make_gesture`` unset. The aggregate ``plan_hash`` is derived from the per-SKU
 ``PlanAction.plan_hash`` values (the outlet service's own TOCTOU keys), sorted so
 the hash is order-independent; ``publish_apply`` still re-verifies each SKU against
 its own plan_hash internally, so this aggregate is the coarse batch-level drift
@@ -20,7 +20,7 @@ gate on top of that per-action guard.
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from backend.api.mutations import MutationVertical, build_mutation_router
 from backend.services import outlet_service
@@ -51,14 +51,13 @@ def publish_plan_hash(plan: Any) -> str:
 # =============================================================================
 def _size_target_to_dict(st: Any) -> Dict[str, Any]:
     return {
-        "raw_size": st.raw_size,
-        "norm_size": st.norm_size,
-        "row_uuids": list(st.row_uuids),
+        "size": st.size,
+        "event_ids": list(st.event_ids),
         "delta": st.delta,
-        "frozen_pre": st.frozen_pre,
         "matched": st.matched,
         "variant_id": st.variant_id,
         "inventory_item_id": st.inventory_item_id,
+        "twins": list(st.twins),
     }
 
 
@@ -97,7 +96,7 @@ def _outcome_to_dict(o: Any) -> Dict[str, Any]:
         "status": o.status,
         "target_gid": o.target_gid,
         "warnings": list(o.warnings),
-        "reconciled_uuids": list(o.reconciled_uuids),
+        "stamped_event_ids": list(o.stamped_event_ids),
     }
 
 
@@ -112,8 +111,8 @@ def serialize_report(report: Any) -> Dict[str, Any]:
 def _make_preview(state: Any):
     promo = state.promo_location_id
 
-    def _preview(sheet: Any, transport: Any) -> Any:
-        return outlet_service.publish_preview(sheet, transport, promo_location_id=promo)
+    def _preview(register: Any, transport: Any) -> Any:
+        return outlet_service.publish_preview(register, transport, promo_location_id=promo)
 
     return _preview
 
@@ -121,10 +120,10 @@ def _make_preview(state: Any):
 def _make_apply(state: Any):
     promo = state.promo_location_id
 
-    def _apply(sheet: Any, transport: Any, approved_plan: Any, audit_sink: Any) -> Any:
-        # publish has no audit sink — the injected sink (always None here) is ignored.
+    def _apply(register: Any, transport: Any, approved_plan: Any, audit_sink: Any) -> Any:
+        # publish writes its RECONCILE rows through the register — no audit sink.
         return outlet_service.publish_apply(
-            sheet, transport, approved_plan, promo_location_id=promo
+            register, transport, approved_plan, promo_location_id=promo
         )
 
     return _apply

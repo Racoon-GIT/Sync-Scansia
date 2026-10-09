@@ -184,7 +184,8 @@ def test_product_update_status_sets_active():
     t = FakeTransport({"productUpdate": {"product": {"id": "gid://shopify/Product/1", "status": "ACTIVE"}, "userErrors": []}})
     out = ops.product_update_status(t, "gid://shopify/Product/1", "ACTIVE")
     assert out["product"]["status"] == "ACTIVE"
-    assert t.calls[0]["variables"] == {"input": {"id": "gid://shopify/Product/1", "status": "ACTIVE"}}
+    assert t.calls[0]["variables"] == {"product": {"id": "gid://shopify/Product/1", "status": "ACTIVE"}}
+    assert "productUpdate(product: $product)" in t.calls[0]["query"]   # input: is deprecated at 2026-10
     assert "productUpdate" in t.calls[0]["query"]
 
 
@@ -275,3 +276,31 @@ def test_enumerate_outlet_products_raises_when_collection_null():
     t = FakeTransport({"collection": None})
     with pytest.raises(RuntimeError, match="Collection not found"):
         ops.enumerate_outlet_products(t, "gid://shopify/Collection/404")
+
+
+def test_get_product_core_reads_smart_from_collection_sources():
+    """2026-10: ``Collection.ruleSet`` is deprecated — rule-based membership is a
+    sub-collections source, or a conditions source with inclusion conditions."""
+    nodes = [
+        {"id": "c1", "title": "OUTLET", "handle": "outlet", "sources": [
+            {"__typename": "CollectionConditionsSource", "inclusion": {"conditions": [{"__typename": "X"}]}}]},
+        {"id": "c2", "title": "Manual", "handle": "man", "sources": [
+            {"__typename": "CollectionConditionsSource", "inclusion": {"conditions": []}}]},
+        {"id": "c3", "title": "Sub", "handle": "sub", "sources": [{"__typename": "CollectionSubCollectionsSource"}]},
+        {"id": "c4", "title": "Bare", "handle": "bare", "sources": []},
+    ]
+    t = FakeTransport({"product": {"id": "gid://shopify/Product/1", "title": "T", "handle": "t", "status": "DRAFT",
+                                   "tags": [], "collections": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                               "nodes": nodes}}})
+    core = ops.get_product_core(t, "gid://shopify/Product/1")
+    assert {c["id"]: c["smart"] for c in core["collections"]} == {"c1": True, "c2": False, "c3": True, "c4": False}
+    assert "ruleSet" not in t.calls[0]["query"] and "sources" in t.calls[0]["query"]
+
+
+def test_a_null_product_is_product_not_found():
+    from backend.shopify.ops import ProductNotFound
+
+    with pytest.raises(ProductNotFound):
+        ops.get_product_core(FakeTransport({"product": None}), "gid://shopify/Product/404")
+    with pytest.raises(ProductNotFound):
+        ops.read_variant_inventory(FakeTransport({"node": None}), "gid://shopify/Product/404")

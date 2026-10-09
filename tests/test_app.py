@@ -6,7 +6,7 @@ no branch echoes the raw exception text.
 
 TestClient tier (``importorskip``): ``/health`` open, gated routes 401 without
 auth, and the error boundary — a service exception raised inside a handler yields
-a stable ``error_code`` with NO raw message/stack/GraphQL/gspread text in the body.
+a stable ``error_code`` with NO raw message/stack/GraphQL/driver text in the body.
 Skipped where FastAPI/httpx are absent (this bare interpreter); runs on CI.
 """
 from __future__ import annotations
@@ -16,11 +16,13 @@ import base64
 import pytest
 
 from backend.api.errors import (
+    CODE_BASELINE_MISSING,
     CODE_CONFIG_ERROR,
-    CODE_CUTOVER_NOT_DONE,
+    CODE_INTENT_NOT_FOUND,
     CODE_INTERNAL_ERROR,
-    CODE_SHEET_ERROR,
-    CODE_SHEET_IO_ERROR,
+    CODE_LEASE_LOST,
+    CODE_PASS_BUSY,
+    CODE_REGISTER_ERROR,
     CODE_SHOPIFY_TRANSPORT_ERROR,
     CODE_SHOPIFY_USER_ERROR,
     CODE_SINGLE_DELETE_NOT_OUTLET,
@@ -29,7 +31,9 @@ from backend.api.errors import (
 )
 from backend.auth.basic_auth import AuthError, AuthNotConfigured
 from backend.config import ConfigError
-from backend.gsheet.reader import CutoverNotDoneError, GSheetError, SheetIOError
+from backend.persistence.audit_sink import IntentNotFound
+from backend.persistence.records import BaselineMissing, CommitUnknown, LeaseLost, StoreError
+from backend.services.lease import LeaseUnavailable
 from backend.services.delete_service import SingleDeleteNotOutletError
 from backend.shopify.ops import ShopifyUserError
 from backend.shopify.transport import ShopifyTransportError
@@ -51,20 +55,21 @@ def test_map_shopify_transport_error():
     assert "secret" not in err.message
 
 
-def test_map_sheet_io_error_specific_over_base():
-    err = map_exception(SheetIOError("gspread APIError 500 quota exceeded xyz"))
-    assert err.status_code == 502 and err.error_code == CODE_SHEET_IO_ERROR
-    assert "quota" not in err.message
-
-
-def test_map_cutover_specific_over_base():
-    err = map_exception(CutoverNotDoneError("sentinel absent"))
-    assert err.status_code == 409 and err.error_code == CODE_CUTOVER_NOT_DONE
-
-
-def test_map_gsheet_base_error():
-    err = map_exception(GSheetError("some sheet failure"))
-    assert err.status_code == 502 and err.error_code == CODE_SHEET_ERROR
+def test_map_register_errors_specific_over_their_store_base():
+    """BaselineMissing / LeaseLost / IntentNotFound subclass StoreError: each keeps
+    its own code, the rest of the family is the generic 502 (its text never echoed)."""
+    assert (map_exception(BaselineMissing("x")).status_code, map_exception(BaselineMissing("x")).error_code) \
+        == (409, CODE_BASELINE_MISSING)
+    assert (map_exception(LeaseLost("x")).status_code, map_exception(LeaseLost("x")).error_code) \
+        == (409, CODE_LEASE_LOST)
+    assert (map_exception(IntentNotFound("x")).status_code, map_exception(IntentNotFound("x")).error_code) \
+        == (404, CODE_INTENT_NOT_FOUND)
+    for exc in (StoreError("errno 1045 user scansia_mgr"), CommitUnknown("errno 2013 during COMMIT")):
+        err = map_exception(exc)
+        assert (err.status_code, err.error_code) == (502, CODE_REGISTER_ERROR)
+        assert "errno" not in err.message and "scansia_mgr" not in err.message
+    assert (map_exception(LeaseUnavailable("x")).status_code, map_exception(LeaseUnavailable("x")).error_code) \
+        == (409, CODE_PASS_BUSY)
 
 
 def test_map_config_error():
@@ -121,9 +126,7 @@ def _app(monkeypatch, *, boom=None):
     cfg = ShopifyConfig("t.myshopify.com", "shpat_x", "2025-07", "gid://shopify/Location/PROMO")
     app = create_app(
         config=cfg,
-        sheet_factory=lambda: None,
         transport_factory=lambda: None,
-        audit_factory=lambda: None,
         promo_location_id="gid://shopify/Location/PROMO",
     )
 
@@ -182,20 +185,17 @@ def test_error_boundary_shopify_user_error_is_stable_and_safe(monkeypatch):
     assert "productDelete" not in dumped
 
 
-def test_error_boundary_sheet_io_error_maps_502(monkeypatch):
-    client = _client(_app(monkeypatch, boom=SheetIOError("gspread quota secret")))
-    r = client.get("/boom", headers={"Authorization": _basic("racoon", "s3cret-pw")})
-    assert r.status_code == 502
-    body = r.json()
-    assert body["error"]["code"] == CODE_SHEET_IO_ERROR
-    assert "quota" not in body["error"]["message"]
+def test_error_boundary_store_error_maps_502_via_http(monkeypatch):
+    """A register failure raised in a handler goes through the catch-all handler and
+    the same mapper: 502 ``register_error``, the driver's text never in the body."""
+    app = _app(monkeypatch, boom=StoreError("errno 1045 Access denied for user scansia_mgr"))
 
+    from fastapi.testclient import TestClient
 
-def test_error_boundary_cutover_maps_409(monkeypatch):
-    client = _client(_app(monkeypatch, boom=CutoverNotDoneError("sentinel absent")))
-    r = client.get("/boom", headers={"Authorization": _basic("racoon", "s3cret-pw")})
-    assert r.status_code == 409
-    assert r.json()["error"]["code"] == CODE_CUTOVER_NOT_DONE
+    r = TestClient(app, raise_server_exceptions=False).get(
+        "/boom", headers={"Authorization": _basic("racoon", "s3cret-pw")})
+    assert r.status_code == 502 and r.json()["error"]["code"] == CODE_REGISTER_ERROR
+    assert "errno" not in r.text and "scansia_mgr" not in r.text
 
 
 def test_error_boundary_unmapped_exception_is_generic_500_via_http(monkeypatch):
@@ -230,7 +230,7 @@ def test_error_boundary_auth_not_configured_503(monkeypatch):
 
     monkeypatch.delenv("APP_PASSWORD", raising=False)
     cfg = ShopifyConfig("t.myshopify.com", "shpat_x", "2025-07", "gid://shopify/Location/PROMO")
-    app = create_app(config=cfg, sheet_factory=lambda: None, transport_factory=lambda: None,
-                     audit_factory=lambda: None, promo_location_id="gid://shopify/Location/PROMO")
+    app = create_app(config=cfg, transport_factory=lambda: None,
+                     promo_location_id="gid://shopify/Location/PROMO")
     r = _client(app).get("/scansia", headers={"Authorization": _basic("racoon", "x")})
     assert r.status_code == 503

@@ -35,8 +35,17 @@ _SECRET = "unit-test-signing-secret"
 # ---------------------------------------------------------------------------
 # Fakes + plan/report builders
 # ---------------------------------------------------------------------------
-class FakeSheet:
-    """Opaque sheet handle — the service is mocked, so no method is exercised."""
+class FakeRegister:
+    """Opaque register handle — the service is mocked; records its close()."""
+
+    closed = 0
+    actors: List[Any] = []
+
+    def __init__(self, actor: Any = None) -> None:
+        FakeRegister.actors.append(actor)
+
+    def close(self) -> None:
+        FakeRegister.closed += 1
 
 
 class FakeTransport:
@@ -58,7 +67,7 @@ def _report() -> ApplyReport:
     return ApplyReport(outcomes=(
         ApplyOutcome(
             sku="SKU1", branch="ACTIVE", status="APPLIED",
-            target_gid="gid://shopify/Product/1", warnings=(), reconciled_uuids=("u1",),
+            target_gid="gid://shopify/Product/1", warnings=(), stamped_event_ids=(1,),
         ),
     ))
 
@@ -73,12 +82,13 @@ class _MockService:
         self.preview_calls = 0
         self.apply_calls = 0
 
-    def publish_preview(self, sheet: Any, transport: Any, *, promo_location_id: str) -> Plan:
+    def publish_preview(self, register: Any, transport: Any, *, promo_location_id: str) -> Plan:
         self.preview_calls += 1
         return self.plan
 
-    def publish_apply(self, sheet: Any, transport: Any, approved_plan: Plan, *,
-                      promo_location_id: str, publication_id: Optional[str] = None) -> ApplyReport:
+    def publish_apply(self, register: Any, transport: Any, approved_plan: Plan, *,
+                      promo_location_id: str, publication_id: Optional[str] = None,
+                      lease: Any = None) -> ApplyReport:
         self.apply_calls += 1
         return self.report
 
@@ -101,7 +111,7 @@ def test_apply_worker_happy_path_calls_apply():
 
     _run_apply_job(
         store, rec.job_id, "H1",
-        lambda: FakeSheet(), lambda: FakeTransport(),
+        lambda: FakeRegister(), lambda: FakeTransport(),
         None,                                   # no audit builder (publish-shaped)
         lambda s, t: {"h": "H1"},               # live re-preview -> same hash
         lambda p: p["h"], apply_fn, lambda r: r, None,
@@ -123,7 +133,7 @@ def test_apply_worker_drift_is_verify_failed_and_skips_apply():
 
     _run_apply_job(
         store, rec.job_id, "H1",
-        lambda: FakeSheet(), lambda: FakeTransport(),
+        lambda: FakeRegister(), lambda: FakeTransport(),
         None,
         lambda s, t: {"h": "H2"},               # live state moved -> hash differs
         lambda p: p["h"],
@@ -145,7 +155,7 @@ def test_apply_worker_gesture_gate_blocks_apply():
 
     _run_apply_job(
         store, rec.job_id, "H1",
-        lambda: FakeSheet(), lambda: FakeTransport(),
+        lambda: FakeRegister(), lambda: FakeTransport(),
         None,
         lambda s, t: {"h": "H1"},               # no drift
         lambda p: p["h"],
@@ -170,7 +180,7 @@ def test_apply_worker_service_crash_maps_to_stable_code():
 
     _run_apply_job(
         store, rec.job_id, "H1",
-        lambda: FakeSheet(), lambda: FakeTransport(),
+        lambda: FakeRegister(), lambda: FakeTransport(),
         None, lambda s, t: {"h": "H1"}, lambda p: p["h"], boom, lambda r: r, None,
     )
     got = store.get(rec.job_id)
@@ -192,7 +202,7 @@ def test_preview_worker_mints_token_and_stores_plan():
     rec = store.create("x_preview")
     _run_preview_job(
         store, rec.job_id,
-        lambda: FakeSheet(), lambda: FakeTransport(),
+        lambda: FakeRegister(), lambda: FakeTransport(),
         lambda s, t: {"h": "HH"}, lambda p: p["h"], lambda p: {"plan": p},
         FakeToken(), "publish", 900, None,
     )
@@ -245,9 +255,8 @@ def _make_client(monkeypatch, svc: _MockService):
 
     app = create_app(
         config=cfg,
-        sheet_factory=lambda: FakeSheet(),
+        register_factory=lambda **kw: FakeRegister(**kw),
         transport_factory=lambda: FakeTransport(),
-        audit_factory=lambda: None,
         executor=SynchronousExecutor(),  # POST completes the job inline
         promo_location_id=PROMO,
     )
@@ -387,3 +396,53 @@ def test_publish_routes_require_auth(monkeypatch, method, path):
     r = getattr(client, method)(path, **kwargs)
     assert r.status_code == 401
     assert "www-authenticate" in {k.lower() for k in r.headers}
+
+
+# ===========================================================================
+# F7: publish runs on the register handle, closed at the end of every job
+# ===========================================================================
+def test_publish_jobs_get_the_register_and_close_it(monkeypatch):
+    seen: List[Any] = []
+    svc = _MockService(plan=_plan("h1"), report=_report())
+    real_preview = svc.publish_preview
+
+    def recording_preview(register, transport, **kw):
+        seen.append(register)
+        return real_preview(register, transport, **kw)
+
+    svc.publish_preview = recording_preview
+    client = _make_client(monkeypatch, svc)
+    FakeRegister.closed = 0
+    FakeRegister.actors = []
+    res = _preview_and_get(client)
+    ap = client.post("/outlet/publish/apply", headers=_auth(),
+                     json={"plan_hash": res["plan_hash"], "confirm_token": res["confirm_token"]})
+    assert ap.status_code == 202
+    assert all(isinstance(r, FakeRegister) for r in seen) and len(seen) == 2
+    assert FakeRegister.closed == 2          # the preview's handle and the apply's
+    assert FakeRegister.actors[-1] == "racoon"   # the apply's register writes as the user
+
+
+def test_publish_without_a_configured_register_fails_closed(monkeypatch):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from backend.api.jobs import SynchronousExecutor
+    from backend.app import create_app
+    from backend.config import ShopifyConfig
+
+    monkeypatch.setenv("APP_PASSWORD", "s3cret-pw")
+    monkeypatch.setenv("TOKEN_SIGNING_SECRET", _SECRET)
+    for var in ("SCANSIA_DB_HOST", "SCANSIA_DB_USER", "SCANSIA_DB_PASSWORD", "SCANSIA_DB_NAME",
+                "SCANSIA_DB_CA_PATH", "SCANSIA_DB_CA_B64"):
+        monkeypatch.delenv(var, raising=False)
+    app = create_app(
+        config=ShopifyConfig("t.myshopify.com", "shpat_x", "2025-07", PROMO),
+        transport_factory=lambda: FakeTransport(),
+        executor=SynchronousExecutor(), promo_location_id=PROMO,
+    )
+    with TestClient(app) as client:
+        sub = client.post("/outlet/publish/preview", headers=_auth())
+        job = client.get(f"/outlet/publish/preview/{sub.json()['job_id']}", headers=_auth()).json()
+    assert job["status"] == "failed" and job["error_code"] == "config_error"

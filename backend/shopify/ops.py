@@ -6,10 +6,13 @@ operation. The first argument is always a ``ShopifyTransport`` (see
 ``transport.graphql(query, variables)`` and shapes the result. No module-level
 state, no HTTP session ownership, no secrets — those all live in the transport.
 
-M1a migration notes (authoritative source: ``src/sync.py`` legacy methods):
+M1a migration notes (authoritative source: ``src/sync.py`` legacy methods — removed
+with F7 §3.8; the lines cited are ``git show 8aab2a3:src/sync.py``):
 
-* API version is 2025-07 (bumped from the legacy 2025-01); all selections used
-  here are stable at 2025-07 with no field renames.
+* API version: PINNED at 2026-10 (``backend.config.PINNED_API_VERSION``, F7
+  §7): every document here is written against it — ``@idempotent`` and
+  ``changeFromQuantity`` on inventory writes, explicit activation,
+  ``includeInactive`` reads, ``productUpdate(product:)``, ``Collection.sources``.
 * **fix3** — every mutation inspects its own ``userErrors`` and RAISES
   (:class:`ShopifyUserError`) when they are non-empty. Legacy variously
   ``logger.warning``'d and swallowed them (price update sync.py:465-467,
@@ -32,14 +35,24 @@ service layer, NOT here.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
-from backend.shopify.transport import ShopifyTransport
+from backend.shopify.transport import ShopifyTransport, request_body
 
 # Shopify 2025-07 hard cap for metafieldsSet inputs per call.
 METAFIELDS_SET_MAX = 25
 # Single-page connection cap used by the read queries (matches legacy first:250).
 CONNECTION_PAGE_SIZE = 250
+
+
+class ProductNotFound(RuntimeError):
+    """A read answered a definitive null for the product (``node`` / ``product``
+    null) — terminal path (ii) of F7 §3.3 rule 2 reads it as "gone"."""
+
+    def __init__(self, gid: str) -> None:
+        self.gid = gid
+        super().__init__(f"Product not found for GID: {gid}")
 
 
 class ShopifyUserError(RuntimeError):
@@ -145,7 +158,7 @@ def get_product_variants(transport: ShopifyTransport, product_gid: str) -> List[
     data = transport.graphql(_GET_PRODUCT_VARIANTS, {"id": product_gid})
     node = data.get("node")
     if node is None:
-        raise RuntimeError(f"Product not found for GID: {product_gid}")
+        raise ProductNotFound(product_gid)
     edges = node["variants"]["edges"]
     return [e["node"] for e in edges]
 
@@ -234,7 +247,7 @@ def get_product_metafields(transport: ShopifyTransport, product_gid: str) -> Lis
     data = transport.graphql(_GET_PRODUCT_METAFIELDS, {"id": product_gid})
     node = data.get("node")
     if node is None:
-        raise RuntimeError(f"Product not found for GID: {product_gid}")
+        raise ProductNotFound(product_gid)
     return [e["node"] for e in node["metafields"]["edges"]]
 
 
@@ -306,7 +319,7 @@ def get_product_media(transport: ShopifyTransport, product_gid: str) -> List[str
     data = transport.graphql(_GET_PRODUCT_MEDIA, {"id": product_gid})
     product = data.get("product")
     if product is None:
-        raise RuntimeError(f"Product not found for GID: {product_gid}")
+        raise ProductNotFound(product_gid)
     urls: List[str] = []
     for node in product["media"]["nodes"]:
         image = (node or {}).get("image") or {}
@@ -400,159 +413,53 @@ def get_location_by_name(transport: ShopifyTransport, name: str) -> Optional[Dic
 
 
 # =============================================================================
-# Inventory
+# Inventory — writes at the pinned version (F7 §3.3 rules 2, 3, 8, 9; E15)
 # =============================================================================
+#
+# Every Promo write is RELATIVE (``inventoryAdjustQuantities`` on ``available``)
+# with ``changeFromQuantity`` = the level just read (rule 9's Shopify-side fence)
+# and the row's ``@idempotent`` key (mandatory from 2026-04). Activation is an
+# explicit step with ``available`` 0 / ``onHand`` 0 (2026-04 stopped defaulting
+# omitted quantities), sent only for an absent or inactive level. A write never
+# activates by itself and never retries on "not stocked" (2026-10 removed
+# ``ITEM_NOT_STOCKED_AT_LOCATION``). Each write is built as a request BODY first
+# (:func:`adjust_request`, …): the ``RECONCILE`` row stores that exact text and
+# every re-send posts it again (:func:`send_inventory`), never a rebuilt one.
+#
+# Sources (read 2026-10-06, raw pages): shopify.dev/docs/api/admin-graphql/2026-10/
+# mutations/inventoryAdjustQuantities.md, input-objects/InventoryChangeInput.md
+# ("changeFromQuantity … mandatory: you must explicitly pass in a value, even if
+# that value is null"), enums/InventoryAdjustQuantitiesUserErrorCode.md,
+# mutations/inventoryActivate.md (``[UserError!]!``: no ``code``),
+# mutations/inventoryDeactivate.md, objects/InventoryItem.md (``inventoryLevel``
+# / ``inventoryLevels`` take ``includeInactive``), objects/InventoryLevel.md
+# (``isActive``), docs/apps/build/apis/graphql-admin/implementing-idempotency.md.
+
+INVENTORY_REASON = "correction"
+QUANTITY_NAME = "available"
+
+_INVENTORY_ADJUST = """
+mutation($input: InventoryAdjustQuantitiesInput!, $idempotencyKey: String!) {
+  inventoryAdjustQuantities(input: $input) @idempotent(key: $idempotencyKey) {
+    inventoryAdjustmentGroup {
+      changes { name delta quantityAfterChange location { id } item { id } }
+    }
+    userErrors { field message code }
+  }
+}"""
 
 _INVENTORY_ACTIVATE = """
-mutation($inventoryItemId: ID!, $locationId: ID!, $available: Int, $onHand: Int) {
+mutation($inventoryItemId: ID!, $locationId: ID!, $available: Int, $onHand: Int, $idempotencyKey: String!) {
   inventoryActivate(
     inventoryItemId: $inventoryItemId
     locationId: $locationId
     available: $available
     onHand: $onHand
-  ) {
-    inventoryLevel { id }
+  ) @idempotent(key: $idempotencyKey) {
+    inventoryLevel { id isActive }
     userErrors { field message }
   }
 }"""
-
-
-def inventory_activate(
-    transport: ShopifyTransport,
-    inventory_item_gid: str,
-    location_gid: str,
-    on_hand: Optional[int] = None,
-) -> Dict[str, Any]:
-    """Connect an inventory item to a location (creates the InventoryLevel).
-
-    Pure connect by default: quantities are omitted so both ``available`` and
-    ``onHand`` default to 0, matching the legacy connect that set no quantity
-    (sync.py:613-623). Pass ``on_hand`` to seed the physical count.
-
-    Idempotent: ``inventoryActivate`` on an already-active item returns the
-    existing ``inventoryLevel`` with NO userError, so re-activation is not a
-    failure (legacy swallowed an 'already exists' error; here GraphQL models it
-    as a non-error natively). fix3: a genuine non-empty ``userErrors`` RAISES.
-    """
-    variables: Dict[str, Any] = {
-        "inventoryItemId": inventory_item_gid,
-        "locationId": location_gid,
-        "available": None,
-        "onHand": None,
-    }
-    if on_hand is not None:
-        variables["onHand"] = on_hand
-    data = transport.graphql(_INVENTORY_ACTIVATE, variables)
-    return _check_user_errors(data, "inventoryActivate")
-
-
-_INVENTORY_SET_QUANTITIES = """
-mutation($input: InventorySetQuantitiesInput!) {
-  inventorySetQuantities(input: $input) {
-    inventoryAdjustmentGroup {
-      changes { name delta quantityAfterChange }
-    }
-    userErrors { code field message }
-  }
-}"""
-
-
-def _is_not_stocked(errors: List[Dict[str, Any]]) -> bool:
-    """True if any userError signals 'item not stocked at location' (the retry case)."""
-    for e in errors:
-        code = (e.get("code") or "").upper()
-        message = (e.get("message") or "").lower()
-        if "NOT_STOCKED" in code or "not stocked" in message:
-            return True
-    return False
-
-
-def inventory_set_quantities(
-    transport: ShopifyTransport,
-    inventory_item_gid: str,
-    location_gid: str,
-    quantity: int,
-    _allow_activate_retry: bool = True,
-) -> Dict[str, Any]:
-    """Unconditional absolute set of the sellable quantity via ``on_hand``.
-
-    Uses ``name: "on_hand"`` (NOT ``available``): on a fresh outlet nothing is
-    committed/reserved, so ``available == on_hand`` and writing ``on_hand=qty``
-    reproduces the legacy REST set of ``available`` with zero behavioral
-    difference, while staying robust if a variant ever has ``committed>0``.
-    ``ignoreCompareQuantity: true`` replicates the unconditional REST set (no
-    compare-and-swap); ``reason: "correction"``.
-
-    Used to zero (qty=0) and to set the per-size Google-Sheet qty
-    (sync.py:809,847,878).
-
-    Retry-on-not-connected: if the item is not stocked at the location, the
-    legacy code caught HTTP 422, connected, and retried once
-    (sync.py:633-651). Here the 'not stocked' userError triggers a single
-    :func:`inventory_activate` + one retry (the old 1.5s sleep was a REST
-    eventual-consistency hack; a GraphQL activate is transactional). fix3: any
-    other non-empty ``userErrors`` RAISE.
-    """
-    variables = {
-        "input": {
-            "name": "on_hand",
-            "reason": "correction",
-            "ignoreCompareQuantity": True,
-            "quantities": [
-                {
-                    "inventoryItemId": inventory_item_gid,
-                    "locationId": location_gid,
-                    "quantity": quantity,
-                }
-            ],
-        }
-    }
-    data = transport.graphql(_INVENTORY_SET_QUANTITIES, variables)
-    payload = data.get("inventorySetQuantities") or {}
-    errors = payload.get("userErrors") or []
-    if errors:
-        if _allow_activate_retry and _is_not_stocked(errors):
-            inventory_activate(transport, inventory_item_gid, location_gid)
-            return inventory_set_quantities(
-                transport,
-                inventory_item_gid,
-                location_gid,
-                quantity,
-                _allow_activate_retry=False,
-            )
-        raise ShopifyUserError("inventorySetQuantities", errors)
-    return payload
-
-
-_GET_INVENTORY_LEVEL_ID = """
-query($id: ID!, $loc: ID!) {
-  inventoryItem(id: $id) {
-    inventoryLevel(locationId: $loc) { id }
-  }
-}"""
-
-
-def get_inventory_level_id(
-    transport: ShopifyTransport, inventory_item_gid: str, location_gid: str
-) -> Optional[str]:
-    """Return the InventoryLevel GID for (item, location), or ``None`` if unstocked.
-
-    Helper for :func:`inventory_deactivate` (which takes only the level id, not
-    item+location — a new required lookup with no direct REST analog). ``None``
-    when the item is not stocked at the location (``inventoryLevel`` null),
-    reproducing the legacy 'already disconnected' tolerance.
-    """
-    data = transport.graphql(
-        _GET_INVENTORY_LEVEL_ID, {"id": inventory_item_gid, "loc": location_gid}
-    )
-    item = data.get("inventoryItem")
-    if item is None:
-        return None
-    level = item.get("inventoryLevel")
-    if level is None:
-        return None
-    return level["id"]
-
 
 _INVENTORY_DEACTIVATE = """
 mutation($inventoryLevelId: ID!) {
@@ -561,29 +468,139 @@ mutation($inventoryLevelId: ID!) {
   }
 }"""
 
+_READ_LEVEL = """
+query($id: ID!, $loc: ID!) {
+  inventoryItem(id: $id) {
+    id
+    inventoryLevel(locationId: $loc, includeInactive: true) {
+      id
+      isActive
+      quantities(names: ["available", "committed", "on_hand"]) { name quantity }
+    }
+  }
+}"""
 
-def inventory_deactivate(
-    transport: ShopifyTransport, inventory_item_gid: str, location_gid: str
-) -> None:
-    """Remove the inventory level at a location (disconnect), if one exists.
 
-    Resolves the level id first (:func:`get_inventory_level_id`); if ``None``
-    (item not stocked / already disconnected) this is a silent no-op, NOT an
-    error (legacy tolerated 'already disconnected', sync.py:655-663).
+@dataclass(frozen=True)
+class InventoryAnswer:
+    """What an inventory mutation answered (the transport did not raise).
 
-    Requires ``on_hand == 0`` at the location: the Magazzino caller deliberately
-    zeroes first (:func:`inventory_set_quantities` qty=0) THEN deactivates,
-    because a duplicated outlet inherits the source's Magazzino stock — preserve
-    that zero-then-deactivate ordering (deactivating nonzero stock errors).
-    fix3: a genuine non-empty ``userErrors`` RAISES (the caller's per-item
-    try/except keeps a real error log-and-continue, not fatal to the batch).
-    """
-    level_id = get_inventory_level_id(transport, inventory_item_gid, location_gid)
-    if level_id is None:
-        return None
-    data = transport.graphql(_INVENTORY_DEACTIVATE, {"inventoryLevelId": level_id})
-    _check_user_errors(data, "inventoryDeactivate")
-    return None
+    ``ok`` — no ``userErrors``; ``codes`` — their ``code`` values (adjust only:
+    activate / deactivate return plain ``UserError``, no code); ``changes`` —
+    the adjustment group's changes; ``level`` — an activation's
+    ``inventoryLevel`` (``{"id", "isActive"}``)."""
+
+    ok: bool
+    codes: Tuple[str, ...] = ()
+    errors: Tuple[Dict[str, Any], ...] = ()
+    changes: Tuple[Dict[str, Any], ...] = ()
+    level: Optional[Dict[str, Any]] = None
+
+
+def adjust_request(
+    inventory_item_gid: str,
+    location_gid: str,
+    delta: int,
+    change_from: Optional[int],
+    idempotency_key: str,
+    *,
+    reference: Optional[str] = None,
+) -> str:
+    """The body of one relative ``available`` write, fenced by ``change_from``."""
+    payload: Dict[str, Any] = {
+        "name": QUANTITY_NAME,
+        "reason": INVENTORY_REASON,
+    }
+    if reference:
+        payload["referenceDocumentUri"] = reference
+    payload["changes"] = [{
+        "inventoryItemId": inventory_item_gid,
+        "locationId": location_gid,
+        "delta": int(delta),
+        "changeFromQuantity": change_from,
+    }]
+    return request_body(_INVENTORY_ADJUST, {"input": payload, "idempotencyKey": idempotency_key})
+
+
+def activate_request(inventory_item_gid: str, location_gid: str, idempotency_key: str) -> str:
+    """The body of an explicit activation: ``available`` 0, ``onHand`` 0 (never
+    omitted — E15), for an absent or inactive level only (the caller's rule)."""
+    return request_body(_INVENTORY_ACTIVATE, {
+        "inventoryItemId": inventory_item_gid,
+        "locationId": location_gid,
+        "available": 0,
+        "onHand": 0,
+        "idempotencyKey": idempotency_key,
+    })
+
+
+def deactivate_request(inventory_level_gid: str) -> str:
+    """``inventoryDeactivate`` takes no idempotency key (not ``@idempotent``)."""
+    return request_body(_INVENTORY_DEACTIVATE, {"inventoryLevelId": inventory_level_gid})
+
+
+_PAYLOAD_KEY = {
+    "inventoryAdjustQuantities": "inventoryAdjustQuantities",
+    "inventoryActivate": "inventoryActivate",
+    "inventoryDeactivate": "inventoryDeactivate",
+}
+
+
+def _body_field(body: str) -> str:
+    for field in _PAYLOAD_KEY:
+        if f"{field}(" in body:
+            return field
+    raise ValueError("not an inventory mutation body")
+
+
+def send_inventory(transport: ShopifyTransport, body: str) -> InventoryAnswer:
+    """POST a stored inventory body; parse its answer. Transport outcomes
+    (unknown / refused) propagate as the transport's exceptions."""
+    field = _body_field(body)
+    data = transport.send_body(body)
+    payload = data.get(field) or {}
+    errors = tuple(payload.get("userErrors") or ())
+    group = payload.get("inventoryAdjustmentGroup") or {}
+    return InventoryAnswer(
+        ok=not errors,
+        codes=tuple(str(e.get("code")) for e in errors if e.get("code")),
+        errors=errors,
+        changes=tuple(group.get("changes") or ()),
+        level=payload.get("inventoryLevel"),
+    )
+
+
+def _quantities(level: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    qmap = {q["name"]: q["quantity"] for q in (level.get("quantities") or [])}
+    return {"available": qmap.get("available"), "committed": qmap.get("committed"),
+            "on_hand": qmap.get("on_hand")}
+
+
+def read_level(transport: ShopifyTransport, inventory_item_gid: str, location_gid: str) -> Dict[str, Any]:
+    """Rule 8's read right before a write (``includeInactive: true``).
+
+    Returns ``{"item_found": bool, "level": None | {"id", "is_active",
+    "available", "committed", "on_hand"}}`` — ``item_found`` False is a
+    definitive null for the item (terminal path (ii) reads it); ``level`` None is
+    an ABSENT level (never stocked), not a zero."""
+    data = transport.graphql(_READ_LEVEL, {"id": inventory_item_gid, "loc": location_gid})
+    item = data.get("inventoryItem")
+    if item is None:
+        return {"item_found": False, "level": None}
+    lvl = item.get("inventoryLevel")
+    if lvl is None:
+        return {"item_found": True, "level": None}
+    return {"item_found": True, "level": {"id": lvl.get("id"), "is_active": bool(lvl.get("isActive")),
+                                          **_quantities(lvl)}}
+
+
+def deny_tracked_inputs(variants: List[Dict[str, Any]], **extra: Any) -> List[Dict[str, Any]]:
+    """``ProductVariantsBulkInput`` rows making every variant DENY + tracked
+    (rule 7), with optional extra fields (``price``, ``compareAtPrice``)."""
+    return [
+        {"id": v["id"], "inventoryPolicy": "DENY", "inventoryItem": {"tracked": True}, **extra}
+        for v in variants
+    ]
 
 
 # =============================================================================
@@ -624,13 +641,17 @@ query($id: ID!, $variantsFirst: Int!, $levelsFirst: Int!, $variantsAfter: String
         nodes {
           id
           sku
+          title
           inventoryPolicy
           selectedOptions { name value }
           inventoryItem {
             id
-            inventoryLevels(first: $levelsFirst) {
+            tracked
+            inventoryLevels(first: $levelsFirst, includeInactive: true) {
               pageInfo { hasNextPage endCursor }
               nodes {
+                id
+                isActive
                 location { id name }
                 quantities(names: ["available", "committed", "on_hand"]) { name quantity }
               }
@@ -649,8 +670,9 @@ def _parse_inventory_levels(inventory_levels: Dict[str, Any]) -> List[Dict[str, 
     Only locations Shopify actually returned are present in the output — a
     location that is NOT in the list means the level is ABSENT (never stocked),
     which the caller must treat as UNKNOWN, never as ``0``. A location present
-    with ``available: 0`` is a genuine known-zero. That distinction (node
-    presence vs quantity value) is the whole point of this read.
+    with ``available: 0`` is a genuine known-zero. Inactive levels are returned
+    too (``includeInactive: true``, F7 E15: an inactive level may hold units,
+    and its units count) with ``is_active`` False.
 
     Each quantity name (``available``/``committed``/``on_hand``) is looked up by
     name; a missing name maps to ``None`` (UNKNOWN for that metric) rather than
@@ -662,6 +684,8 @@ def _parse_inventory_levels(inventory_levels: Dict[str, Any]) -> List[Dict[str, 
         qmap = {q["name"]: q["quantity"] for q in (lvl.get("quantities") or [])}
         levels.append(
             {
+                "level_id": lvl.get("id"),
+                "is_active": lvl.get("isActive", True) is not False,
                 "location_id": loc.get("id"),
                 "location_name": loc.get("name"),
                 "available": qmap.get("available"),
@@ -675,18 +699,21 @@ def _parse_inventory_levels(inventory_levels: Dict[str, Any]) -> List[Dict[str, 
 def read_variant_inventory(
     transport: ShopifyTransport, product_gid: str
 ) -> List[Dict[str, Any]]:
-    """Read per-variant inventory for a product: policy + per-location quantities.
+    """Read per-variant inventory for a product: policy, tracking + per-location quantities.
 
     Returns one dict per variant::
 
         {
           "id": <variant GID>,
-          "sku": <variant sku>,                     # fix5: secondary cross-check key
+          "sku": <variant sku>,                     # secondary cross-check key
+          "title": <variant title>,                 # F7 §3.2: the exact-size match key
           "inventoryPolicy": "DENY" | "CONTINUE",   # on the VARIANT (not the item)
           "selectedOptions": [{"name","value"}, ...],
           "inventoryItemId": <inventory item GID>,
-          "levels": [                               # only locations Shopify returned
-            {"location_id","location_name","available","committed","on_hand"}, ...
+          "tracked": bool | None,                   # rule 7: DENY + tracked
+          "levels": [                               # every level Shopify returned,
+            {"level_id","is_active","location_id",  #   inactive ones included
+             "location_name","available","committed","on_hand"}, ...
           ],
           "levels_truncated": bool,                 # True => inventory is UNKNOWN
         }
@@ -695,20 +722,13 @@ def read_variant_inventory(
 
     * **quantity 0 vs level ABSENT**: a location present in ``levels`` with
       ``available == 0`` is a known zero; a location NOT in ``levels`` is an
-      absent level and MUST be treated as UNKNOWN (never summed as 0). This op
-      never fabricates a zero for a missing location — it returns exactly the
-      levels the API reported.
+      absent level and MUST be treated as UNKNOWN (never summed as 0).
     * **truncation cap-guard**: ``levels`` is capped at
       ``INVENTORY_LEVELS_PAGE_SIZE`` (10). ``levels_truncated`` reflects the
-      authoritative ``inventoryLevels.pageInfo.hasNextPage`` — when True the
-      level set is incomplete, so ANY per-location conclusion is UNKNOWN. We do
-      NOT use ``len(nodes) == 10`` as the signal: with exactly 10 locations that
-      is a false positive (hasNextPage would be False = complete).
+      authoritative ``inventoryLevels.pageInfo.hasNextPage``.
 
-    Variants are paginated (walks ``variants.pageInfo``) for forward-safety even
-    though shoe size-ladders stay well under one page. ``inventoryPolicy`` is a
-    ``ProductVariant`` field (``InventoryItem`` has none). Product-not-found
-    (null ``node``) raises, matching :func:`get_product_variants`.
+    Variants are paginated. Product-not-found (null ``node``) raises
+    :class:`ProductNotFound` — a definitive null (terminal path (ii) reads it).
     """
     variants_out: List[Dict[str, Any]] = []
     after: Optional[str] = None
@@ -724,7 +744,7 @@ def read_variant_inventory(
         )
         node = data.get("node")
         if node is None:
-            raise RuntimeError(f"Product not found for GID: {product_gid}")
+            raise ProductNotFound(product_gid)
         conn = node["variants"]
         for vn in conn["nodes"]:
             inv_item = vn.get("inventoryItem") or {}
@@ -734,9 +754,11 @@ def read_variant_inventory(
                 {
                     "id": vn["id"],
                     "sku": vn.get("sku"),
+                    "title": vn.get("title"),
                     "inventoryPolicy": vn.get("inventoryPolicy"),
                     "selectedOptions": vn.get("selectedOptions") or [],
                     "inventoryItemId": inv_item.get("id"),
+                    "tracked": inv_item.get("tracked"),
                     "levels": _parse_inventory_levels(inv_levels),
                     "levels_truncated": bool(page.get("hasNextPage")),
                 }
@@ -857,8 +879,8 @@ def product_publish(
 # -----------------------------------------------------------------------------
 
 _PRODUCT_UPDATE_STATUS = """
-mutation($input: ProductInput!) {
-  productUpdate(input: $input) {
+mutation($product: ProductUpdateInput!) {
+  productUpdate(product: $product) {
     product { id status }
     userErrors { field message }
   }
@@ -870,15 +892,14 @@ def product_update_status(
 ) -> Dict[str, Any]:
     """Set a product's status ("DRAFT"/"ACTIVE"/"ARCHIVED") via ``productUpdate``.
 
-    The outlet lifecycle keeps a freshly duplicated product in DRAFT for the
-    whole anti-phantom-stock finalization and flips it to ACTIVE as the LAST
-    mutation before publish (legacy ``update_product_basic`` did the status flip
-    too early — sync.py:742 — which this orchestration deliberately defers).
-    ``status`` is a ``ProductStatus`` enum value passed as a string. fix3:
-    non-empty ``userErrors`` RAISE.
+    Uses the ``product: ProductUpdateInput`` argument — ``input`` is deprecated at
+    the pin (``2026-10`` mutations/productUpdate.md, Arguments). The outlet
+    lifecycle keeps a freshly duplicated product in DRAFT for the whole
+    anti-phantom-stock finalization and flips it to ACTIVE as the LAST mutation
+    before publish. fix3: non-empty ``userErrors`` RAISE.
     """
     data = transport.graphql(
-        _PRODUCT_UPDATE_STATUS, {"input": {"id": product_gid, "status": status}}
+        _PRODUCT_UPDATE_STATUS, {"product": {"id": product_gid, "status": status}}
     )
     return _check_user_errors(data, "productUpdate")
 
@@ -952,10 +973,30 @@ query($id: ID!, $collFirst: Int!, $collAfter: String) {
     tags
     collections(first: $collFirst, after: $collAfter) {
       pageInfo { hasNextPage endCursor }
-      nodes { id title handle ruleSet { appliedDisjunctively } }
+      nodes {
+        id
+        title
+        handle
+        sources {
+          __typename
+          ... on CollectionConditionsSource { inclusion { conditions { __typename } } }
+        }
+      }
     }
   }
 }"""
+
+
+def _is_smart(sources: List[Dict[str, Any]]) -> bool:
+    """Rule-based membership: a sub-collections source, or a conditions source
+    with inclusion conditions (manual selections alone are not rules)."""
+    for s in sources or []:
+        kind = s.get("__typename")
+        if kind == "CollectionSubCollectionsSource":
+            return True
+        if kind == "CollectionConditionsSource" and ((s.get("inclusion") or {}).get("conditions") or []):
+            return True
+    return False
 
 
 def get_product_core(transport: ShopifyTransport, product_gid: str) -> Dict[str, Any]:
@@ -968,15 +1009,16 @@ def get_product_core(transport: ShopifyTransport, product_gid: str) -> Dict[str,
           "status": "ACTIVE"|"DRAFT"|"ARCHIVED"|None,
           "tags": [str, ...],
           "collections": [
-            {"id","title","handle","smart": bool}, ...   # smart == has a ruleSet
+            {"id","title","handle","smart": bool}, ...
           ],
         }
 
-    ``smart`` distinguishes rule-based (SMART) collections — OUTLET/SALDI re-attach
-    themselves once tag/price are recreated — from MANUAL ones (the only memberships
-    a rebuild must re-assign by hand); it is derived from ``ruleSet`` being non-null.
-    ``collections`` is paginated (``pageInfo``/``endCursor``) for completeness. A
-    null ``product`` (not found) RAISES, matching the other read ops.
+    ``smart`` distinguishes rule-based collections — OUTLET/SALDI re-attach
+    themselves once tag/price are recreated — from MANUAL ones. It is read from
+    ``Collection.sources`` (``ruleSet`` is deprecated at the pin; collections
+    using the new source model are filtered out of pre-2026-07 versions —
+    shopify.dev changelog "New Collection model and APIs now available",
+    2026-06-17). A null ``product`` (not found) raises :class:`ProductNotFound`.
     """
     collections: List[Dict[str, Any]] = []
     core: Optional[Dict[str, Any]] = None
@@ -992,7 +1034,7 @@ def get_product_core(transport: ShopifyTransport, product_gid: str) -> Dict[str,
         )
         product = data.get("product")
         if product is None:
-            raise RuntimeError(f"Product not found for GID: {product_gid}")
+            raise ProductNotFound(product_gid)
         if core is None:
             core = {
                 "id": product["id"],
@@ -1008,7 +1050,7 @@ def get_product_core(transport: ShopifyTransport, product_gid: str) -> Dict[str,
                     "id": n["id"],
                     "title": n.get("title"),
                     "handle": n.get("handle"),
-                    "smart": n.get("ruleSet") is not None,
+                    "smart": _is_smart(n.get("sources") or []),
                 }
             )
         page = conn["pageInfo"]

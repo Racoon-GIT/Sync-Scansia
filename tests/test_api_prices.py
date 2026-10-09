@@ -4,14 +4,14 @@ WORKER tier (fastapi import only): the aggregate ``prices_plan_hash`` (order
 independence + drift sensitivity). TestClient tier (``importorskip`` fastapi+httpx;
 runs on CI/deploy): the price routes end-to-end with Basic Auth, the REAL HMAC
 confirm-token, and ``pricing_service`` mocked so nothing touches Shopify or the
-sheet. Every apply asserts ``prices_apply`` is reached ONLY when the token verifies
-AND the live re-preview matches (no drift).
+register. Every apply asserts ``prices_apply`` is reached ONLY when the token verifies
+AND the live re-preview matches (no drift). The last tests run the REAL service on
+the in-memory register and the fake Shopify through HTTP (preview → apply → revert).
 """
 from __future__ import annotations
 
 import base64
-from types import SimpleNamespace
-from typing import Any, List, Optional
+from typing import Any, List
 
 import pytest
 
@@ -31,9 +31,15 @@ _SECRET = "unit-test-signing-secret"
 # ---------------------------------------------------------------------------
 # Fakes + builders
 # ---------------------------------------------------------------------------
-class FakeSheet:
-    def __init__(self) -> None:
-        self.ws = SimpleNamespace(spreadsheet=SimpleNamespace())
+class FakeRegister:
+    """What the mocked service receives: a handle the job closes."""
+
+    def __init__(self, actor: str = "") -> None:
+        self.actor = actor
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeTransport:
@@ -43,9 +49,9 @@ class FakeTransport:
 def _diff(sku: str = "SKU1", plan_hash: str = "d1", *, actionable: bool = True) -> PriceDiff:
     return PriceDiff(
         sku=sku, product_gid="gid://shopify/Product/1", status="OK", actionable=actionable,
-        price="50.00", compare_at="100.00", percent=0.5, sheet_price="50.00", sheet_changed=False,
-        live_price="60.00", live_compare_at="100.00", live_changed=True, live_status="ACTIVE",
-        row_uuids=("u1",), warnings=(), plan_hash=plan_hash,
+        price="50.00", compare_at="100.00", discount="50.00", percent=0.5, register_price="50.00",
+        register_changed=False, live_price="60.00", live_compare_at="100.00", live_changed=True,
+        live_status="ACTIVE", pair_ids=(1,), warnings=(), plan_hash=plan_hash,
     )
 
 
@@ -78,20 +84,28 @@ class _MockPricingService:
         self.apply_calls = 0
         self.revert_calls = 0
         self.debt_calls = 0
+        self.registers: List[Any] = []
+        self.sinks: List[Any] = []
 
-    def prices_preview(self, sheet: Any, transport: Any, mode: str, params: Any,
-                       *, row_override: bool = False, status_override: bool = False) -> PricePlan:
+    def prices_preview(self, register: Any, transport: Any, mode: str, params: Any,
+                       *, status_override: bool = False) -> PricePlan:
         self.preview_calls += 1
+        self.registers.append(register)
         return self.plan
 
-    def prices_apply(self, sheet: Any, transport: Any, mode: str, params: Any,
+    def prices_apply(self, register: Any, transport: Any, mode: str, params: Any,
                      approved_plan: Any, audit_sink: Any,
-                     *, row_override: bool = False, status_override: bool = False) -> PriceApplyReport:
+                     *, promo_location_id: str, status_override: bool = False) -> PriceApplyReport:
         self.apply_calls += 1
+        self.registers.append(register)
+        self.sinks.append(audit_sink)
         return self.apply_report
 
-    def revert_prices(self, transport: Any, audit_sink: Any, intent_id: str) -> RevertReport:
+    def revert_prices(self, register: Any, transport: Any, audit_sink: Any, intent_id: str,
+                      *, promo_location_id: str) -> RevertReport:
         self.revert_calls += 1
+        self.registers.append(register)
+        self.sinks.append(audit_sink)
         return self.revert_report
 
     def discharge_debt_count(self, transport: Any, *, collection_gid: str = "") -> DebtReport:
@@ -140,14 +154,13 @@ def _make_client(monkeypatch, svc: _MockPricingService):
     for name in ("prices_preview", "prices_apply", "revert_prices", "discharge_debt_count"):
         monkeypatch.setattr(pricing_service, name, getattr(svc, name))
 
-    cfg = ShopifyConfig("t.myshopify.com", "shpat_x", "2025-07", PROMO)
+    cfg = ShopifyConfig("t.myshopify.com", "shpat_x", "2026-10", PROMO)
     from backend.api.jobs import SynchronousExecutor
 
     app = create_app(
         config=cfg,
-        sheet_factory=lambda: FakeSheet(),
+        register_factory=lambda actor="": FakeRegister(actor),
         transport_factory=lambda: FakeTransport(),
-        audit_factory=lambda: None,
         executor=SynchronousExecutor(),
         promo_location_id=PROMO,
     )
@@ -189,6 +202,11 @@ def test_prices_apply_valid_token_no_drift_executes(monkeypatch):
     assert out["report"]["intent_id"] == "intent-1"
     assert out["report"]["outcomes"][0]["status"] == "APPLIED"
     assert svc.apply_calls == 1
+    # the apply's register is bound to the acting user, its sink too; the job closed it
+    reg = svc.registers[-1]
+    assert reg.actor == "racoon" and reg.closed
+    from backend.persistence.audit_sink import RegisterAuditSink
+    assert isinstance(svc.sinks[-1], RegisterAuditSink)
 
 
 def test_prices_apply_bad_token_is_409_and_skips_apply(monkeypatch):
@@ -257,6 +275,7 @@ def test_prices_revert_confirm_gated_happy(monkeypatch):
     assert out["reverted_products"] == 1 and out["reverted_variants"] == 2
     assert out["outcomes"][0]["status"] == "REVERTED"
     assert svc.revert_calls == 1
+    assert svc.registers[-1].actor == "racoon" and svc.registers[-1].closed
 
 
 def test_prices_discharge_debt_is_readonly_job(monkeypatch):
@@ -296,3 +315,72 @@ def test_prices_routes_require_auth(monkeypatch, method, path, body):
     r = getattr(client, method)(path, **kwargs)
     assert r.status_code == 401
     assert "www-authenticate" in {k.lower() for k in r.headers}
+
+
+# ===========================================================================
+# The REAL service through HTTP: the in-memory register, the fake Shopify
+# ===========================================================================
+def _real_client(monkeypatch):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from decimal import Decimal
+
+    from fastapi.testclient import TestClient
+
+    from backend.api.jobs import SynchronousExecutor
+    from backend.app import create_app
+    from backend.config import ShopifyConfig
+    from backend.services import flows
+
+    from tests.fake_shop import PROMO as SHOP_PROMO
+    from tests.fake_shop import FakeShop
+    from tests.register_fixtures import MemoryBackend
+
+    monkeypatch.delenv("APP_USERNAME", raising=False)
+    monkeypatch.setenv("APP_PASSWORD", "s3cret-pw")
+    monkeypatch.setenv("TOKEN_SIGNING_SECRET", _SECRET)
+    be, shop = MemoryBackend(), FakeShop()
+    be.seed_baseline()
+    out = shop.product("SKU1 - Outlet", sku="SKU1", sizes=("42",))
+    out.variants[0].price, out.variants[0].compare_at = "90.00", "100.00"
+    pid, _e = be.add_shelf_pair("SKU1", "42", reconciled=True, price_high=Decimal("100.00"),
+                                outlet_product_id=flows.product_number(out.gid))
+    app = create_app(config=ShopifyConfig("t.myshopify.com", "shpat_x", "2026-10", SHOP_PROMO),
+                     register_factory=lambda **kw: be.register(**kw),
+                     transport_factory=lambda: shop,
+                     executor=SynchronousExecutor(), promo_location_id=SHOP_PROMO)
+    return TestClient(app), be, shop, out, pid
+
+
+def test_prices_end_to_end_on_the_register_preview_apply_revert(monkeypatch):
+    from decimal import Decimal
+
+    client, be, shop, out, pid = _real_client(monkeypatch)
+    body = {"mode": "percent", "params": {"percent_by_sku": {"SKU1": 0.3}}}
+    sub = client.post("/prices/preview", headers=_auth(), json=body)
+    res = client.get(f"/prices/preview/{sub.json()['job_id']}", headers=_auth()).json()["result"]
+    (d,) = res["plan"]["diffs"]
+    assert (d["price"], d["discount"], d["register_price"], d["live_price"]) == ("70.00", "30.00", None, "90.00")
+    ap = client.post("/prices/apply", headers=_auth(),
+                     json={**body, "plan_hash": res["plan_hash"], "confirm_token": res["confirm_token"]})
+    out_job = client.get(f"/prices/apply/{ap.json()['job_id']}", headers=_auth()).json()["result"]
+    assert out_job["status"] == "APPLIED", out_job
+    report = out_job["report"]
+    assert report["outcomes"][0]["status"] == "APPLIED" and len(report["intent_id"]) == 32
+    (p,) = be.register().pairs(pair_ids=[pid])
+    assert p.price_outlet == Decimal("70.00") and shop.products[out.gid].variants[0].price == "70.00"
+    rows = be.register().audit_rows("PRICE")
+    assert {r.actor for r in rows} == {"racoon"}                 # every audit row names the acting user
+    rv = client.post("/prices/revert", headers=_auth(), json={"intent_id": report["intent_id"], "confirm": "CONFERMO"})
+    rres = client.get(f"/prices/revert/{rv.json()['job_id']}", headers=_auth()).json()["result"]
+    assert rres["outcomes"][0]["status"] == "REVERTED" and rres["reverted_pairs"] == 1
+    (p,) = be.register().pairs(pair_ids=[pid])
+    assert p.price_outlet is None and shop.products[out.gid].variants[0].price == "90.00"
+    assert be.register().lease_state().holder is None
+
+
+def test_prices_revert_of_an_unknown_intent_fails_the_job_with_a_stable_code(monkeypatch):
+    client, *_ = _real_client(monkeypatch)
+    rv = client.post("/prices/revert", headers=_auth(), json={"intent_id": "0" * 32, "confirm": "CONFERMO"})
+    rec = client.get(f"/prices/revert/{rv.json()['job_id']}", headers=_auth()).json()
+    assert rec["status"] == "failed" and rec["error_code"] == "intent_not_found"

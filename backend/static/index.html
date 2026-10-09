@@ -22,72 +22,127 @@
 
   <!-- ============================== INIT (first-run banner) ============================== -->
   <section id="init-banner" class="plan-panel hidden">
-    <h3>Inizializza — prima configurazione</h3>
+    <h3>Inizializza — allineamento iniziale (una volta sola)</h3>
     <p class="warning-banner">
-      Operazione una tantum: allinea il foglio a Shopify (righe "online" non più
-      vendibili vengono spuntate e i relativi prodotti passati in bozza). Da
-      eseguire UNA VOLTA prima di usare il resto dello strumento.
+      Operazione una tantum, dopo il controllo fisico: per ogni chiave (SKU, taglia) porta lo stock Promo
+      dell'outlet al numero di paia in scansia, oppure la trattiene se non è determinabile. Prima del calcolo
+      fai leggere a Claude <code>/dlqs</code> di 678434: nessuna voce irrisolta e nessuna esecuzione in corso.
     </p>
     <div class="toolbar">
       <button id="btn-init-preview">Calcola piano di inizializzazione</button>
       <span id="init-status" class="status-text"></span>
     </div>
     <div id="init-plan-panel" class="plan-panel hidden">
-      <p>Righe da timbrare (backfill): <strong id="init-backfill-count"></strong></p>
+      <p id="init-counts"></p>
       <div id="init-anomalies" class="anomalies"></div>
 
-      <h4>kept-online</h4>
-      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>Target</th></tr></thead>
-        <tbody id="init-kept-online-tbody"></tbody></table>
+      <h4>Chiavi allineate a N (outlet attivo con la taglia)</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>N</th><th>Δ Promo</th><th>Attivazione</th></tr></thead>
+        <tbody id="init-level-tbody"></tbody></table>
 
-      <h4>demote:missing</h4>
-      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th></tr></thead>
-        <tbody id="init-demote-missing-tbody"></tbody></table>
+      <h4>Outlet in bozza: unità azzerate, il pubblica le ripristina</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>N</th><th>Δ Promo</th></tr></thead>
+        <tbody id="init-zero-tbody"></tbody></table>
 
-      <h4>demote:draft</h4>
-      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>Target</th><th>Stato live</th></tr></thead>
-        <tbody id="init-demote-draft-tbody"></tbody></table>
+      <h4>Outlet in bozza già a N: nessuna scrittura, si espongono con un riallineamento della chiave</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>N</th></tr></thead>
+        <tbody id="init-parked-tbody"></tbody></table>
 
-      <h4>demote:sold-out-size</h4>
-      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>Target</th></tr></thead>
-        <tbody id="init-demote-soldout-tbody"></tbody></table>
+      <h4>Senza outlet: le crea il pubblica</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>N</th></tr></thead>
+        <tbody id="init-none-tbody"></tbody></table>
 
-      <h4>review:multi-match</h4>
-      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th></tr></thead>
-        <tbody id="init-review-tbody"></tbody></table>
+      <h4>Unità senza paio in scansia: portate a 0</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>Δ Promo</th></tr></thead>
+        <tbody id="init-lower-tbody"></tbody></table>
+
+      <h4>Chiavi trattenute (si sbloccano con un riallineamento della chiave)</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>N</th><th>Motivo</th><th>Gemelle</th><th>Δ Promo</th></tr></thead>
+        <tbody id="init-hold-tbody"></tbody></table>
+
+      <h4>Varianti da normalizzare (DENY + tracciata) e personalizzazioni a 0</h4>
+      <table class="data-table"><thead><tr><th>Prodotto</th><th>Titolo</th><th>Stato</th><th>Varianti</th><th>Personalizzazioni</th></tr></thead>
+        <tbody id="init-products-tbody"></tbody></table>
+
+      <h4>Prezzo outlet dal foglio (colonna J)</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Esito</th><th>Prezzo</th><th>Valori letti</th></tr></thead>
+        <tbody id="init-prices-tbody"></tbody></table>
+
+      <h4>Discrepanze "online" (solo elenco)</h4>
+      <table class="data-table"><thead><tr><th>Paio</th><th>SKU</th><th>Taglia</th><th>Classe</th></tr></thead>
+        <tbody id="init-partb-tbody"></tbody></table>
+
+      <h4>Note di catalogo (una persona)</h4>
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>Nota</th><th>Gemelle</th></tr></thead>
+        <tbody id="init-catalogue-tbody"></tbody></table>
 
       <div class="gesture-panel">
-        <p class="warning-banner">Gesto umano richiesto: digita <code>CONFERMO</code> per applicare.</p>
+        <p class="warning-banner">Gesto umano richiesto: istante della lettura <code>/dlqs</code>, voci irrisolte (deve essere 0) e <code>CONFERMO</code>.</p>
+        <label>Lettura /dlqs alle <input type="datetime-local" id="init-dlq-at" step="1"></label>
+        <label>Voci irrisolte (dlqCount) <input type="number" id="init-dlq-count" min="0" step="1"></label>
         <label>Digita CONFERMO <input type="text" id="init-confirm-word"></label>
-        <label id="init-second-confirm-row" class="hidden">
-          <input type="checkbox" id="init-second-confirm"> Confermo di aver rivisto il numero elevato di demote (second_confirm)
-        </label>
         <button id="btn-init-apply" class="btn-danger">Applica inizializzazione</button>
         <span id="init-apply-status" class="status-text"></span>
       </div>
     </div>
     <div id="init-outcome-panel" class="plan-panel hidden">
       <h4>Esito</h4>
+      <p id="init-outcome-summary"></p>
       <table class="data-table">
-        <thead><tr><th>SKU</th><th>Taglia</th><th>Bucket</th><th>Stato</th><th>Target</th><th>Warning</th></tr></thead>
+        <thead><tr><th>SKU</th><th>Taglia</th><th>Azione</th><th>Esito</th><th>Motivo</th></tr></thead>
         <tbody id="init-outcome-tbody"></tbody>
       </table>
+    </div>
+  </section>
+
+  <!-- ============================== RE-LEVEL (per key) ============================== -->
+  <section id="relevel-panel" class="plan-panel">
+    <h3>Riallineamento per chiave</h3>
+    <p class="warning-banner">
+      Rilascia una chiave trattenuta — o riallinea una chiave non trattenuta — portando lo stock Promo
+      al numero di paia in scansia. Stessa precondizione dell'inizializzazione: lettura <code>/dlqs</code>
+      di 678434 senza voci irrisolte.
+    </p>
+    <div class="toolbar">
+      <button id="btn-relevel-held">Elenca chiavi trattenute</button>
+      <label>SKU <input type="text" id="relevel-sku"></label>
+      <label>Taglia <input type="text" id="relevel-size"></label>
+      <button id="btn-relevel-add">Aggiungi chiave</button>
+      <span id="relevel-status" class="status-text"></span>
+    </div>
+    <table class="data-table"><thead><tr><th></th><th>SKU</th><th>Taglia</th><th>Tipi</th><th>Motivi</th><th>Eventi</th></tr></thead>
+      <tbody id="relevel-held-tbody"></tbody></table>
+    <div class="toolbar"><button id="btn-relevel-preview">Calcola riallineamento</button></div>
+    <div id="relevel-plan-panel" class="plan-panel hidden">
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>N</th><th>Ramo</th><th>Motivo</th><th>Δ Promo</th><th>Trattenuta da</th></tr></thead>
+        <tbody id="relevel-plan-tbody"></tbody></table>
+      <div class="gesture-panel">
+        <label>Lettura /dlqs alle <input type="datetime-local" id="relevel-dlq-at" step="1"></label>
+        <label>Voci irrisolte (dlqCount) <input type="number" id="relevel-dlq-count" min="0" step="1"></label>
+        <label>Digita CONFERMO <input type="text" id="relevel-confirm-word"></label>
+        <button id="btn-relevel-apply" class="btn-danger">Applica riallineamento</button>
+        <span id="relevel-apply-status" class="status-text"></span>
+      </div>
+    </div>
+    <div id="relevel-outcome-panel" class="plan-panel hidden">
+      <table class="data-table"><thead><tr><th>SKU</th><th>Taglia</th><th>Ramo</th><th>Esito</th><th>Motivo</th></tr></thead>
+        <tbody id="relevel-outcome-tbody"></tbody></table>
     </div>
   </section>
 
   <!-- ============================== SCANSIA ============================== -->
   <section id="tab-scansia" class="tab-panel active">
     <div class="toolbar">
-      <button id="btn-scansia-refresh">Aggiorna righe</button>
+      <button id="btn-scansia-refresh">Aggiorna scaffale</button>
       <button id="btn-inventory-run">Aggiorna inventario (join live)</button>
       <span id="inventory-status" class="status-text"></span>
     </div>
     <table class="data-table" id="scansia-table">
       <thead>
         <tr>
-          <th>SKU</th><th>Taglia</th><th>Qta</th><th>Online</th>
-          <th>Prezzo High</th><th>Prezzo Outlet</th><th>Sconto</th>
-          <th>Riconciliata</th><th>Anomalie</th><th>Inventario live</th>
+          <th>Paio</th><th>SKU</th><th>Taglia</th><th>Online</th>
+          <th>Compare-at</th><th>Prezzo Outlet</th><th>Sconto %</th>
+          <th>Outlet</th><th>Taglia su Shopify</th><th>Inventario live</th>
         </tr>
       </thead>
       <tbody id="scansia-tbody"></tbody>
@@ -135,8 +190,7 @@
             <option value="bulk">bulk — regole + override</option>
           </select>
         </label>
-        <label><input type="checkbox" id="prices-row-override"> row_override</label>
-        <label><input type="checkbox" id="prices-status-override"> status_override</label>
+        <label><input type="checkbox" id="prices-status-override"> anche outlet in bozza (status_override)</label>
       </div>
 
       <div class="form-row mode-percent">
@@ -171,8 +225,8 @@
       <div id="prices-anomalies" class="anomalies"></div>
       <table class="data-table">
         <thead>
-          <tr><th>SKU</th><th>Stato</th><th>Azionabile</th><th>Prezzo</th><th>Compare-at</th>
-              <th>Prezzo sheet</th><th>Prezzo live</th><th>Warning</th></tr>
+          <tr><th>SKU</th><th>Stato</th><th>Azionabile</th><th>Prezzo</th><th>Compare-at</th><th>Sconto %</th>
+              <th>Prezzo registro</th><th>Prezzo live</th><th>Warning</th></tr>
         </thead>
         <tbody id="prices-plan-tbody"></tbody>
       </table>
@@ -195,7 +249,7 @@
     <div class="form-panel">
       <h3>Revert prezzi</h3>
       <div class="form-row">
-        <label>Intent ID <input type="text" id="revert-intent-id" placeholder="intent id da /audit"></label>
+        <label>Intent ID <input type="text" id="revert-intent-id" placeholder="intent_id dall'esito dell'applicazione"></label>
         <label>Digita CONFERMO <input type="text" id="revert-confirm-word"></label>
         <button id="btn-prices-revert">Revert</button>
         <span id="revert-status" class="status-text"></span>
@@ -256,6 +310,11 @@
           <thead><tr><th>Product</th><th>Titolo</th><th>Stato</th><th>Motivi</th></tr></thead>
           <tbody id="cleanup-review-tbody"></tbody>
         </table>
+        <h4>Protetti (paia in scansia: mai eliminati)</h4>
+        <table class="data-table">
+          <thead><tr><th>Product</th><th>Titolo</th><th>Stato</th><th>Motivi</th></tr></thead>
+          <tbody id="cleanup-protected-tbody"></tbody>
+        </table>
         <div class="gesture-panel">
           <p class="warning-banner">Gesto umano richiesto: digita <code>CONFERMO</code> e ridigita il numero esatto di candidati mostrato sopra.</p>
           <label>Digita CONFERMO <input type="text" id="cleanup-confirm-word"></label>
@@ -270,7 +329,7 @@
       <div id="cleanup-outcome-panel" class="plan-panel hidden">
         <h4>Esito cleanup</h4>
         <table class="data-table">
-          <thead><tr><th>Product</th><th>Stato</th><th>Deleted ID</th><th>Warning</th></tr></thead>
+          <thead><tr><th>Product</th><th>Stato</th><th>Deleted ID</th><th>Warning</th><th>Righe chiuse</th></tr></thead>
           <tbody id="cleanup-outcome-tbody"></tbody>
         </table>
       </div>
@@ -280,12 +339,124 @@
 
     <div class="form-panel danger-zone">
       <h3>Delete singolo prodotto — AZIONE IRREVERSIBILE</h3>
-      <p class="warning-banner">Da usare solo per una CREATE fallita/duplicata. Il target deve risolvere a un prodotto outlet.</p>
+      <p class="warning-banner">Da usare solo per una CREATE fallita/duplicata. Il target deve risolvere a un prodotto outlet. Due passi: anteprima, poi conferma.</p>
       <div class="form-row">
         <label>Product GID <input type="text" id="single-delete-gid" placeholder="gid://shopify/Product/123"></label>
-        <label>Digita CONFERMO <input type="text" id="single-delete-confirm-word"></label>
-        <button id="btn-single-delete" class="btn-danger">Elimina definitivamente (1 prodotto)</button>
-        <span id="single-delete-status" class="status-text"></span>
+        <button id="btn-single-delete-preview">Anteprima delete</button>
+        <span id="single-delete-preview-status" class="status-text"></span>
+      </div>
+      <div id="single-delete-plan-panel" class="plan-panel hidden">
+        <p>Prodotto: <strong id="single-delete-title"></strong> — stato <span id="single-delete-state"></span></p>
+        <p>SKU: <span id="single-delete-skus"></span></p>
+        <p id="single-delete-keys"></p>
+        <p>Paia in scansia (id): <span id="single-delete-shelf"></span></p>
+        <p>Righe RECONCILE aperte (id): <span id="single-delete-open-rows"></span></p>
+        <div class="gesture-panel">
+          <label>Digita CONFERMO <input type="text" id="single-delete-confirm-word"></label>
+          <button id="btn-single-delete" class="btn-danger">Elimina definitivamente (1 prodotto)</button>
+          <span id="single-delete-status" class="status-text"></span>
+        </div>
+      </div>
+    </div>
+
+    <hr>
+
+    <div class="form-panel danger-zone">
+      <h3>Uscita multi-outlet — AZIONE IRREVERSIBILE</h3>
+      <p class="warning-banner">Per uno SKU con più outlet: azzera lo stock Promo degli altri outlet e li elimina, tenendo solo quello indicato. Due passi: anteprima, poi conferma.</p>
+      <div class="form-row">
+        <label>SKU <input type="text" id="exit-sku"></label>
+        <label>GID outlet da tenere <input type="text" id="exit-keep-gid" placeholder="gid://shopify/Product/123"></label>
+        <button id="btn-exit-preview">Anteprima uscita</button>
+        <span id="exit-preview-status" class="status-text"></span>
+      </div>
+      <div id="exit-plan-panel" class="plan-panel hidden">
+        <p>Outlet da tenere: <strong id="exit-keep-title"></strong></p>
+        <table class="data-table">
+          <thead><tr><th>Product</th><th>Titolo</th><th>Stato</th><th>Da azzerare</th><th>Rifiuti predicato</th></tr></thead>
+          <tbody id="exit-outlets-tbody"></tbody>
+        </table>
+        <p id="exit-keys"></p>
+        <div class="gesture-panel">
+          <label>Digita CONFERMO <input type="text" id="exit-confirm-word"></label>
+          <button id="btn-exit-apply" class="btn-danger">Esegui uscita</button>
+          <span id="exit-apply-status" class="status-text"></span>
+        </div>
+      </div>
+      <div id="exit-outcome-panel" class="plan-panel hidden">
+        <h4>Esito uscita</h4>
+        <p id="exit-outcome-summary"></p>
+        <table class="data-table">
+          <thead><tr><th>Product</th><th>Stato</th><th>Warning</th><th>Righe azzerate</th><th>Righe chiuse</th></tr></thead>
+          <tbody id="exit-outcome-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <hr>
+
+    <div class="form-panel">
+      <h3>Normalizzazione DENY + tracked (regola 7)</h3>
+      <p class="warning-banner">Porta ogni variante degli outlet a DENY + tracciata e azzera le personalizzazioni con stock Promo. Due passi: anteprima, poi conferma.</p>
+      <div class="form-row">
+        <label>GID prodotti (uno per riga; vuoto = tutti gli outlet)
+          <textarea id="normalize-gids" rows="4" placeholder="gid://shopify/Product/123"></textarea>
+        </label>
+        <button id="btn-normalize-preview">Anteprima</button>
+        <span id="normalize-preview-status" class="status-text"></span>
+      </div>
+      <div id="normalize-plan-panel" class="plan-panel hidden">
+        <p id="normalize-summary"></p>
+        <table class="data-table">
+          <thead><tr><th>Product</th><th>Titolo</th><th>Stato</th><th>Varianti da correggere</th><th>Personalizzazioni da azzerare</th></tr></thead>
+          <tbody id="normalize-products-tbody"></tbody>
+        </table>
+        <h4>Da rivedere (non pianificati)</h4>
+        <table class="data-table">
+          <thead><tr><th>Product</th><th>Motivo</th></tr></thead>
+          <tbody id="normalize-review-tbody"></tbody>
+        </table>
+        <div class="gesture-panel">
+          <label>Digita CONFERMO <input type="text" id="normalize-confirm-word"></label>
+          <button id="btn-normalize-apply">Applica normalizzazione</button>
+          <span id="normalize-apply-status" class="status-text"></span>
+        </div>
+      </div>
+      <div id="normalize-outcome-panel" class="plan-panel hidden">
+        <h4>Esito normalizzazione</h4>
+        <table class="data-table">
+          <thead><tr><th>Product</th><th>Stato</th><th>Warning</th><th>Righe</th></tr></thead>
+          <tbody id="normalize-outcome-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <hr>
+
+    <div class="form-panel">
+      <h3>Righe RECONCILE aperte</h3>
+      <p class="warning-banner">Una chiusura a mano trattiene le chiavi (HELD) finché un re-level non le rilascia; mai riaggiunge, mai timbra.</p>
+      <div class="toolbar">
+        <button id="btn-reconcile-open">Aggiorna</button>
+        <span id="reconcile-open-status" class="status-text"></span>
+      </div>
+      <table class="data-table">
+        <thead><tr><th>Riga</th><th>Azione</th><th>Scopo</th><th>Stato</th><th>Chiavi</th><th>Prodotto</th><th>Inviata</th><th>Diventerà</th></tr></thead>
+        <tbody id="reconcile-open-tbody"></tbody>
+      </table>
+      <h4>Chiudi a mano una riga</h4>
+      <div class="form-row">
+        <label>ID riga <input type="number" id="close-row-id" min="1" step="1"></label>
+        <label>Stato letto
+          <select id="close-expect-status">
+            <option value="OPEN">OPEN</option>
+            <option value="APPLIED">APPLIED</option>
+          </select>
+        </label>
+        <label>Motivo <input type="text" id="close-why"></label>
+        <label>Digita CONFERMO <input type="text" id="close-confirm-word"></label>
+        <button id="btn-reconcile-close" class="btn-danger">Chiudi a mano</button>
+        <span id="reconcile-close-status" class="status-text"></span>
       </div>
     </div>
   </section>

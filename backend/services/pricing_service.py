@@ -1,80 +1,63 @@
-"""FIX_PRICES successor — safe price/discount maintenance over the Scansia sheet.
+"""PRICES — one outlet price per SKU, on the register (plan
+``docs/f7-mysql-adapter-plan.md`` §3.5, §3.1 ``set_outlet_price``, §6 B-2 / D20 + D25;
+§3.3 rule 6's lease).
 
-Replaces the legacy ``fix_prices.py`` monolith with a preview/apply split so
-DRY_RUN is fail-closed by construction, composing the same three leaf layers as
-:mod:`backend.services.outlet_service`:
+The register is where an outlet price lives: ``PRICE_OUTLET`` / ``DISCOUNT`` on the
+SKU's ``IN_SCANSIA`` pairs, by PRIMARY KEY, a ``PRICE`` audit row per write (a pair
+already sold keeps the price it was sold at). Shopify follows the register: the push
+refreshes the SKU's outlet — price and compare-at on every variant — when it is
+ACTIVE; a DRAFT outlet takes the register's price at its revive (its tail carries
+it) unless ``status_override`` pushes it now; a SKU with no outlet takes it at its
+CREATE. The publish then reads that one price (``outlet_service.sku_prices``).
 
-* :func:`prices_preview` — READ-ONLY. Reads the sheet with ``assign_uuids=False``
-  (never mutates the Sheet), computes the target ``(price, compareAtPrice)`` per
-  SKU group for the chosen mode, and returns a :class:`PricePlan` of
-  :class:`PriceDiff` (sheet<->live diff, validation, status, warnings). Nothing on
-  Shopify or the Sheet is touched.
-* :func:`prices_apply` — MUTATES (confirm-gated upstream by the APPLY token /
-  the web confirm-nonce). Re-reads with ``assign_uuids=True``, re-plans live
-  (TOCTOU: a drifted target/status -> ``VERIFY_FAILED``), writes the decided
-  price back to the sheet, captures the PRIOR ``price``/``compareAtPrice`` of every
-  impacted variant via the injected :class:`AuditSink` BEFORE any Shopify push,
-  then pushes.
-* :func:`revert_prices` — consumes an ``intent_id`` from the audit sink and
-  re-pushes the captured prior values (the concrete rollback affordance required
-  by the plan, not a snapshot-that-can't-be-invoked).
-* :func:`discharge_debt_count` — READ-ONLY recon: counts live outlets whose
-  variants would fail price validation (``price<=0`` / ``price>=compareAt`` /
-  compareAt missing) — the FIX_PRICES debt the successor must actually close.
+* :func:`prices_preview` — READ-ONLY: per SKU on the shelf, the mode's target price,
+  B-2's compare-at (one per SKU), FIX4, and the register ↔ target ↔ live diff.
+* :func:`prices_apply` — under the pass lease (a decrement-class holder: its
+  recovery and the held-key lowering at the take; released and re-taken between
+  SKUs so a waiting decrement gets in, rule 6). It captures the priors first — one
+  ``PRICE`` intent row keyed by a unique ``INTENT_ID``, the abort gate: nothing is
+  written unless it lands — then, per SKU re-derived live, writes the register and
+  pushes. Only what the approved plan bounds is written (same per-SKU plan hash).
+* :func:`revert_prices` — an intent undone, per SKU, under the lease: the register
+  pairs it wrote go back to the values it replaced (read off its own ``PRICE``
+  rows; a pair whose price moved since leaves the SKU untouched, listed), then the
+  captured Shopify priors are re-pushed. A revert that left the register at the
+  new price would be undone by the next publish, which refreshes every variant from
+  the register.
+* :func:`discharge_debt_count` — READ-ONLY recon of live outlets failing FIX4.
 
-Mapping (authoritative, legacy fix_prices.py §"Prezzi/Sconti" M4):
-``compareAtPrice <- col H (prezzo_high)``; ``price <- col J (prezzo_outlet)``;
-Shopify target ``product_gid <- col Q (product_id)``.
+Modes: **percent** (price = compare-at × (1 − pct), to the cent, half up),
+**direct** (a typed price, or — none typed — the register's own price as it is: a
+repair push; fill-missing stays REFUSED: no price → ``SKIP_MISSING_PRICE``, never a
+default), **bulk** (ordered rules scoped by ``sku`` / ``brand`` / ``product_title``
+— the last matching rule wins; a per-SKU override wins over every rule).
+``DISCOUNT`` is always the discount the written price makes on the compare-at, in
+percent to the cent (what the sheet's K held: J 149 on a compare-at of 189 →
+21.16, §6 B-2's example) — one rule for every mode.
 
-Three modes (plan §Prezzi 1/2/3):
-
-1. **percent** — ``price = round(prezzo_high * (1 - pct), 2)`` per product; the
-   pct and computed price are written to the sheet (``sconto`` + ``prezzo_outlet``).
-2. **direct / repair** — operator-typed ``prezzo_outlet`` (or the sheet value
-   as-is); pushed to Shopify. **fill-missing is REFUSED** (owner decision
-   Q-fixprices): an empty required price -> ``SKIP_MISSING_PRICE``, never
-   cross-filled from the twin column, never defaulted to ``0.00`` (that legacy
-   behaviour re-introduced the zero-price bug it was meant to fix).
-3. **bulk rules** — ordered rules scoped by product attributes; precedence is
-   **per-product override > bulk rule**, and among matching bulk rules the LAST
-   defined wins (overlap tie-break).
-
-Invariants preserved from legacy (SPEC A1/A3/A4/A5):
-
-* **Row-eligibility** — only ``online=SI AND qta>0`` rows (via the canonical
-  ``ScansiaSheet.eligible_rows``), unless an explicit operator ``row_override``.
-* **Q gate (security)** — an empty col Q -> ``SKIP_NO_PRODUCT_ID`` with NO
-  SKU-search fallback (the cardinal fix_prices safety filter).
-* **Status ACTIVE-only** — non-ACTIVE outlets are skipped by default
-  (``SKIP_DRAFT``); ``status_override`` documents the intentional extension.
-* **skip-if-correct** (SPEC B2) — a product whose live variants already carry the
-  target ``(price, compareAt)`` is NOT re-pushed (``SKIP_ALREADY_CORRECT``).
-* **Uniform price** — the same ``(price, compareAtPrice)`` is broadcast to every
-  variant of the product (:func:`ops.product_variants_bulk_update`).
-
-Boundary hygiene mirrors ``outlet_service``: raw ``ShopifyUserError`` /
-``ShopifyTransportError`` / ``GSheetError`` / any unexpected ``RuntimeError`` from
-a read op are caught per-group and translated to a bounded, code-shaped outcome —
-one SKU's failure never aborts the batch.
-
-Status source note: the ACTIVE-only filter reads product status from ONE
-``ops.enumerate_outlet_products`` call (gid->status over the ground-truth OUTLET
-collection) rather than a per-SKU search — cheap, and it applies the status gate
-uniformly to a col-Q GID (closing the legacy D2 gap where the GID branch
-synthesised ``ACTIVE`` and bypassed the filter). Caveat: a col-Q GID that is not
-(yet) a member of the OUTLET collection surfaces as ``SKIP_NOT_FOUND``.
+The push target is the SKU's ``OUTLET_PRODUCT_ID`` — written only for an outlet by
+title AND collection, never a resolver ``review`` match (§3.1) — and it must still
+be a member of the outlet collection: the sheet era's cardinal gate (column Q empty
+→ no push; never a SKU search, which also finds the full-price source sharing the
+SKU, LD21) holds on the register. Two different ids on one SKU's shelf pairs →
+the SKU is listed and blocked.
 """
 from __future__ import annotations
 
 import hashlib
 import logging
+import math
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Protocol, Tuple
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
-from backend.gsheet import GSheetError, ScansiaSheet
-from backend.gsheet.reader import _clean_price
+from backend.persistence.records import KIND_PRICE, AuditRow, LeaseLost, PairRow, StoreError
+from backend.services import flows, passes
+from backend.services.lease import HOLDER_PRICING, LeaseUnavailable, PassLease
+from backend.services.outlet_service import compare_at_of, validate_price
 from backend.shopify import ops
-from backend.shopify.ops import OUTLET_COLLECTION_GID, ShopifyUserError
+from backend.shopify.ops import OUTLET_COLLECTION_GID, ProductNotFound, ShopifyUserError
 from backend.shopify.transport import ShopifyTransportError
 
 logger = logging.getLogger("backend.services.pricing_service")
@@ -85,39 +68,39 @@ MODE_DIRECT = "direct"
 MODE_BULK = "bulk"
 _MODES = frozenset({MODE_PERCENT, MODE_DIRECT, MODE_BULK})
 
-_GID_PREFIX = "gid://shopify/Product/"
 _STATUS_ACTIVE = "ACTIVE"
+# The bulk rules' scope keys: the register columns that describe a model.
+SCOPE_KEYS = frozenset({"sku", "brand", "product_title"})
+PRICING_TAKE_BOUND_S = passes.HOLDER_TAKE_BOUND_S
+# The PRICE rows a pricing apply / revert writes (``Register``'s actions).
+ACTION_SET = "set_outlet_price"
 
-# --- status / reason codes (surfaced on PriceDiff.status / PriceOutcome.status)
-STATUS_OK = "OK"                                # preview: actionable, will apply
-STATUS_APPLIED = "APPLIED"                       # apply: sheet written + pushed
-STATUS_SHEET_UPDATED = "SHEET_UPDATED"           # apply: sheet written, live already correct
-STATUS_ALREADY_CORRECT = "SKIP_ALREADY_CORRECT"  # sheet + live already on target
-STATUS_NO_PRODUCT_ID = "SKIP_NO_PRODUCT_ID"      # col Q empty (security gate)
-STATUS_Q_NOT_GID = "SKIP_Q_NOT_GID"              # col Q present but not a GID (handle-shape)
-STATUS_NOT_FOUND = "SKIP_NOT_FOUND"              # gid not an outlet-collection member / no variants
-STATUS_DRAFT = "SKIP_DRAFT"                       # status != ACTIVE (ACTIVE-only)
-STATUS_MISSING_PRICE = "SKIP_MISSING_PRICE"       # fill-missing REFUSED (B1)
-STATUS_PRICE_INVALID = "PRICE_INVALID"           # price<=0 / >=compareAt / compareAt<=0
-STATUS_VERIFY_FAILED = "VERIFY_FAILED"           # apply TOCTOU: plan_hash drifted
-STATUS_NOT_IN_PLAN = "NOT_IN_PLAN"               # apply: sku absent from approved plan
+# --- status / reason codes (PriceDiff.status / PriceOutcome.status) ----------
+STATUS_OK = "OK"                                  # preview: actionable
+STATUS_APPLIED = "APPLIED"                        # apply: register written (if it differed) + pushed
+STATUS_REGISTER_UPDATED = "REGISTER_UPDATED"      # apply: register written, nothing to push
+STATUS_ALREADY_CORRECT = "SKIP_ALREADY_CORRECT"   # register and live already on target
+STATUS_MISSING_PRICE = "SKIP_MISSING_PRICE"       # no price, or no compare-at (fill-missing REFUSED)
+STATUS_PRICE_INVALID = "PRICE_INVALID"            # FIX4: price ≤ 0, ≥ compare-at, …
+STATUS_PRICE_CONFLICT = "SKIP_PRICE_CONFLICT"     # a repair push with two register prices
+STATUS_COMPARE_AT_CONFLICT = "SKIP_COMPARE_AT_CONFLICT"  # the SKU's pairs yield two compare-ats
+STATUS_MULTI_PRODUCT_ID = "SKIP_MULTI_PRODUCT_ID"  # two OUTLET_PRODUCT_IDs on one SKU's pairs
+STATUS_VERIFY_FAILED = "VERIFY_FAILED"            # apply: the SKU moved since the preview
+STATUS_NOT_IN_PLAN = "NOT_IN_PLAN"                # apply: SKU absent from the approved plan
 STATUS_ERROR = "ERROR"
 STATUS_REVERTED = "REVERTED"
+STATUS_REVERT_SKIPPED = "SKIP_CHANGED_SINCE"      # revert: a pair's price moved after the intent
 
 
 # =============================================================================
 # Params (per-mode inputs the GUI passes down)
 # =============================================================================
-
-
 @dataclass(frozen=True)
 class BulkRule:
-    """One bulk-pricing rule (mode 3). ``percent`` is a fraction (0.30 == 30% off).
+    """One bulk-pricing rule (mode 3). ``percent`` is a fraction (0.30 == 30 % off).
 
-    ``scope`` maps a product-attribute name -> the accepted values for it; ALL
-    entries must match (AND). An empty scope matches every product. Attributes are
-    the group's normalized sheet columns plus ``sku`` (e.g. ``{"brand": ("Nike",)}``
-    matches rows whose ``brand`` cell is ``Nike``).
+    ``scope`` maps an attribute (``sku`` / ``brand`` / ``product_title``) to the
+    accepted values; ALL entries must match (AND); an empty scope matches every SKU.
     """
 
     percent: float
@@ -126,22 +109,17 @@ class BulkRule:
 
 @dataclass(frozen=True)
 class PriceParams:
-    """Unified per-mode parameters. Only the fields for the active mode are read."""
+    """Unified per-mode parameters. Only the fields of the active mode are read."""
 
-    # mode PERCENT: sku -> discount fraction.
     percent_by_sku: Mapping[str, float] = field(default_factory=dict)
-    # mode DIRECT: sku -> explicit prezzo_outlet override (else the sheet col J as-is).
     price_by_sku: Mapping[str, str] = field(default_factory=dict)
-    # mode BULK: ordered rules (last matching wins) + per-product overrides (win over rules).
     rules: Tuple[BulkRule, ...] = ()
     override_percent_by_sku: Mapping[str, float] = field(default_factory=dict)
 
 
 # =============================================================================
-# Audit sink (injected — mocked in tests; the SQLite impl lives in backend.audit)
+# The intent (the abort gate's record) and the audit sink
 # =============================================================================
-
-
 @dataclass(frozen=True)
 class VariantPrior:
     variant_id: str
@@ -158,7 +136,9 @@ class ProductPrior:
 
 @dataclass(frozen=True)
 class PriceIntent:
-    """The before-snapshot persisted by :meth:`AuditSink.capture_before`."""
+    """What :meth:`AuditSink.capture_before` persists before any write: the live
+    priors of every product the apply may push. The register's priors are kept by
+    each write's own ``PRICE`` row, which names this intent."""
 
     mode: str
     plan_hash: str
@@ -166,12 +146,6 @@ class PriceIntent:
 
 
 class AuditSink(Protocol):
-    """Durable append-only audit boundary (dependency-injected).
-
-    ``capture_before`` persists the prior state and returns the intent id that
-    :func:`revert_prices` later consumes; ``load`` retrieves it.
-    """
-
     def capture_before(self, intent: PriceIntent) -> str: ...
 
     def load(self, intent_id: str) -> PriceIntent: ...
@@ -180,24 +154,23 @@ class AuditSink(Protocol):
 # =============================================================================
 # Plan / report data model
 # =============================================================================
-
-
 @dataclass(frozen=True)
 class PriceDiff:
     sku: str
-    product_gid: Optional[str]
+    product_gid: Optional[str]      # the push target; None → the register only
     status: str
     actionable: bool
-    price: Optional[str]            # target price (col J) -> Shopify price
-    compare_at: Optional[str]       # target compareAt (col H) -> Shopify compareAtPrice
-    percent: Optional[float]        # mode 1/3: fraction written to `sconto`
-    sheet_price: Optional[str]      # current col J value in the sheet
-    sheet_changed: bool             # target price != sheet current
-    live_price: Optional[str]       # live variant price (first variant)
+    price: Optional[str]            # target price → PRICE_OUTLET and Shopify price
+    compare_at: Optional[str]       # B-2's compare-at → Shopify compareAtPrice
+    discount: Optional[str]         # → DISCOUNT (percent, to the cent)
+    percent: Optional[float]        # modes 1 / 3: the fraction that made the price
+    register_price: Optional[str]   # the SKU's one PRICE_OUTLET now (None: none, or two)
+    register_changed: bool          # a shelf pair's PRICE_OUTLET / DISCOUNT ≠ target
+    live_price: Optional[str]
     live_compare_at: Optional[str]
-    live_changed: bool              # target != live (a push is needed)
+    live_changed: bool              # a variant of the push target ≠ target
     live_status: Optional[str]
-    row_uuids: Tuple[str, ...]
+    pair_ids: Tuple[int, ...]
     warnings: Tuple[str, ...]
     plan_hash: str
 
@@ -222,6 +195,7 @@ class PriceOutcome:
 class PriceApplyReport:
     intent_id: Optional[str]
     outcomes: Tuple[PriceOutcome, ...]
+    surfaced: Tuple[Dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -230,6 +204,8 @@ class RevertReport:
     reverted_products: int
     reverted_variants: int
     outcomes: Tuple[PriceOutcome, ...]
+    reverted_pairs: int = 0
+    surfaced: Tuple[Dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -240,20 +216,19 @@ class DebtReport:
     broken_gids: Tuple[str, ...]
 
 
-# Internal planning row: the public diff plus the live variants (needed by apply
-# for the prior snapshot + the broadcast push; dropped from the public plan).
 @dataclass(frozen=True)
 class _PlanRow:
+    """The public diff plus the push target's live variants (apply's priors and push)."""
+
     diff: PriceDiff
     live_variants: Tuple[Dict[str, Any], ...]
-    expected_sku: str
 
 
 # =============================================================================
 # Pure helpers
 # =============================================================================
-
-_CAUGHT = (ShopifyUserError, ShopifyTransportError, GSheetError, RuntimeError)
+_CENT = Decimal("0.01")
+_SHOPIFY_ERRORS = (ShopifyUserError, ShopifyTransportError, ProductNotFound)
 
 
 def _check_mode(mode: str) -> None:
@@ -261,528 +236,540 @@ def _check_mode(mode: str) -> None:
         raise ValueError(f"unknown price mode {mode!r} (expected one of {sorted(_MODES)})")
 
 
-def _is_gid(value: Any) -> bool:
-    return isinstance(value, str) and value.startswith(_GID_PREFIX)
-
-
-def _fmt_percent(percent: float) -> str:
-    """Sheet-cell form of a discount fraction: ``0.30 -> '30'``, ``0.125 -> '12.5'``."""
-    return f"{percent * 100:g}"
-
-
-def _percent_price(high: Optional[str], percent: float) -> Optional[str]:
-    """``round(prezzo_high * (1 - pct), 2)`` as a 2-decimal string, or None."""
-    if not high:
+def money(value: Any) -> Optional[str]:
+    """A price as a 2-decimal string (``'129'``, ``'129,9'``, ``'€ 129.90'`` →
+    ``'129.90'``), or ``None`` when empty or not a finite number. The sign is kept:
+    FIX4 refuses a non-positive price, never a silently flipped one."""
+    if value is None:
         return None
-    try:
-        return f"{round(float(high) * (1.0 - percent), 2):.2f}"
-    except (TypeError, ValueError):
+    s = str(value).strip().replace("€", "").replace(" ", "")
+    if not s:
         return None
-
-
-def _validate_price(
-    price: Optional[str], compare_at: Optional[str]
-) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
-    """Reject missing/zero/negative price, missing/zero compareAt, or price>=compareAt.
-
-    Mirrors ``outlet_service._validate_price`` (FIX4) so publish and prices reject
-    identically. Returns ``(ok, price, compare_at, reason)``.
-    """
-    if not price:
-        return False, price, compare_at, "price_missing"
+    if s.count(",") == 1 and "." not in s:
+        s = s.replace(",", ".")
     try:
-        p = float(price)
-    except (TypeError, ValueError):
-        return False, price, compare_at, "price_unparseable"
-    if p <= 0:
-        return False, price, compare_at, "price_zero"
-    if not compare_at:
-        return False, price, compare_at, "compare_at_missing"
-    try:
-        c = float(compare_at)
-    except (TypeError, ValueError):
-        return False, price, compare_at, "compare_at_unparseable"
-    if c <= 0:
-        return False, price, compare_at, "compare_at_zero"
-    if p >= c:
-        return False, price, compare_at, "price_ge_compare_at"
-    return True, price, compare_at, None
+        d = Decimal(s)
+    except InvalidOperation:
+        return None
+    if not d.is_finite():
+        return None
+    return str(d.quantize(_CENT, rounding=ROUND_HALF_UP))
 
 
-def _plan_hash(
-    gid: Optional[str], price: Optional[str], compare_at: Optional[str], status: Optional[str]
-) -> str:
-    """TOCTOU verify key: bind {target gid, target price, target compareAt, status}."""
-    raw = f"{gid or ''}|{price or ''}|{compare_at or ''}|{(status or '').upper()}"
+def _dec(value: Optional[str]) -> Optional[Decimal]:
+    return None if value is None else Decimal(value)
+
+
+def discount_of(price: str, compare_at: str) -> str:
+    """The discount ``price`` makes on ``compare_at``, in percent to the cent."""
+    d = (Decimal(1) - Decimal(price) / Decimal(compare_at)) * 100
+    return str(d.quantize(_CENT, rounding=ROUND_HALF_UP))
+
+
+def _percent_price(compare_at: Optional[str], percent: float) -> Optional[str]:
+    if compare_at is None or not isinstance(percent, (int, float)) or not math.isfinite(percent):
+        return None
+    d = Decimal(compare_at) * (Decimal(1) - Decimal(str(percent)))
+    return str(d.quantize(_CENT, rounding=ROUND_HALF_UP))
+
+
+def _plan_hash(gid: Optional[str], price: Optional[str], compare_at: Optional[str],
+               discount: Optional[str], status: Optional[str]) -> str:
+    """TOCTOU key: {push target, price, compare-at, discount, its status}."""
+    raw = f"{gid or ''}|{price or ''}|{compare_at or ''}|{discount or ''}|{(status or '').upper()}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def _first_nonempty(group: List[Any], attr: str) -> Optional[Any]:
-    for r in group:
-        v = getattr(r, attr, None)
+def _first(shelf: Sequence[PairRow], attr: str) -> str:
+    for p in shelf:
+        v = getattr(p, attr, None)
         if v not in (None, ""):
-            return v
-    return None
+            return str(v).strip()
+    return ""
 
 
-def _group_by_sku(rows: List[Any]) -> List[Tuple[str, List[Any]]]:
-    """Group rows by trimmed SKU, preserving first-seen order; blank SKU dropped."""
-    groups: Dict[str, List[Any]] = {}
-    order: List[str] = []
-    for r in rows:
-        sku = (getattr(r, "sku", "") or "").strip()
-        if not sku:
-            continue
-        if sku not in groups:
-            groups[sku] = []
-            order.append(sku)
-        groups[sku].append(r)
-    return [(sku, groups[sku]) for sku in order]
+def _scope_matches(scope: Mapping[str, Tuple[str, ...]], attrs: Mapping[str, str]) -> bool:
+    return all(str(attrs.get(k, "")).strip() in accepted for k, accepted in scope.items())
 
 
-def _scope_matches(scope: Mapping[str, Tuple[str, ...]], attrs: Mapping[str, Any]) -> bool:
-    for key, accepted in scope.items():
-        if str(attrs.get(key, "")).strip() not in accepted:
-            return False
-    return True
-
-
-def _bulk_percent(params: PriceParams, sku: str, attrs: Mapping[str, Any]) -> Optional[float]:
-    """Mode-3 precedence: per-product override > last matching bulk rule > None."""
+def _bulk_percent(params: PriceParams, sku: str, attrs: Mapping[str, str]) -> Optional[float]:
+    """Mode 3 precedence: per-SKU override > the last matching rule > None."""
     if sku in params.override_percent_by_sku:
         return float(params.override_percent_by_sku[sku])
     chosen: Optional[float] = None
     for rule in params.rules:
         if _scope_matches(rule.scope, attrs):
-            chosen = float(rule.percent)  # last match wins (overlap tie-break)
+            chosen = float(rule.percent)
     return chosen
 
 
-def _is_broken(price: Optional[str], compare_at: Optional[str]) -> bool:
-    """A live variant is 'debt' iff it would fail price validation."""
-    ok, *_ = _validate_price(price, compare_at)
-    return not ok
-
-
-# =============================================================================
-# Planning (shared by preview and apply's TOCTOU re-plan)
-# =============================================================================
-
-
-def _skip(
-    sku: str,
-    gid: Optional[str],
-    status: str,
-    *,
-    price: Optional[str] = None,
-    compare_at: Optional[str] = None,
-    percent: Optional[float] = None,
-    sheet_price: Optional[str] = None,
-    row_uuids: Tuple[str, ...] = (),
-    warnings: Tuple[str, ...] = (),
-    live_status: Optional[str] = None,
-) -> _PlanRow:
-    diff = PriceDiff(
-        sku=sku,
-        product_gid=gid,
-        status=status,
-        actionable=False,
-        price=price,
-        compare_at=compare_at,
-        percent=percent,
-        sheet_price=sheet_price,
-        sheet_changed=False,
-        live_price=None,
-        live_compare_at=None,
-        live_changed=False,
-        live_status=live_status,
-        row_uuids=tuple(row_uuids),
-        warnings=tuple(warnings),
-        plan_hash=_plan_hash(gid, price, compare_at, live_status or ""),
-    )
-    return _PlanRow(diff, (), sku)
-
-
-def _error_row(sku: str, gid: Optional[str], err: str) -> _PlanRow:
-    diff = PriceDiff(
-        sku=sku, product_gid=gid, status=STATUS_ERROR, actionable=False, price=None,
-        compare_at=None, percent=None, sheet_price=None, sheet_changed=False, live_price=None,
-        live_compare_at=None, live_changed=False, live_status=None, row_uuids=(),
-        warnings=(f"error:{err}",), plan_hash=_plan_hash(gid, None, None, ""),
-    )
-    return _PlanRow(diff, (), sku)
-
-
-def _target_price(mode: str, params: PriceParams, sku: str, group: List[Any], high: Optional[str],
-                  sheet_outlet: Optional[str]) -> Tuple[bool, Optional[str], Optional[float]]:
-    """Compute (in_scope, target_price, percent) for a group in the given mode.
-
-    ``in_scope=False`` means the group is not addressed by this operation (mode 1/3
-    with no matching pct) and is dropped from the plan entirely.
-    """
+def _target(mode: str, params: PriceParams, sku: str, shelf: Sequence[PairRow],
+            compare_at: Optional[str], register_price: Optional[str]) -> Tuple[bool, Optional[str], Optional[float]]:
+    """``(in_scope, target price, percent)``; out of scope → the SKU is not in the plan."""
     if mode == MODE_PERCENT:
         pct = params.percent_by_sku.get(sku)
         if pct is None:
             return False, None, None
-        return True, _percent_price(high, float(pct)), float(pct)
+        return True, _percent_price(compare_at, pct), float(pct)
     if mode == MODE_BULK:
-        attrs = {"sku": sku, **(getattr(group[0], "raw", None) or {})}
+        attrs = {"sku": sku, "brand": _first(shelf, "brand"), "product_title": _first(shelf, "product_title")}
         pct = _bulk_percent(params, sku, attrs)
         if pct is None:
             return False, None, None
-        return True, _percent_price(high, pct), pct
-    # MODE_DIRECT: operator override, else the sheet col J value as-is (repair).
+        return True, _percent_price(compare_at, pct), pct
     override = params.price_by_sku.get(sku)
-    price = _clean_price(override) if override not in (None, "") else sheet_outlet
-    return True, price, None
+    if override not in (None, ""):
+        return True, money(override), None
+    return True, register_price, None
 
 
-def _plan_group(
-    mode: str, params: PriceParams, sku: str, group: List[Any], transport: Any,
-    status_map, status_override: bool,
-) -> Optional[_PlanRow]:
-    warnings: List[str] = []
-    high = _first_nonempty(group, "prezzo_high")
-    sheet_outlet = _first_nonempty(group, "prezzo_outlet")
-    gid = _first_nonempty(group, "product_id")
-    row_uuids = tuple(r.row_uuid for r in group)
-
-    distinct_q = {r.product_id for r in group if getattr(r, "product_id", "")}
-    if len(distinct_q) > 1:
-        warnings.append(f"multi_product_id:{sorted(distinct_q)}")
-
-    in_scope, price, percent = _target_price(mode, params, sku, group, high, sheet_outlet)
-    if not in_scope:
-        return None
-    compare_at = high
-
-    # --- Q gate (security invariant A3): empty Q -> skip, NO SKU-search fallback ---
-    if not gid:
-        return _skip(sku, None, STATUS_NO_PRODUCT_ID, price=price, compare_at=compare_at,
-                     percent=percent, sheet_price=sheet_outlet, row_uuids=row_uuids,
-                     warnings=tuple(warnings))
-    if not _is_gid(gid):
-        warnings.append("q_not_gid:handle_shape_unsupported")
-        return _skip(sku, gid, STATUS_Q_NOT_GID, price=price, compare_at=compare_at,
-                     percent=percent, sheet_price=sheet_outlet, row_uuids=row_uuids,
-                     warnings=tuple(warnings))
-
-    # --- validation / fill-missing REFUSE (B1) ---
-    ok, price, compare_at, reason = _validate_price(price, compare_at)
-    if not ok:
-        status = (STATUS_MISSING_PRICE if reason in ("price_missing", "compare_at_missing")
-                  else STATUS_PRICE_INVALID)
-        warnings.append(f"price:{reason}")
-        return _skip(sku, gid, status, price=price, compare_at=compare_at, percent=percent,
-                     sheet_price=sheet_outlet, row_uuids=row_uuids, warnings=tuple(warnings))
-
-    # --- status ACTIVE-only (A4) ---
-    live_status = status_map().get(gid)
-    if live_status is None:
-        warnings.append("not_in_outlet_collection")
-        return _skip(sku, gid, STATUS_NOT_FOUND, price=price, compare_at=compare_at,
-                     percent=percent, sheet_price=sheet_outlet, row_uuids=row_uuids,
-                     warnings=tuple(warnings))
-    if live_status != _STATUS_ACTIVE and not status_override:
-        warnings.append(f"status:{live_status}")
-        return _skip(sku, gid, STATUS_DRAFT, price=price, compare_at=compare_at, percent=percent,
-                     sheet_price=sheet_outlet, row_uuids=row_uuids, warnings=tuple(warnings),
-                     live_status=live_status)
-
-    # --- live diff (sheet<->live) ---
-    variants = ops.get_product_variants(transport, gid)
+def _live(variants: Sequence[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
     if not variants:
-        warnings.append("no_variants")
-        return _skip(sku, gid, STATUS_NOT_FOUND, price=price, compare_at=compare_at,
-                     percent=percent, sheet_price=sheet_outlet, row_uuids=row_uuids,
-                     warnings=tuple(warnings), live_status=live_status)
-
-    live_price = _clean_price(variants[0].get("price"))
-    live_compare = _clean_price(variants[0].get("compareAtPrice"))
-    # skip-if-correct (B2): normalize both sides before comparing (None vs "129.00").
-    live_changed = any(
-        _clean_price(v.get("price")) != price or _clean_price(v.get("compareAtPrice")) != compare_at
-        for v in variants
-    )
-    sheet_changed = _clean_price(sheet_outlet) != price
-    actionable = live_changed or sheet_changed
-    status = STATUS_OK if actionable else STATUS_ALREADY_CORRECT
-    diff = PriceDiff(
-        sku=sku, product_gid=gid, status=status, actionable=actionable, price=price,
-        compare_at=compare_at, percent=percent, sheet_price=sheet_outlet,
-        sheet_changed=sheet_changed, live_price=live_price, live_compare_at=live_compare,
-        live_changed=live_changed, live_status=live_status, row_uuids=row_uuids,
-        warnings=tuple(warnings), plan_hash=_plan_hash(gid, price, compare_at, live_status),
-    )
-    return _PlanRow(diff, tuple(variants), sku)
+        return None, None
+    return money(variants[0].get("price")), money(variants[0].get("compareAtPrice"))
 
 
-def _plan_all(
-    mode: str, params: PriceParams, groups: List[Tuple[str, List[Any]]], transport: Any,
-    status_override: bool,
-) -> List[_PlanRow]:
-    """Plan every SKU group, isolating per-group Shopify/read errors to an ERROR row.
+# =============================================================================
+# Planning — shared by the preview, the apply and its per-SKU re-derivation
+# =============================================================================
+StatusOf = Callable[[str], Optional[str]]
 
-    ``status_map`` is a memoizing closure so the single
-    ``ops.enumerate_outlet_products`` call is made lazily (only when a group
-    actually reaches the status gate) and at most once.
-    """
+
+def collection_status_map(transport: Any) -> StatusOf:
+    """Product status by gid over the outlet collection, read once (lazily);
+    ``None`` = not a member."""
     cache: Dict[str, Dict[str, str]] = {}
 
-    def status_map() -> Dict[str, str]:
+    def status_of(gid: str) -> Optional[str]:
         if "m" not in cache:
             members = ops.enumerate_outlet_products(transport)
             cache["m"] = {n["id"]: (n.get("status") or "").upper() for n in members}
-        return cache["m"]
+        return cache["m"].get(gid)
 
-    out: List[_PlanRow] = []
-    for sku, group in groups:
+    return status_of
+
+
+def core_status(transport: Any) -> StatusOf:
+    """The same answer from the product itself (one read, right before a write)."""
+
+    def status_of(gid: str) -> Optional[str]:
         try:
-            row = _plan_group(mode, params, sku, group, transport, status_map, status_override)
-        except _CAUGHT as e:
-            out.append(_error_row(sku, _first_nonempty(group, "product_id"), type(e).__name__))
+            core = ops.get_product_core(transport, gid)
+        except ProductNotFound:
+            return None
+        if not any(c.get("id") == OUTLET_COLLECTION_GID for c in core.get("collections") or ()):
+            return None
+        return (core.get("status") or "").upper()
+
+    return status_of
+
+
+def _diff(sku: str, status: str, *, gid: Optional[str] = None, price: Optional[str] = None,
+          compare_at: Optional[str] = None, discount: Optional[str] = None, percent: Optional[float] = None,
+          register_price: Optional[str] = None, register_changed: bool = False,
+          live: Tuple[Optional[str], Optional[str]] = (None, None), live_changed: bool = False,
+          live_status: Optional[str] = None, pair_ids: Tuple[int, ...] = (),
+          warnings: Sequence[str] = ()) -> PriceDiff:
+    return PriceDiff(
+        sku=sku, product_gid=gid, status=status, actionable=status == STATUS_OK, price=price,
+        compare_at=compare_at, discount=discount, percent=percent, register_price=register_price,
+        register_changed=register_changed, live_price=live[0], live_compare_at=live[1],
+        live_changed=live_changed, live_status=live_status, pair_ids=pair_ids, warnings=tuple(warnings),
+        plan_hash=_plan_hash(gid, price, compare_at, discount, live_status if gid else ""),
+    )
+
+
+def plan_sku(mode: str, params: PriceParams, sku: str, shelf: Sequence[PairRow], transport: Any,
+             status_of: StatusOf, status_override: bool) -> Optional[_PlanRow]:
+    """One SKU's diff (``None`` when the mode does not address it)."""
+    warnings: List[str] = []
+    pair_ids = tuple(p.pair_id for p in shelf)
+    prices = {p.price_outlet for p in shelf if p.price_outlet is not None}
+    cats = {compare_at_of(p) for p in shelf if compare_at_of(p) is not None}
+    register_price = money(next(iter(prices))) if len(prices) == 1 else None
+    compare_at = money(next(iter(cats))) if len(cats) == 1 else None
+    in_scope, price, percent = _target(mode, params, sku, shelf, compare_at, register_price)
+    if not in_scope:
+        return None
+    base = dict(price=price, compare_at=compare_at, percent=percent, register_price=register_price,
+                pair_ids=pair_ids)
+    if len(prices) > 1:
+        warnings.append(f"price_conflict:{'|'.join(sorted(money(p) or '' for p in prices))}")
+    kept_out = [p.pair_id for p in shelf if compare_at_of(p) is None]
+    if kept_out:   # D25: kept out of the publish, never its SKU; no compare-at lent
+        warnings.append(f"no_compare_at_pairs:{','.join(str(i) for i in kept_out)}")
+    if len(cats) > 1:
+        warnings.append(f"compare_at_conflict:{'|'.join(sorted(money(c) or '' for c in cats))}")
+        return _PlanRow(_diff(sku, STATUS_COMPARE_AT_CONFLICT, warnings=warnings, **base), ())
+    if mode == MODE_DIRECT and price is None and len(prices) > 1:
+        return _PlanRow(_diff(sku, STATUS_PRICE_CONFLICT, warnings=warnings, **base), ())
+    ok, why = validate_price(price, compare_at) if compare_at is not None else (False, "compare_at_missing")
+    if not ok:
+        warnings.append(f"price:{why}")
+        status = STATUS_MISSING_PRICE if why in ("price_missing", "compare_at_missing") else STATUS_PRICE_INVALID
+        return _PlanRow(_diff(sku, status, warnings=warnings, **base), ())
+    assert price is not None and compare_at is not None
+    discount = discount_of(price, compare_at)
+    register_changed = any(p.price_outlet != Decimal(price) or p.discount != Decimal(discount) for p in shelf)
+    ids = sorted({p.outlet_product_id for p in shelf if p.outlet_product_id is not None})
+    if len(ids) > 1:
+        warnings.append(f"multi_product_id:{','.join(str(i) for i in ids)}")
+        return _PlanRow(_diff(sku, STATUS_MULTI_PRODUCT_ID, discount=discount, warnings=warnings, **base), ())
+    gid = flows.product_gid(ids[0]) if ids else None
+    push: Optional[str] = None
+    live_status: Optional[str] = None
+    if gid is None:
+        warnings.append("no_outlet_product_id")        # the publish's CREATE takes the price
+    else:
+        live_status = status_of(gid)
+        if live_status is None:
+            warnings.append("outlet_not_in_collection")
+        elif live_status != _STATUS_ACTIVE and not status_override:
+            warnings.append(f"status:{live_status}")    # the revive's tail takes the price
+        else:
+            push = gid
+    variants: List[Dict[str, Any]] = []
+    if push is not None:
+        variants = ops.get_product_variants(transport, push)
+        if not variants:
+            warnings.append("no_variants")
+            push = None
+    live = _live(variants)
+    live_changed = any(money(v.get("price")) != price or money(v.get("compareAtPrice")) != compare_at
+                       for v in variants)
+    status = STATUS_OK if (register_changed or live_changed) else STATUS_ALREADY_CORRECT
+    return _PlanRow(_diff(sku, status, gid=push, discount=discount, register_changed=register_changed,
+                          live=live, live_changed=live_changed, live_status=live_status if push else None,
+                          warnings=warnings, **base), tuple(variants))
+
+
+def _by_sku(register: Any) -> List[Tuple[str, List[PairRow]]]:
+    """The shelf grouped by SKU in first-pair order (a blank SKU resolves nothing, rule 7)."""
+    groups: Dict[str, List[PairRow]] = {}
+    for p in register.shelf():
+        if (p.sku or "").strip():
+            groups.setdefault(p.sku, []).append(p)
+    return list(groups.items())
+
+
+def _error_row(sku: str, err: str) -> _PlanRow:
+    return _PlanRow(_diff(sku, STATUS_ERROR, warnings=(f"error:{err}",)), ())
+
+
+def _plan_all(register: Any, transport: Any, mode: str, params: PriceParams, status_override: bool,
+              status_of: StatusOf) -> Tuple[List[_PlanRow], Tuple[str, ...]]:
+    rows: List[_PlanRow] = []
+    anomalies: List[str] = []
+    for p in register.shelf():
+        if not (p.sku or "").strip():
+            anomalies.append(f"blank_sku:{p.pair_id}")
+    for sku, shelf in _by_sku(register):
+        try:
+            row = plan_sku(mode, params, sku, shelf, transport, status_of, status_override)
+        except _SHOPIFY_ERRORS + (RuntimeError,) as e:
+            rows.append(_error_row(sku, type(e).__name__))
             continue
         if row is not None:
-            out.append(row)
-    return out
-
-
-def _eligible_groups(
-    sheet: Any, mode: str, params: PriceParams, transport: Any, *,
-    assign_uuids: bool, row_override: bool, status_override: bool,
-) -> Tuple[List[_PlanRow], Tuple[str, ...]]:
-    read = sheet.read_canonical(assign_uuids=assign_uuids)
-    eligible = ScansiaSheet.eligible_rows(read.rows, override=row_override)
-    groups = _group_by_sku(eligible)
-    rows = _plan_all(mode, params, groups, transport, status_override)
-    anomalies = tuple(
-        f"{a.kind}:{a.sku}:{a.row_uuid}" for a in getattr(read, "anomalies", ()) or ()
-    )
-    return rows, anomalies
+            rows.append(row)
+    return rows, tuple(anomalies)
 
 
 # =============================================================================
-# Preview (READ-ONLY, DRY_RUN-safe)
+# Preview (READ-ONLY)
 # =============================================================================
-
-
-def prices_preview(
-    sheet: Any, transport: Any, mode: str, params: PriceParams, *,
-    row_override: bool = False, status_override: bool = False,
-) -> PricePlan:
-    """Compute the price PLAN without mutating Shopify or the Sheet.
-
-    Reads canonically with ``assign_uuids=False`` (no row_uuid minted, no cell
-    written). Returns a :class:`PricePlan` whose diffs carry the sheet<->live
-    comparison, validation status, and TOCTOU ``plan_hash``.
-    """
+def prices_preview(register: Any, transport: Any, mode: str, params: PriceParams, *,
+                   status_override: bool = False) -> PricePlan:
+    """Compute the price PLAN without writing the register or Shopify."""
     _check_mode(mode)
-    rows, anomalies = _eligible_groups(
-        sheet, mode, params, transport,
-        assign_uuids=False, row_override=row_override, status_override=status_override,
-    )
+    rows, anomalies = _plan_all(register, transport, mode, params, status_override,
+                                collection_status_map(transport))
     return PricePlan(dry_run=True, mode=mode, diffs=tuple(r.diff for r in rows), anomalies=anomalies)
 
 
 # =============================================================================
 # Apply (MUTATES — confirm-gated upstream)
 # =============================================================================
-
-
-def _write_sheet(sheet: Any, row: _PlanRow) -> None:
-    d = row.diff
-    fields: Dict[str, Any] = {"prezzo_outlet": d.price}
-    if d.percent is not None:
-        fields["sconto"] = _fmt_percent(d.percent)
-    for u in d.row_uuids:
-        sheet.write_back(u, fields, expected_sku=row.expected_sku)
-
-
 def _prior_of(row: _PlanRow) -> ProductPrior:
-    variants = tuple(
-        VariantPrior(v["id"], v.get("price"), v.get("compareAtPrice")) for v in row.live_variants
-    )
-    return ProductPrior(row.diff.product_gid, row.diff.sku, variants)
+    return ProductPrior(row.diff.product_gid or "", row.diff.sku, tuple(
+        VariantPrior(v["id"], money(v.get("price")), money(v.get("compareAtPrice"))) for v in row.live_variants))
 
 
-def _push(transport: Any, row: _PlanRow) -> None:
-    d = row.diff
-    updates = [
-        {"id": v["id"], "price": d.price, "compareAtPrice": d.compare_at} for v in row.live_variants
-    ]
-    ops.product_variants_bulk_update(transport, d.product_gid, updates)
+def _bind(audit_sink: Any, lease: PassLease) -> None:
+    bind = getattr(audit_sink, "bind", None)
+    if callable(bind):
+        bind(lease)
+
+
+def _push(transport: Any, diff: PriceDiff, variants: Sequence[Dict[str, Any]]) -> None:
+    ops.product_variants_bulk_update(transport, diff.product_gid, [
+        {"id": v["id"], "price": diff.price, "compareAtPrice": diff.compare_at} for v in variants])
+
+
+def _moved_since_capture(row: _PlanRow, prior: Optional[ProductPrior]) -> bool:
+    """A push whose live prices are no longer the captured priors (or with none
+    captured) cannot be reverted faithfully: it is not sent."""
+    if prior is None:
+        return True
+    now = {v["id"]: (money(v.get("price")), money(v.get("compareAtPrice"))) for v in row.live_variants}
+    then = {v.variant_id: (v.price, v.compare_at) for v in prior.variants}
+    return now != then
 
 
 def prices_apply(
-    sheet: Any, transport: Any, mode: str, params: PriceParams, approved_plan: PricePlan,
-    audit_sink: AuditSink, *, row_override: bool = False, status_override: bool = False,
+    register: Any,
+    transport: Any,
+    mode: str,
+    params: PriceParams,
+    approved_plan: PricePlan,
+    audit_sink: AuditSink,
+    *,
+    promo_location_id: str,
+    status_override: bool = False,
+    lease: Optional[PassLease] = None,
+    take_bound_s: float = PRICING_TAKE_BOUND_S,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> PriceApplyReport:
-    """Execute the approved plan: capture PRIORs, THEN write the sheet and push.
-
-    Re-reads the sheet (``assign_uuids=True``) and re-plans LIVE (TOCTOU). For each
-    fresh, actionable group whose ``plan_hash`` still equals the approved plan's:
-    a group whose live variants are already on target only needs its sheet cell
-    updated (``SHEET_UPDATED``). A group whose live variants differ from target is
-    queued into ``push_set`` — its sheet write is DEFERRED: only once
-    ``audit_sink.capture_before`` has durably captured the PRIOR
-    ``price``/``compareAtPrice`` of every queued group does its sheet cell get
-    written and its ``product_variants_bulk_update`` get pushed (in that order,
-    per row). This is deliberate: it prevents a sheet-updated-but-not-pushed
-    drift if the sink itself fails — ANY exception from ``capture_before`` (not
-    just the ops-boundary set) is caught, propagates NO raw traceback, touches NO
-    sheet cell in ``push_set``, pushes nothing, and surfaces a bounded ``ERROR``
-    outcome per queued sku. On success the intent id is returned for
-    :func:`revert_prices`. A drifted ``plan_hash`` -> ``VERIFY_FAILED``.
-
-    Per-group isolation: any Shopify/Sheet/read error is caught and reported as an
-    ``ERROR`` outcome for that sku only — the batch always completes.
-    """
+    """Execute the approved plan under the pass lease: priors first, then per SKU
+    (re-derived live after each re-take) the register write, then the push."""
     _check_mode(mode)
-    fresh_rows, _anoms = _eligible_groups(
-        sheet, mode, params, transport,
-        assign_uuids=True, row_override=row_override, status_override=status_override,
-    )
-    approved_by_sku = {d.sku: d for d in approved_plan.diffs}
-
+    run = passes.Holder(register, transport, promo_location_id, HOLDER_PRICING, lease=lease,
+                        take_bound_s=take_bound_s, sleep=sleep)
+    approved = {d.sku: d for d in approved_plan.diffs}
     outcomes: List[PriceOutcome] = []
-    push_set: List[_PlanRow] = []
-
-    for row in fresh_rows:
-        d = row.diff
-        if not d.actionable:
-            outcomes.append(PriceOutcome(d.sku, d.product_gid, d.status, d.warnings))
-            continue
-        approved = approved_by_sku.get(d.sku)
-        if approved is None:
-            outcomes.append(PriceOutcome(d.sku, d.product_gid, STATUS_NOT_IN_PLAN,
-                                         ("not_in_approved_plan",)))
-            continue
-        if d.plan_hash != approved.plan_hash:
-            outcomes.append(PriceOutcome(d.sku, d.product_gid, STATUS_VERIFY_FAILED,
-                                         ("plan_hash_mismatch:live_state_changed",)))
-            continue
-        if d.live_changed:
-            # Sheet write DEFERRED until after a successful capture_before (below)
-            # — never ahead of an un-pushed live price.
-            push_set.append(row)
-            continue
-        try:
-            if d.sheet_changed:
-                _write_sheet(sheet, row)
-            outcomes.append(PriceOutcome(d.sku, d.product_gid, STATUS_SHEET_UPDATED, d.warnings))
-        except _CAUGHT as e:
-            outcomes.append(PriceOutcome(d.sku, d.product_gid, STATUS_ERROR,
-                                         (f"unexpected_error:{type(e).__name__}",)))
-
-    # Capture BEFORE any sheet write / push for the push_set: all priors first,
-    # one intent -> one revert.
     intent_id: Optional[str] = None
-    if push_set:
+    todo: List[_PlanRow] = []
+    try:
+        run.start()
+        _bind(audit_sink, run.lease)
+        fresh, _anomalies = _plan_all(register, transport, mode, params, status_override,
+                                      collection_status_map(transport))
+        for row in fresh:
+            d = row.diff
+            a = approved.get(d.sku)
+            if not d.actionable:
+                outcomes.append(PriceOutcome(d.sku, d.product_gid, d.status, d.warnings))
+            elif a is None:
+                outcomes.append(PriceOutcome(d.sku, d.product_gid, STATUS_NOT_IN_PLAN, ("not_in_approved_plan",)))
+            elif d.plan_hash != a.plan_hash:
+                outcomes.append(PriceOutcome(d.sku, d.product_gid, STATUS_VERIFY_FAILED,
+                                             ("plan_hash_mismatch:live_state_changed",)))
+            else:
+                todo.append(row)
+        if not todo:
+            return PriceApplyReport(None, tuple(outcomes), tuple(run.report.items))
+        priors = {r.diff.sku: _prior_of(r) for r in todo if r.diff.product_gid and r.diff.live_changed}
         intent = PriceIntent(
             mode=mode,
-            plan_hash=_plan_hash(
-                "|".join(r.diff.product_gid or "" for r in push_set), None, None, mode
-            ),
-            priors=tuple(_prior_of(r) for r in push_set),
+            plan_hash=hashlib.sha256("|".join(sorted(f"{r.diff.sku}:{r.diff.plan_hash}" for r in todo))
+                                     .encode("utf-8")).hexdigest()[:16],
+            priors=tuple(priors[s] for s in sorted(priors)),
         )
         try:
             intent_id = audit_sink.capture_before(intent)
-        except Exception as e:  # noqa: BLE001 - the sink's own failure must not
-            # abort the process raw NOR leave the sheet ahead of an un-pushed
-            # live price: nothing in push_set has touched the sheet yet.
-            for row in push_set:
-                d = row.diff
-                outcomes.append(PriceOutcome(d.sku, d.product_gid, STATUS_ERROR,
-                                             (f"capture_before_failed:{type(e).__name__}",)))
-            return PriceApplyReport(intent_id=None, outcomes=tuple(outcomes))
+        except LeaseLost:
+            raise
+        except Exception as e:  # noqa: BLE001 - the abort gate: nothing written
+            outcomes.extend(PriceOutcome(r.diff.sku, r.diff.product_gid, STATUS_ERROR,
+                                         (f"capture_before_failed:{type(e).__name__}",)) for r in todo)
+            return PriceApplyReport(None, tuple(outcomes), tuple(run.report.items))
+        live_status = core_status(transport)
+        for row in todo:
+            run.next_item()
+            outcomes.append(_apply_sku(register, transport, run.lease, mode, params, row, priors,
+                                       intent_id, live_status, status_override))
+    except LeaseUnavailable:
+        if not run.lease.takes:
+            return PriceApplyReport(None, tuple(PriceOutcome(d.sku, d.product_gid, STATUS_ERROR, ("lease_unavailable",))
+                                                for d in approved_plan.diffs if d.actionable))
+        _lease_lost(outcomes, [(r.diff.sku, r.diff.product_gid) for r in todo])
+    except LeaseLost:
+        _lease_lost(outcomes, [(r.diff.sku, r.diff.product_gid) for r in todo])
+    finally:
+        run.release()
+    return PriceApplyReport(intent_id, tuple(outcomes), tuple(run.report.items))
 
-        for row in push_set:
-            d = row.diff
-            try:
-                if d.sheet_changed:
-                    _write_sheet(sheet, row)
-                _push(transport, row)
-                outcomes.append(PriceOutcome(d.sku, d.product_gid, STATUS_APPLIED, d.warnings))
-            except _CAUGHT as e:
-                outcomes.append(PriceOutcome(d.sku, d.product_gid, STATUS_ERROR,
-                                             (f"unexpected_error:{type(e).__name__}",)))
 
-    return PriceApplyReport(intent_id=intent_id, outcomes=tuple(outcomes))
+def _lease_lost(outcomes: List[PriceOutcome], items: Sequence[Tuple[str, Optional[str]]]) -> None:
+    done = {o.sku for o in outcomes}
+    outcomes.extend(PriceOutcome(sku, gid, STATUS_ERROR, ("lease_lost",)) for sku, gid in items if sku not in done)
+
+
+def _apply_sku(register: Any, transport: Any, lease: PassLease, mode: str, params: PriceParams,
+               approved_row: _PlanRow, priors: Dict[str, ProductPrior], intent_id: str,
+               status_of: StatusOf, status_override: bool) -> PriceOutcome:
+    """One SKU, re-derived live under the lease: same plan hash → register, then push."""
+    sku = approved_row.diff.sku
+    try:
+        row = plan_sku(mode, params, sku, register.shelf(sku), transport, status_of, status_override)
+    except _SHOPIFY_ERRORS as e:
+        return PriceOutcome(sku, approved_row.diff.product_gid, STATUS_ERROR, (f"error:{type(e).__name__}",))
+    if row is None or not row.diff.actionable:
+        d = row.diff if row is not None else approved_row.diff
+        return PriceOutcome(sku, d.product_gid, d.status if row is not None else STATUS_VERIFY_FAILED, d.warnings)
+    d = row.diff
+    if d.plan_hash != approved_row.diff.plan_hash:
+        return PriceOutcome(sku, d.product_gid, STATUS_VERIFY_FAILED, ("plan_hash_mismatch:live_state_changed",))
+    push = d.product_gid is not None and d.live_changed
+    if push and _moved_since_capture(row, priors.get(sku)):
+        return PriceOutcome(sku, d.product_gid, STATUS_VERIFY_FAILED, ("live_prices_moved_since_capture",))
+    written = False
+    try:
+        if d.register_changed:
+            assert d.price is not None and d.discount is not None
+            written = bool(register.set_outlet_price(lease, sku, Decimal(d.price), Decimal(d.discount),
+                                                     ref=intent_id))
+        if push:
+            lease.keepalive()
+            _push(transport, d, row.live_variants)
+            return PriceOutcome(sku, d.product_gid, STATUS_APPLIED, d.warnings)
+        return PriceOutcome(sku, d.product_gid, STATUS_REGISTER_UPDATED, d.warnings)
+    except LeaseLost:
+        raise
+    except _SHOPIFY_ERRORS as e:
+        # the register is the price's home: a refused or unknown push leaves it
+        # written, surfaced; a re-run pushes it (live ≠ target), or the publish does
+        return PriceOutcome(sku, d.product_gid, STATUS_ERROR,
+                            d.warnings + (f"push_failed:{type(e).__name__}",) + (("register_written",) if written else ()))
+    except StoreError as e:
+        return PriceOutcome(sku, d.product_gid, STATUS_ERROR, d.warnings + (f"register_error:{type(e).__name__}",))
 
 
 # =============================================================================
-# Revert (re-push captured priors — the concrete rollback affordance)
+# Revert (MUTATES — confirm-gated upstream)
 # =============================================================================
+def _written_by(register: Any, intent_id: str) -> Dict[str, List[AuditRow]]:
+    """The intent's own register writes — its ``set_outlet_price`` rows — by SKU."""
+    out: Dict[str, List[AuditRow]] = {}
+    for r in register.audit_rows(KIND_PRICE):
+        p = r.payload or {}
+        if r.action == ACTION_SET and p.get("intent_id") == intent_id and p.get("sku"):
+            out.setdefault(str(p["sku"]), []).append(r)
+    return out
 
 
-def revert_prices(transport: Any, audit_sink: AuditSink, intent_id: str) -> RevertReport:
-    """Consume an audit ``intent_id`` and re-push each variant's captured prior.
+def _revert_register(register: Any, lease: PassLease, sku: str, rows: Sequence[AuditRow],
+                     intent_id: str) -> Tuple[Optional[int], Tuple[str, ...]]:
+    """Restore the pairs the intent wrote, still on the shelf, to their priors.
+    ``(pairs restored, ())`` — or ``(None, why)`` when a pair moved since (the SKU
+    is left untouched)."""
+    restore: Dict[int, Tuple[Optional[Decimal], Optional[Decimal]]] = {}
+    wrote: Dict[int, Tuple[Optional[Decimal], Optional[Decimal]]] = {}
+    for r in sorted(rows, key=lambda x: x.row_id):
+        p = r.payload or {}
+        value = (_dec(p.get("price_outlet")), _dec(p.get("discount")))
+        for pp in p.get("pairs") or ():
+            pid = int(pp["pair_id"])
+            restore.setdefault(pid, (_dec(pp.get("old_price_outlet")), _dec(pp.get("old_discount"))))
+            wrote[pid] = value
+    current = {p.pair_id: p for p in register.shelf(sku)}
+    moved = sorted(pid for pid in restore
+                   if pid in current and (current[pid].price_outlet, current[pid].discount) != wrote[pid])
+    if moved:
+        return None, (f"price_changed_since:{','.join(str(i) for i in moved)}",)
+    groups: Dict[Tuple[Optional[Decimal], Optional[Decimal]], List[int]] = {}
+    for pid, value in restore.items():
+        if pid in current:
+            groups.setdefault(value, []).append(pid)
+    n = 0
+    for (price, discount), ids in sorted(groups.items(), key=lambda kv: min(kv[1])):
+        n += len(register.restore_outlet_price(lease, ids, price, discount, ref=intent_id))
+    return n, ()
 
-    Confirm-gated upstream. Per-product isolation: a failed re-push is an
-    ``ERROR`` outcome for that product only.
-    """
+
+def revert_prices(
+    register: Any,
+    transport: Any,
+    audit_sink: AuditSink,
+    intent_id: str,
+    *,
+    promo_location_id: str,
+    lease: Optional[PassLease] = None,
+    take_bound_s: float = PRICING_TAKE_BOUND_S,
+    sleep: Callable[[float], None] = time.sleep,
+) -> RevertReport:
+    """Undo one pricing intent, SKU by SKU, under the pass lease: the register
+    first (its pairs back to their priors), then the captured Shopify priors."""
     intent = audit_sink.load(intent_id)
-    outcomes: List[PriceOutcome] = []
-    reverted_products = 0
-    reverted_variants = 0
+    written = _written_by(register, intent_id)
+    priors: Dict[str, List[ProductPrior]] = {}
     for prior in intent.priors:
-        updates = [
-            {"id": v.variant_id, "price": v.price, "compareAtPrice": v.compare_at}
-            for v in prior.variants
-        ]
-        try:
-            ops.product_variants_bulk_update(transport, prior.product_gid, updates)
-            reverted_products += 1
-            reverted_variants += len(updates)
-            outcomes.append(PriceOutcome(prior.sku, prior.product_gid, STATUS_REVERTED, ()))
-        except _CAUGHT as e:
-            outcomes.append(PriceOutcome(prior.sku, prior.product_gid, STATUS_ERROR,
-                                         (f"unexpected_error:{type(e).__name__}",)))
-    return RevertReport(intent_id, reverted_products, reverted_variants, tuple(outcomes))
+        priors.setdefault(prior.sku, []).append(prior)
+    skus = sorted(set(written) | set(priors))
+    run = passes.Holder(register, transport, promo_location_id, HOLDER_PRICING, lease=lease,
+                        take_bound_s=take_bound_s, sleep=sleep)
+    outcomes: List[PriceOutcome] = []
+    products = variants_n = pairs_n = 0
+    try:
+        run.start()
+        for sku in skus:
+            run.next_item()
+            gid = priors[sku][0].product_gid if sku in priors else None
+            try:
+                n, why = _revert_register(register, run.lease, sku, written.get(sku, ()), intent_id)
+                if n is None:
+                    outcomes.append(PriceOutcome(sku, gid, STATUS_REVERT_SKIPPED, why))
+                    continue
+                pairs_n += n
+                for prior in priors.get(sku, ()):
+                    run.lease.keepalive()
+                    ops.product_variants_bulk_update(transport, prior.product_gid, [
+                        {"id": v.variant_id, "price": v.price, "compareAtPrice": v.compare_at}
+                        for v in prior.variants])
+                    products += 1
+                    variants_n += len(prior.variants)
+                outcomes.append(PriceOutcome(sku, gid, STATUS_REVERTED, ()))
+            except LeaseLost:
+                raise
+            except _SHOPIFY_ERRORS as e:
+                outcomes.append(PriceOutcome(sku, gid, STATUS_ERROR, (f"push_failed:{type(e).__name__}",)))
+            except StoreError as e:
+                outcomes.append(PriceOutcome(sku, gid, STATUS_ERROR, (f"register_error:{type(e).__name__}",)))
+    except LeaseUnavailable:
+        why = "lease_lost" if run.lease.takes else "lease_unavailable"
+        _lease_lost_as(outcomes, skus, why)
+    except LeaseLost:
+        _lease_lost_as(outcomes, skus, "lease_lost")
+    finally:
+        run.release()
+    return RevertReport(intent_id, products, variants_n, tuple(outcomes), pairs_n, tuple(run.report.items))
+
+
+def _lease_lost_as(outcomes: List[PriceOutcome], skus: Sequence[str], why: str) -> None:
+    done = {o.sku for o in outcomes}
+    outcomes.extend(PriceOutcome(s, None, STATUS_ERROR, (why,)) for s in skus if s not in done)
 
 
 # =============================================================================
 # Discharge-debt recon (READ-ONLY count of broken live outlets)
 # =============================================================================
-
-
-def discharge_debt_count(
-    transport: Any, *, collection_gid: str = OUTLET_COLLECTION_GID,
-) -> DebtReport:
-    """Count live ACTIVE outlets whose variants fail price validation (READ-ONLY).
-
-    A product counts as 'broken' if any variant has ``price<=0``, ``price>=compareAt``,
-    or a missing/invalid compareAt — the exact debt the successor repairs. No
-    mutation, no Sheet access.
-    """
+def discharge_debt_count(transport: Any, *, collection_gid: str = OUTLET_COLLECTION_GID) -> DebtReport:
+    """Count live ACTIVE outlets whose variants fail FIX4 (READ-ONLY): a product is
+    'broken' if any variant has ``price <= 0``, ``price >= compareAt`` or a
+    missing / invalid compare-at — the debt the pricing screen repairs."""
     members = ops.enumerate_outlet_products(transport, collection_gid)
-    scanned = 0
-    broken_products = 0
-    broken_variants = 0
+    scanned = broken_products = broken_variants = 0
     broken_gids: List[str] = []
     for m in members:
         if (m.get("status") or "").upper() != _STATUS_ACTIVE:
             continue
         scanned += 1
         try:
-            variants = ops.get_product_variants(transport, m["id"])
-        except _CAUGHT:
+            vs = ops.get_product_variants(transport, m["id"])
+        except _SHOPIFY_ERRORS + (RuntimeError,):
             continue  # best-effort recon: an unreadable product is not counted
-        prod_broken = sum(
-            1 for v in variants
-            if _is_broken(_clean_price(v.get("price")), _clean_price(v.get("compareAtPrice")))
-        )
-        if prod_broken:
+        bad = sum(1 for v in vs if not validate_price(money(v.get("price")), money(v.get("compareAtPrice")))[0])
+        if bad:
             broken_products += 1
-            broken_variants += prod_broken
+            broken_variants += bad
             broken_gids.append(m["id"])
     return DebtReport(scanned, broken_products, broken_variants, tuple(broken_gids))
 
 
 __all__ = [
-    "MODE_PERCENT", "MODE_DIRECT", "MODE_BULK",
+    "MODE_PERCENT", "MODE_DIRECT", "MODE_BULK", "SCOPE_KEYS",
     "BulkRule", "PriceParams",
     "AuditSink", "VariantPrior", "ProductPrior", "PriceIntent",
     "PriceDiff", "PricePlan", "PriceOutcome", "PriceApplyReport", "RevertReport", "DebtReport",
+    "money", "discount_of", "plan_sku", "collection_status_map", "core_status",
     "prices_preview", "prices_apply", "revert_prices", "discharge_debt_count",
 ]

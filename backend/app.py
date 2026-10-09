@@ -16,10 +16,10 @@ Wiring:
   starting misconfigured. Collaborators are built lazily from that config into
   ``app.state`` factories; tests inject in-memory fakes via ``create_app`` kwargs.
 * **Error boundary** — a shared exception handler translates every known internal
-  exception (Shopify user/transport, GSheet/SheetIO, Config, cutover) into a
-  STABLE ``error_code`` + a fixed safe message via ``backend.api.errors``. NO raw
-  message, stack, GraphQL payload, or gspread text ever reaches the client; the
-  only internal log line carries the exception TYPE name + code.
+  exception (Shopify user/transport, the register's store errors, Config, auth)
+  into a STABLE ``error_code`` + a fixed safe message via ``backend.api.errors``.
+  NO raw message, stack, GraphQL payload, or driver text ever reaches the client;
+  the only internal log line carries the exception TYPE name + code.
 * **Concurrency** — the slow live-inventory join runs OFF the event loop in a
   single-worker thread pool (``app.state.executor``); a single-slot ``JobStore``
   (in-memory) tracks it. A restart LOSES in-flight jobs — acceptable: a join is
@@ -40,30 +40,31 @@ from fastapi.responses import JSONResponse
 
 from backend.api.errors import log_boundary, map_exception
 from backend.api.jobs import JobStore
+from backend.api.decrement import build_decrement_router
 from backend.api.delete_outlet import build_delete_router
-from backend.api.init import build_init_router
+from backend.api.init import build_init_router, build_relevel_router
 from backend.api.prices import build_prices_router
 from backend.api.publish import build_publish_router
 from backend.api.read import build_read_router
+from backend.api.reconcile import build_reconcile_router
 from backend.api.ui import build_ui_router
 from backend.auth.basic_auth import AuthError, AuthNotConfigured
 from backend.config import ConfigError, ShopifyConfig, load_shopify_config
-from backend.gsheet import ScansiaSheet
-from backend.gsheet.reader import GSheetError
-from backend.persistence.gsheet_audit import GSheetAuditSink
+from backend.persistence.mysql_store import make_register_factory
 from backend.persistence.tokens import HmacTokenService
+from backend.services.decrement_worker import DecrementWorker, make_run_pass
 from backend.shopify.ops import ShopifyUserError
 from backend.shopify.transport import ShopifyTransport, ShopifyTransportError
 
 logger = logging.getLogger("backend.app")
 
 # Exception types translated by the boundary. Registering the bases is enough —
-# ``map_exception`` refines subclasses (SheetIOError/CutoverNotDoneError -> distinct
-# codes) via ordered isinstance checks. ``Exception`` is the last-resort 500 (a
-# genuine bug still yields a safe body before the server re-logs it).
+# ``map_exception`` refines subclasses (LeaseLost/BaselineMissing before their
+# StoreError base) via ordered isinstance checks. ``Exception`` catches the rest
+# through the same mapper (a genuine bug still yields a safe 500 body before the
+# server re-logs it).
 _BOUNDARY_TYPES = (
     ConfigError,
-    GSheetError,
     ShopifyUserError,
     ShopifyTransportError,
     AuthError,
@@ -87,20 +88,21 @@ def _register_error_handlers(app: FastAPI) -> None:
 def create_app(
     *,
     config: Optional[ShopifyConfig] = None,
-    sheet_factory: Optional[Callable[[], Any]] = None,
+    register_factory: Optional[Callable[..., Any]] = None,
     transport_factory: Optional[Callable[[], Any]] = None,
-    audit_factory: Optional[Callable[[], Any]] = None,
     executor: Optional[Any] = None,
     job_store: Optional[JobStore] = None,
     promo_location_id: Optional[str] = None,
     token_service: Optional[Any] = None,
+    decrement_worker: Optional[Any] = None,
 ) -> FastAPI:
     """Build the app. All collaborators are injectable (tests pass fakes).
 
     Un-injected collaborators are filled with production defaults on startup
-    (``load_shopify_config`` fail-closed, real transport/sheet/audit/thread-pool),
-    so ``create_app()`` with no args is the production entry point and
-    ``create_app(config=..., sheet_factory=..., ...)`` is the test entry point.
+    (``load_shopify_config`` fail-closed, the real transport, the MySQL register,
+    the thread pool, the decrement worker), so ``create_app()`` with no args is the
+    production entry point and ``create_app(config=..., register_factory=..., ...)``
+    is the test entry point.
     """
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -115,12 +117,20 @@ def create_app(
         if state.transport_factory is None:
             cfg = state.config
             state.transport_factory = lambda: ShopifyTransport(cfg)
-        if state.sheet_factory is None:
-            state.sheet_factory = ScansiaSheet.open
-        if state.audit_factory is None:
-            state.audit_factory = lambda: GSheetAuditSink.from_scansia_sheet(state.sheet_factory())
+        if state.register_factory is None:
+            # A new MySQL connection per job (§3.7 rule 4); the SCANSIA_DB_* env is
+            # read at the first job — missing → that job's config_error, nothing written.
+            state.register_factory = make_register_factory()
         if state.executor is None:
             state.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scansia-job")
+        if state.decrement_worker is None:
+            # B-3 (D23): the decrement on its own thread, never on the jobs' executor
+            state.decrement_worker = DecrementWorker(make_run_pass(state))
+        # B-3's boot pass: whoever woke the instance (678434's call, a person, a
+        # restart), what is pending is applied. Never blocks the startup. A test
+        # entering the lifespan (`with TestClient(app)`) sets app.state.decrement_worker
+        # first, or this pass runs on a thread against its fakes.
+        state.decrement_worker.trigger("boot")
         yield
         # Shutdown: release the worker pool (only if we own a real one).
         ex = app.state.executor
@@ -136,9 +146,8 @@ def create_app(
     )
 
     app.state.config = config
-    app.state.sheet_factory = sheet_factory
+    app.state.register_factory = register_factory
     app.state.transport_factory = transport_factory
-    app.state.audit_factory = audit_factory
     app.state.executor = executor
     app.state.job_store = job_store or JobStore()
     app.state.promo_location_id = promo_location_id
@@ -146,6 +155,7 @@ def create_app(
     # fail-closed, at mint/verify time — never at import). A single instance is
     # safe: it holds no per-request state.
     app.state.token_service = token_service or HmacTokenService()
+    app.state.decrement_worker = decrement_worker
 
     _register_error_handlers(app)
 
@@ -156,9 +166,12 @@ def create_app(
 
     app.include_router(build_read_router())
     app.include_router(build_publish_router())
+    app.include_router(build_decrement_router())
     app.include_router(build_delete_router())
     app.include_router(build_prices_router())
     app.include_router(build_init_router())
+    app.include_router(build_relevel_router())
+    app.include_router(build_reconcile_router())
     app.include_router(build_ui_router())
     return app
 

@@ -3,10 +3,12 @@
 The transport is mocked with an in-memory fake (``.graphql(query, variables)``
 returns a predefined dict). No HTTP, no live store, per project rules.
 
-Each op is covered for happy-path + fix3 (non-empty userErrors -> raise). Extra
-behavioral assertions per the M1a spec: variables/mutation shape, the
-``on_hand`` inventory-set name, idempotent re-activate, null-level deactivate
-no-op, and the not-stocked activate+retry.
+Each op is covered for happy-path + fix3 (non-empty userErrors -> raise). The
+inventory writes at the pin (2026-10, F7 §7): a relative ``available`` adjust
+carrying ``changeFromQuantity`` and the ``@idempotent`` key, an explicit
+activation (0 / 0), a key-less deactivation, a body built once and re-sent as
+stored, the answer parsed (codes / changes / level), and the live level read
+with ``includeInactive``.
 """
 from __future__ import annotations
 
@@ -33,8 +35,19 @@ class FakeTransport:
     ) -> None:
         self._responses = responses
         self.calls: List[Dict[str, Any]] = []
+        self.bodies: List[str] = []
 
     def graphql(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+        return self._answer(query, variables)
+
+    def send_body(self, body: str) -> Dict[str, Any]:
+        import json
+
+        doc = json.loads(body)
+        self.bodies.append(body)
+        return self._answer(doc["query"], doc["variables"])
+
+    def _answer(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         self.calls.append({"query": query, "variables": variables})
         if callable(self._responses):
             return self._responses(query, variables)
@@ -336,134 +349,102 @@ def test_get_location_by_name_returns_none_on_miss():
 
 
 # ---------------------------------------------------------------------------
-# inventory_activate
+# Inventory writes at the pin (F7 §3.3 rules 2, 3, 9; E15)
 # ---------------------------------------------------------------------------
 
-def test_inventory_activate_pure_connect_omits_quantities():
-    t = FakeTransport({"inventoryActivate": {"inventoryLevel": {"id": "gid://shopify/InventoryLevel/1"}, "userErrors": []}})
-    out = ops.inventory_activate(t, "gid://shopify/InventoryItem/1", "gid://shopify/Location/1")
-    assert out["inventoryLevel"]["id"] == "gid://shopify/InventoryLevel/1"
-    v = t.calls[0]["variables"]
-    assert v["inventoryItemId"] == "gid://shopify/InventoryItem/1"
-    assert v["locationId"] == "gid://shopify/Location/1"
-    # pure connect: no seeded quantities
-    assert v["onHand"] is None
-    assert v["available"] is None
+def test_adjust_request_is_relative_fenced_and_keyed():
+    import json
+
+    body = ops.adjust_request("gid://shopify/InventoryItem/1", "gid://shopify/Location/9", -1, 3, "key-1",
+                              reference="gid://scansia-manager/OutletReconcile/5")
+    doc = json.loads(body)
+    assert "@idempotent(key: $idempotencyKey)" in doc["query"] and "inventoryAdjustQuantities(" in doc["query"]
+    assert doc["variables"]["idempotencyKey"] == "key-1"
+    inp = doc["variables"]["input"]
+    assert (inp["name"], inp["reason"]) == ("available", "correction")
+    assert inp["referenceDocumentUri"] == "gid://scansia-manager/OutletReconcile/5"
+    assert inp["changes"] == [{"inventoryItemId": "gid://shopify/InventoryItem/1",
+                               "locationId": "gid://shopify/Location/9", "delta": -1, "changeFromQuantity": 3}]
+    assert "compareQuantity" not in body and "ignoreCompareQuantity" not in body   # removed at 2026-04
 
 
-def test_inventory_activate_idempotent_reactivate_no_raise():
-    # already-active item -> no userError -> must not raise
-    t = FakeTransport({"inventoryActivate": {"inventoryLevel": {"id": "gid://shopify/InventoryLevel/1"}, "userErrors": []}})
-    ops.inventory_activate(t, "gid://shopify/InventoryItem/1", "gid://shopify/Location/1")
+def test_adjust_request_sends_an_explicit_null_change_from():
+    import json
+
+    inp = json.loads(ops.adjust_request("i", "l", 1, None, "k"))["variables"]["input"]
+    assert inp["changes"][0]["changeFromQuantity"] is None and "referenceDocumentUri" not in inp
 
 
-def test_inventory_activate_seeds_on_hand_leaves_available_absent():
-    t = FakeTransport({"inventoryActivate": {"inventoryLevel": {"id": "gid://shopify/InventoryLevel/1"}, "userErrors": []}})
-    ops.inventory_activate(t, "gid://shopify/InventoryItem/1", "gid://shopify/Location/1", on_hand=3)
-    v = t.calls[0]["variables"]
-    assert v["onHand"] == 3
-    assert v["available"] is None
+def test_activate_request_is_explicit_zero_and_keyed():
+    import json
+
+    doc = json.loads(ops.activate_request("i", "l", "k"))
+    v = doc["variables"]
+    assert (v["available"], v["onHand"], v["idempotencyKey"]) == (0, 0, "k")
+    assert "@idempotent(key: $idempotencyKey)" in doc["query"] and "userErrors { field message }" in doc["query"]
 
 
-def test_inventory_activate_raises_on_user_errors_fix3():
-    t = FakeTransport({"inventoryActivate": {"inventoryLevel": None, "userErrors": [{"field": "locationId", "message": "bad"}]}})
-    with pytest.raises(ShopifyUserError):
-        ops.inventory_activate(t, "gid://shopify/InventoryItem/1", "gid://shopify/Location/1")
+def test_deactivate_request_carries_no_key():
+    import json
+
+    doc = json.loads(ops.deactivate_request("gid://shopify/InventoryLevel/3"))
+    assert doc["variables"] == {"inventoryLevelId": "gid://shopify/InventoryLevel/3"}
+    assert "@idempotent" not in doc["query"]
 
 
-# ---------------------------------------------------------------------------
-# inventory_set_quantities
-# ---------------------------------------------------------------------------
-
-def test_inventory_set_quantities_uses_on_hand_name_and_threads_quantity():
-    t = FakeTransport({"inventorySetQuantities": {"inventoryAdjustmentGroup": {"changes": []}, "userErrors": []}})
-    ops.inventory_set_quantities(t, "gid://shopify/InventoryItem/1", "gid://shopify/Location/1", 7)
-    inp = t.calls[0]["variables"]["input"]
-    assert inp["name"] == "on_hand"
-    assert inp["reason"] == "correction"
-    assert inp["ignoreCompareQuantity"] is True
-    q = inp["quantities"][0]
-    assert q == {
-        "inventoryItemId": "gid://shopify/InventoryItem/1",
-        "locationId": "gid://shopify/Location/1",
-        "quantity": 7,
-    }
+def test_send_inventory_posts_the_stored_body_and_parses_codes_and_changes():
+    body = ops.adjust_request("i", "l", -1, 2, "k")
+    t = FakeTransport({"inventoryAdjustQuantities": {
+        "inventoryAdjustmentGroup": {"changes": [{"name": "available", "delta": -1, "quantityAfterChange": 1}]},
+        "userErrors": []}})
+    ans = ops.send_inventory(t, body)
+    assert t.bodies == [body]
+    assert ans.ok and ans.codes == () and ans.changes[0]["quantityAfterChange"] == 1
+    t2 = FakeTransport({"inventoryAdjustQuantities": {"inventoryAdjustmentGroup": None, "userErrors": [
+        {"field": None, "message": "stale", "code": "CHANGE_FROM_QUANTITY_STALE"}]}})
+    ans2 = ops.send_inventory(t2, body)
+    assert not ans2.ok and ans2.codes == ("CHANGE_FROM_QUANTITY_STALE",)
 
 
-def test_inventory_set_quantities_raises_on_user_errors_fix3():
-    t = FakeTransport({"inventorySetQuantities": {"inventoryAdjustmentGroup": None, "userErrors": [{"code": "INVALID", "field": "quantity", "message": "nope"}]}})
-    with pytest.raises(ShopifyUserError):
-        ops.inventory_set_quantities(t, "gid://shopify/InventoryItem/1", "gid://shopify/Location/1", 3)
+def test_send_inventory_reads_an_activation_level_and_codeless_errors():
+    body = ops.activate_request("i", "l", "k")
+    ok = ops.send_inventory(FakeTransport({"inventoryActivate": {
+        "inventoryLevel": {"id": "gid://shopify/InventoryLevel/1", "isActive": True}, "userErrors": []}}), body)
+    assert ok.ok and ok.level == {"id": "gid://shopify/InventoryLevel/1", "isActive": True}
+    bad = ops.send_inventory(FakeTransport({"inventoryActivate": {"inventoryLevel": None, "userErrors": [
+        {"field": ["locationId"], "message": "nope"}]}}), body)
+    assert not bad.ok and bad.codes == ()              # plain UserError: no code to read
 
 
-def test_inventory_set_quantities_not_stocked_triggers_activate_then_retry():
-    calls_order: List[str] = []
+def test_read_level_includes_inactive_and_tells_absent_from_gone():
+    seen = {}
 
-    def route(query, _variables):
-        if "inventorySetQuantities" in query:
-            calls_order.append("set")
-            # first set -> not stocked; second set (after activate) -> success
-            if calls_order.count("set") == 1:
-                return {"inventorySetQuantities": {"inventoryAdjustmentGroup": None,
-                        "userErrors": [{"code": "ITEM_NOT_STOCKED_AT_LOCATION", "field": None, "message": "not stocked at location"}]}}
-            return {"inventorySetQuantities": {"inventoryAdjustmentGroup": {"changes": []}, "userErrors": []}}
-        if "inventoryActivate" in query:
-            calls_order.append("activate")
-            return {"inventoryActivate": {"inventoryLevel": {"id": "gid://shopify/InventoryLevel/1"}, "userErrors": []}}
-        raise AssertionError(f"unexpected query: {query}")
+    def route(query, variables):
+        seen["q"] = query
+        if variables["id"] == "gone":
+            return {"inventoryItem": None}
+        if variables["loc"] == "absent":
+            return {"inventoryItem": {"id": variables["id"], "inventoryLevel": None}}
+        return {"inventoryItem": {"id": variables["id"], "inventoryLevel": {
+            "id": "L1", "isActive": False, "quantities": [{"name": "available", "quantity": 2},
+                                                           {"name": "committed", "quantity": 1},
+                                                           {"name": "on_hand", "quantity": 3}]}}}
 
     t = FakeTransport(route)
-    out = ops.inventory_set_quantities(t, "gid://shopify/InventoryItem/1", "gid://shopify/Location/1", 5)
-    assert out["userErrors"] == []
-    assert calls_order == ["set", "activate", "set"]  # single bounded retry
+    assert ops.read_level(t, "gone", "l") == {"item_found": False, "level": None}
+    assert ops.read_level(t, "i", "absent") == {"item_found": True, "level": None}
+    assert ops.read_level(t, "i", "l")["level"] == {"id": "L1", "is_active": False, "available": 2,
+                                                   "committed": 1, "on_hand": 3}
+    assert "includeInactive: true" in seen["q"]
 
 
-# ---------------------------------------------------------------------------
-# inventory_deactivate  (+ get_inventory_level_id)
-# ---------------------------------------------------------------------------
-
-def test_get_inventory_level_id_returns_id_and_none():
-    hit = FakeTransport({"inventoryItem": {"inventoryLevel": {"id": "gid://shopify/InventoryLevel/9"}}})
-    assert ops.get_inventory_level_id(hit, "i", "l") == "gid://shopify/InventoryLevel/9"
-
-    miss = FakeTransport({"inventoryItem": {"inventoryLevel": None}})
-    assert ops.get_inventory_level_id(miss, "i", "l") is None
+def test_deny_tracked_inputs_cover_every_variant_with_extras():
+    rows = ops.deny_tracked_inputs([{"id": "v1"}, {"id": "v2"}], price="50.00")
+    assert rows == [{"id": "v1", "inventoryPolicy": "DENY", "inventoryItem": {"tracked": True}, "price": "50.00"},
+                    {"id": "v2", "inventoryPolicy": "DENY", "inventoryItem": {"tracked": True}, "price": "50.00"}]
 
 
-def test_get_inventory_level_id_returns_none_when_item_null():
-    t = FakeTransport({"inventoryItem": None})
-    assert ops.get_inventory_level_id(t, "i", "l") is None
-
-
-def test_inventory_deactivate_null_level_is_noop_no_deactivate_call():
-    def route(query, _variables):
-        assert "inventoryDeactivate" not in query, "must not deactivate a null level"
-        return {"inventoryItem": {"inventoryLevel": None}}
-
-    t = FakeTransport(route)
-    assert ops.inventory_deactivate(t, "i", "l") is None
-    # only the level-id lookup happened
-    assert len(t.calls) == 1
-
-
-def test_inventory_deactivate_happy_path():
-    def route(query, _variables):
-        if "inventoryDeactivate" in query:
-            return {"inventoryDeactivate": {"userErrors": []}}
-        return {"inventoryItem": {"inventoryLevel": {"id": "gid://shopify/InventoryLevel/9"}}}
-
-    t = FakeTransport(route)
-    assert ops.inventory_deactivate(t, "i", "l") is None
-    deact = next(c for c in t.calls if "inventoryDeactivate" in c["query"])
-    assert deact["variables"] == {"inventoryLevelId": "gid://shopify/InventoryLevel/9"}
-
-
-def test_inventory_deactivate_raises_on_user_errors_fix3():
-    def route(query, _variables):
-        if "inventoryDeactivate" in query:
-            return {"inventoryDeactivate": {"userErrors": [{"field": "inventoryLevelId", "message": "has stock"}]}}
-        return {"inventoryItem": {"inventoryLevel": {"id": "gid://shopify/InventoryLevel/9"}}}
-
-    t = FakeTransport(route)
-    with pytest.raises(ShopifyUserError):
-        ops.inventory_deactivate(t, "i", "l")
+def test_the_retired_inventory_ops_are_gone():
+    for name in ("inventory_set_quantities", "inventory_activate", "inventory_deactivate",
+                 "get_inventory_level_id", "_is_not_stocked"):
+        assert not hasattr(ops, name), name

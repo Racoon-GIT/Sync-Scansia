@@ -1,5 +1,13 @@
 # Handoff → AUTOMATE (Make) — return-signal integration (unblocks M3)
 
+> **⚠ SUPERSEDED by the F6 cutover (2026-09-21) — historical record, not a live contract.** The sheet
+> `Scarpe_in_Scansia` stopped being the register at 2026-09-21T00:14:38Z; returned pairs live in
+> `racoon.sc_returned_pair*`. Measured 2026-09-28: the sheet has **zero** live writers — `2215567` has
+> been stopped since 2026-09-20T22:38:59Z (permanently), and `678434` v263 replaced modules 146/168
+> with `SP_SCANSIA_LOOKUP`/`SP_SCANSIA_CONSUME` and carries no Scansia-sheet module. Every "live
+> writer", "append", "race" and "sequencing" statement below describes the pre-cutover system. The
+> successor is F7 (MySQL adapter, `IT/_scansia-programme/plan.md` §4).
+
 Scansia Manager = new single-origin FastAPI web service replacing the 3 Sync-Scansia cron jobs (already suspended). Branch `feat/scansia-manager`. Library layer complete and tested (246 tests local / 344 in a venv with fastapi); this handoff defines the Make ⇄ tool sheet contract that M3 (publish-live) depends on.
 
 > AUTOMATE is not one of the 3 IT peers (SVILUPPO/SERVER/CLIENT) → this is an owner/Ale action or a future AUTOMATE session, NOT an `OPEN-HANDOFFS` peer row.
@@ -132,10 +140,17 @@ Live header row (confirmed with Ale, 2026-07-08):
   a matching sale (module `168`, `{{if(146.\`5\`=1;"NO";146.\`6\`)}}`). **Verdict: do NOT reuse `online`
   for the tool's delete write-back** — it would collide with a still-live legacy accounting flag. Use the
   already-scoped fallback: a tool-private column (`_scansia_status=deleted`).
-- [x] **Q2 — Is return-append truly Make's ONLY write to the sheet?** **No.** Scenario `678434` "Shopify
-  - Nuovo Ordine" (the load-bearing order scenario, polling every 900s) also writes to this sheet for
-  outlet-matched order lines. Full mechanics in §9 — this is a new, previously-unknown risk surface, not
-  a simple confirmation.
+- [x] **Q2 — Is return-append truly Make's ONLY write to the sheet?** **No — and this is exhaustively
+  confirmed, not a spot-check.** Verified two ways across **all 50 scenarios** in the account: (1)
+  full-text scan of every blueprint for the sheet's file ID / name; (2) enumeration of **all 110**
+  `google-sheets:*` modules account-wide with their actual `spreadsheetId`. Only **3 scenarios**
+  reference this sheet: `2215567` (the return-append), `678434` "Shopify - Nuovo Ordine" (order
+  decrement, full mechanics in §9), and `4100540` — an **`isinvalid` duplicate** of `678434` (same
+  modules, same target; Make blocks invalid scenarios from executing, so it's dormant, not a live third
+  writer, but is a broken duplicate worth cleaning up). One false-positive ruled out: `3077704` "…
+  OnDemand" contains the string "Scansia" only as a Make-editor **module label** ("Controllo Scansia"),
+  its actual `google-sheets` modules target an unrelated spreadsheet. **Two live writers, confirmed
+  exhaustive, no third found.**
 - [x] **Q3 — Column-position / header-vs-index agreement.** **⚠ SUPERSEDED by §10 (2026-07-08): actually `includesHeaders: true` = header-name stable-id, reorder-robust.** ~~Fixed index, confirmed~~ — Make's `addRow`
   (scenario `2215567`, module `15`) writes `values` keyed `"0".."12"` (skipping 9, 10), matched against
   the live header above. Today the indices happen to line up correctly (e.g. index 7 = "Prezzo High" ✓,
