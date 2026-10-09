@@ -46,10 +46,11 @@ everything OUTSIDE the web layer — it is just not a complete signal for the
 API routes themselves.
 
 `python3` here is `/usr/local/bin`'s 3.13 (2026-10-09 on `ff0894f`: 795 passed,
-28 skipped): the Mac has no 3.12 (no pyenv, uv or python.org build), while
-Render runs 3.12.4 (`runtime.txt`). Check that parity statically: `pip install
-vermin` in the venv, then, from the repo root, `vermin -t=3.12- --violations
---no-tips backend main.py` (no violation at `ff0894f`, minimum 3.9).
+28 skipped): the Mac has no 3.12 (no pyenv, uv or python.org build), while the
+Render pin is 3.12.4 (`.python-version`; `runtime.txt` agrees). Check that
+parity statically: `pip install vermin` in the venv, then, from the repo root,
+`vermin -t=3.12- --violations --no-tips backend main.py` (no violation at
+`ff0894f`, minimum 3.9).
 
 ## The staging opt-in (28 tests)
 
