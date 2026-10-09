@@ -11,7 +11,7 @@ Module keys: `cov` test_plan_coverage · `dec` test_decrement · `out` test_outl
 test_baseline · `rel` test_relevel · `del` test_delete_service · `exit` test_exit_service · `norm`
 test_normalize_service · `close` test_close_service · `price` test_pricing_service · `trig` test_decrement_trigger ·
 `stg` test_consume_beside_f7 (staging) · `tr` test_transport · `ops` test_ops · `read` test_api_read · `init`
-test_api_init · `gate` test_promo_gate.
+test_api_init · `gate` test_promo_gate · `co` test_create_order (§14).
 
 ## 1. §3.3's table, held keys included
 
@@ -34,7 +34,7 @@ test_api_init · `gate` test_promo_gate.
 | T4c | a revive deferred while a row not closed names its product or a key | `out` a_revive_is_deferred_while_a_row_of_its_product_is_open; `cov` aa2 (a tail row) |
 | T4d | a revive zeroes no-shelf-pair, held-key and customisation-only variants, relatively | `out` draft_revive_adds_on_the_live_level_then_activates_last; a_revive_lowers_customisation_only_and_held_keys_to_zero; `cov` m3 |
 | T4e | later steps only once every zeroing row applied | `out` a_revive_stopped_at_a_zeroing_row…; `r8` ab3 ×3 |
-| T4f | activation: absent / inactive only, 0/0; the add only once it is APPLIED | `out` activation_is_explicit_and_only_for_an_absent_or_inactive_level; an_add_is_never_sent_beside_an_activation_that_failed |
+| T4f | activation: absent / inactive only, 0/0 (since D49 `available` 0 only, §14); the add only once it is APPLIED | `out` activation_is_explicit_and_only_for_an_absent_or_inactive_level; an_add_is_never_sent_beside_an_activation_that_failed |
 | T4g | the tail row: written ahead, closed on completion, FAILED on a refusal or "never run" | `r8` ab3 ×3; `cov` aa1_a_revives_tail_refused…; w8_w13_m4 |
 | T4h | size the outlet lacks / SKU not in the catalogue: pending, surfaced | `out` a_spelling_twin_is_surfaced_never_published; customisation_only_variant_never_matches; `cov` t4 |
 | T4i | a held key's +Δ, a +Δ of a key with N 0: never added | `out` a_held_positive_key_is_never_added; a_positive_group_of_a_key_with_n0_is_never_added; `cov` z11 [pending_plus] |
@@ -53,7 +53,7 @@ test_api_init · `gate` test_promo_gate.
 | R4 | FAILED on `userErrors`, events pending | `dec` a_stale_change_from_quantity_fails_the_row_and_the_next_pass_re_plans |
 | R5 | OPEN −Δ landed / not landed → re-sent identical, re-applied past the window | `dec` a_lost_answer_leaves_the_row_open…; a_send_that_never_ran…; past_the_window_an_unknown_minus… |
 | R6 | OPEN +Δ → HELD, key held | `out` a_lost_add_answer_is_never_re_added_and_holds_the_key_past_the_window |
-| R7 | CREATE: `userErrors` at each step after the duplicate; a crash in each window; id recorded or not; a sale between crash and recovery; recovery at start-up (decrement class: left), before a pass, after a stamp failure | `cov` r7_a_create_refused… ×7; r7_w8_w13_a_crash… ×7; m11_r1; r7_a_creates_sent_add_closed_by_the_orphan_path_is_held… (§12); `out` a_create_failing_after_step_1…; a_lost_duplicate_answer…; create_quarantines_when_levels_truncated… |
+| R7 | CREATE: `userErrors` at each step after the duplicate; a crash in each window; id recorded or not; a sale between crash and recovery; recovery at start-up (decrement class: left), before a pass, after a stamp failure | `cov` r7_a_create_refused… ×7; r7_w8_w13_a_crash… ×7; m11_r1; r7_a_creates_sent_add_closed_by_the_orphan_path_is_held… (§12); `out` a_create_failing_after_step_1…; a_lost_duplicate_answer…; create_quarantines_when_levels_truncated…; on a duplicate active off Promo (§14): `co` a_create_refused_at_each_step… ×8; a_crash_in_each_window_of_the_new_order… ×9 |
 | R8 | close + stamp atomic, fenced, in order | `reg` stamp_closes_its_rows_then_stamps_in_one_transaction; `mysql` fenced_write_is_renew_then_ops_then_commit_register_last |
 | R9 | an already-stamped id counted by the matched count | `store` stamp_coalesces_and_counts_an_already_stamped_id_as_matched |
 | R10 | the stamp by PRIMARY KEY beside CONSUME (EXPLAIN) | `stg` a_consume_beside_an_open_stamp_never_waits_and_the_stamp_is_by_primary_key |
@@ -113,7 +113,7 @@ test_api_init · `gate` test_promo_gate.
 | W7 | a not-closed row's key held, its events excluded, never re-grouped under a new nonce | `reg` every_hold_kind_is_derived_and_its_events_subtracted; `dec` a_lost_answer… (one key, one body) |
 | W8 | `SENT_AT` before `productDuplicate` and each tail call; a crash right after it | `cov` r7_w8_w13 [duplicate…]; w8_w13_m4; `r8` ab5_a_normalise_rows_sent_at… |
 | W9 | the stored request re-sent byte-identical | `dec` a_lost_answer…; `store` request_text_comes_back_byte_identical; `tr` send_body_posts_the_stored_bytes_unchanged |
-| W10 | activation only of an absent or inactive level, 0/0 | `out` activation_is_explicit…; `ops` activate_request_is_explicit_zero_and_keyed |
+| W10 | activation only of an absent or inactive level, 0/0 (since D49 `available` 0 only, §14) | `out` activation_is_explicit…; `ops` activate_request_is_an_explicit_zero_available_only_and_keyed |
 | W11 | a revive's activation, adds and tail only after its zeroing applied | `out` a_revive_stopped_at_a_zeroing_row…; `r8` ab3 ×3 |
 | W12 | event-less rows past the window: re-derived from live | `cov` w12_aa1 ×3 |
 | W13 | the decrement's recovery leaves sent +Δ / CREATE / tail rows; reads an activation off `isActive` | `out` the_decrements_recovery_leaves_a_sent_plus…; `cov` r7_w8_w13; w8_w13_m4; `r8` ab13 |
@@ -237,3 +237,33 @@ with a control on the commit that adds them. Suite after: 795 offline green (ven
 | V50, V51 | the default keepalive moved to 240 s; the default send margin to 6 s | every holder runs on the defaults; the lease tests that time a renew set their own, and the end-to-end ones last milliseconds of the real clock | `lease` the_default_lease_keeps_alive_after_60_s… |
 | V54 | a re-apply closed `FAILED` records `possibly_applied` false | the next lowering of its events names no predecessor and surfaces nothing | `cov` w2_aa4_a_re_apply_closed_failed… |
 | V70 | the revert skips a SKU the intent only pushed | a repair push (no register row) is never undone on Shopify | `price` revert_of_a_repair_push… |
+
+## 13. After go-live: F7.3's finding F3 (D46)
+
+`docs/f7.3-live-tests.md` §8 F3: D1 sent no `includeImages` (default false at `2026-10`), so every outlet a CREATE
+made had no images. Fixed on `fix/f7-outlet-media` (decided by the orchestrator, D46): `includeImages: true` on D1,
+atomic with the duplicate; the copy is an asynchronous job, so D1 selects `imageJob { id done }` and CREATE records
+it on its row. Not D7's `productSet` (it carries the deprecated `ProductSetInput.id`, §8 F1).
+
+| Item | Mechanism | Pinned by |
+|---|---|---|
+| F3 | D1 sends `includeImages: true` and selects `imageJob { id done }`; an answer with no job is tolerated | `ops` product_duplicate_copies_the_images_and_returns_the_job_f3; product_duplicate_returns_new_gid; product_duplicate_tolerates_a_null_image_job |
+| F3 | the outlet a CREATE makes carries its source's images; the job's id and `done` on the CREATE row (`image_job`, `image_job_done`), none when no job | `out` create_outlet_carries_the_source_images_and_records_the_job_f3; create_without_an_image_job_applies_and_records_none |
+
+## 14. After go-live: F7.3 run 202610091404 — S3.8, S2.10, the activation body (D49)
+
+Brief `IT/_scansia-programme/briefs/sync-scansia-F7.3-fixes.md` (sha `c2f47e55…`), on `fix/f7-create-order`. The store
+refused to deactivate an item's last active level (R061) — and every CREATE candidate's duplicate holds variants active
+only at Magazzino — so CREATE aborted; it refused F7's activation body, `available` and `onHand` together (R053, T4;
+the body change decided by the orchestrator, 2026-10-09); a publish on a DRAFT answered no `userErrors` and published
+nothing (R025). The fake models the three answers (`tests/fake_shop.py`), so `shop.refused == []` is (a)'s oracle.
+
+| Item | Mechanism | Pinned by |
+|---|---|---|
+| S3.8 (a) | no `inventoryDeactivate` of a variant's last active level: CREATE activates Promo on every variant lacking it first; `zero_rows_for` counts the variant's ACTIVE levels and keeps the last one (zeroed, surfaced) — CREATE and the orphan alike | `co` the_fake_refuses_an_items_last_active_level…; a_create_on_a_duplicate_active_only_off_promo…; an_activation_refused_stops_the_activations_and_the_orphan_keeps_each_last_level |
+| S3.8 (b) | after CREATE every variant is Promo-active, every other level zeroed and inactive; DRAFT until step 6 | `co` a_create_on_a_duplicate_active_only_off_promo…; mixed_variants_… (Promo + Magazzino, Magazzino only, Promo only, none); without_an_activation_the_create_keeps_fix1s_calls_no_re_read |
+| S3.8 (c) | zero rows and adds composed from a re-read after the activations: an inactive level's units kept or dropped, the end state the same | `co` an_inactive_promo_level_holding_units_ends_at_its_add… ×2 (drops, keeps) |
+| S3.8 | every activation first, the rest only once all are `APPLIED`; one not `APPLIED` stops the others; a Promo level read inactive after them → abort before any deactivation | `co` an_activation_refused_stops_the_activations…; a_promo_level_found_inactive_after_the_activations… |
+| S3.8 (d) | a refusal at each step and a crash in each window of the new order: the decrement reads activations off `isActive` (never re-sent) and leaves the CREATE; the publish's recovery drafts and zeroes the orphan, no last level deactivated | `co` a_create_refused_at_each_step… ×8; a_crash_in_each_window_of_the_new_order… ×9 |
+| R053 | the activation body: `available` 0 only, never `onHand` | `ops` activate_request_is_an_explicit_zero_available_only_and_keyed; `co` the_fake_refuses_available_with_on_hand…; `out` activation_is_explicit…; `base` a_activates_an_absent_or_inactive_level… |
+| S2.10 | a publish answered without `publishedOnPublication` true is surfaced (`publish_unconfirmed`) and recorded on its row (`publish_confirmed` false), the step recorded, no abort — CREATE's step 6 and the revive tail | `co` publish_confirmed_reads_published_on_publication_only; a_create_whose_publish_answers_unconfirmed…; a_revive_tail_whose_publish_answers_unconfirmed… |

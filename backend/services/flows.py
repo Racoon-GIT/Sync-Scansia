@@ -456,7 +456,7 @@ def run_tail(ctx: Context, row: AuditRow) -> str:
             ctx.transport, gid, ops.deny_tracked_inputs(inv, **extra)))
         ctx.ledger.step(row, "2:active", lambda: ops.product_update_status(ctx.transport, gid, "ACTIVE"))
         pub = ctx.publication_id()
-        ctx.ledger.step(row, "3:publish", lambda: ops.product_publish(ctx.transport, gid, pub))
+        answer = ctx.ledger.step(row, "3:publish", lambda: ops.product_publish(ctx.transport, gid, pub))
     except ShopifyUserError as e:
         ctx.report.surface("tail_refused", row_id=row.row_id, product_id=row.product_id, mutation=e.mutation)
         return ctx.ledger.close(ctx.ledger.reload(row), FAILED, refused=e.mutation)
@@ -467,7 +467,18 @@ def run_tail(ctx: Context, row: AuditRow) -> str:
         # by the next publish-class recovery — idempotent by state
         ctx.report.surface("tail_outcome_unknown", row_id=row.row_id, error=type(e).__name__)
         return OPEN
-    return ctx.ledger.close(ctx.ledger.reload(row), APPLIED, moved=0)
+    return ctx.ledger.close(ctx.ledger.reload(row), APPLIED, moved=0, **publish_checked(ctx, row, answer))
+
+
+def publish_checked(ctx: Context, row: AuditRow, answer: Dict[str, Any]) -> Dict[str, Any]:
+    """A publish answered with no ``userErrors`` may still have published nothing
+    (on a DRAFT: ``publishedOnPublication`` false, F7.3 run 202610091404, R025).
+    F7 publishes only after ACTIVE, so an unconfirmed publish is surfaced and
+    recorded on its row — not an abort. Returns the row's outcome fields."""
+    if ops.publish_confirmed(answer):
+        return {}
+    ctx.report.surface("publish_unconfirmed", row_id=row.row_id, product_id=row.product_id)
+    return {"publish_confirmed": False}
 
 
 def _not_deny_tracked(inv: Sequence[Dict[str, Any]]) -> bool:
@@ -519,12 +530,17 @@ def zero_rows_for(ctx: Context, inv: Sequence[Dict[str, Any]], *, keys: Sequence
     """Lowering-to-0 rows (event-less, relative) for the variants ``which``
     selects (default every variant) with Promo ``available`` > 0; with
     ``include_nonpromo``, every other location's ``available`` > 0 too, plus its
-    deactivation (sent after that level's zero row applied)."""
+    deactivation (sent after that level's zero row applied) — never of the
+    variant's last active level: Shopify refuses it («variants need to be stocked
+    at a minimum of 1 location», F7.3 run 202610091404, R061), and no field of the
+    level tells (``canDeactivate`` reads true there), so the variant's active
+    levels are counted. A level kept that way is zeroed all the same, and surfaced."""
     specs: List[L.RowSpec] = []
     for v in inv:
         if which is not None and not which(v):
             continue
         item = variants.item_id(v)
+        active = sum(1 for lvl in v.get("levels") or [] if lvl.get("is_active", True))
         for lvl in v.get("levels") or []:
             loc = lvl.get("location_id")
             a = lvl.get("available") or 0
@@ -538,6 +554,12 @@ def zero_rows_for(ctx: Context, inv: Sequence[Dict[str, Any]], *, keys: Sequence
                     specs.append(L.RowSpec(action=L.A_ADJUST, keys=tuple(keys), purpose=L.P_NONPROMO, target=0,
                                            inventory_item_id=item, location_id=loc, variant_id=v.get("id"),
                                            product_id=product))
+                if lvl.get("is_active", True):
+                    if active <= 1:
+                        ctx.report.surface("last_active_level_kept", product_id=product, variant_id=v.get("id"),
+                                           location_id=loc)
+                        continue
+                    active -= 1
                 specs.append(L.RowSpec(action=L.A_DEACTIVATE, keys=tuple(keys), inventory_item_id=item,
                                        location_id=loc, variant_id=v.get("id"), product_id=product))
     return specs
@@ -569,7 +591,8 @@ def run_rows_in_order(ctx: Context, rows: Sequence[AuditRow]) -> Dict[int, str]:
 
 def orphan(ctx: Context, create_row: AuditRow, gid: str) -> None:
     """A CREATE failed after step 1: the orphan is drafted, every Promo variant
-    lowered to 0 relatively, its non-Promo stock zeroed and disconnected."""
+    lowered to 0 relatively, its non-Promo stock zeroed and disconnected — all
+    but a variant's last active level, zeroed and kept (:func:`zero_rows_for`)."""
     try:
         ops.product_update_status(ctx.transport, gid, "DRAFT")
     except (ShopifyUserError, ShopifyTransportError) as e:
@@ -610,5 +633,5 @@ __all__ = [
     "Context", "Resolution", "product_gid", "product_number", "product_total", "total_rule",
     "minus_group", "zero_group", "held_key_lowering", "n0_release", "zeroing_applied",
     "run_tail", "run_normalise", "draft_if_unsafe", "zero_rows_for", "run_rows_in_order", "orphan",
-    "maybe_set_outlet_product",
+    "maybe_set_outlet_product", "publish_checked",
 ]

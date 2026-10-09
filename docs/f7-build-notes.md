@@ -324,3 +324,13 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   marked `f7test`, the lease free.
 - Render `scansia-manager` deploys `main` on commit (`scansia-f6`, 2026-10-06 14:23Z): this branch deploys nothing;
   `main` is production and stays out of F7.2.
+- F7.3 run 202610091404 (raw answers `~/.claude/racoon-bus/msg/f73-live-202610091404/`, re-read 2026-10-09 by
+  D49's context), three answers the fake now gives: `inventoryDeactivate` of an item's only active level →
+  `userErrors` «The variant couldn't be unstocked from Promo because variants need to be stocked at a minimum of 1
+  location.», no `code`, the level unchanged (R061, R062); `inventoryActivate` with `available` 0 AND `onHand` 0
+  → `inventoryLevel` null, one `userError` per field, «not allowed to set available and on_hand quantities at the
+  same time» (R053; on an active level — absent and inactive levels unmeasured); `publishablePublish` on a DRAFT →
+  no `userErrors`, `publishedOnPublication` false, count 0 (R025, R026). The orchestrator's read (`PROGRAM.md`,
+  2026-10-09 ~16:50Z): the 70 CREATE candidates' full-price products hold 932 variants, 927 active only at
+  Magazzino; `canDeactivate` true and `deactivationAlert` null on every level — no field tells a last level.
+  Mechanisms: `docs/f7-coverage-map.md` §14.

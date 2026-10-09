@@ -64,13 +64,38 @@ def test_product_duplicate_returns_new_gid():
     t = FakeTransport(
         {"productDuplicate": {"newProduct": {"id": "gid://shopify/Product/999"}, "userErrors": []}}
     )
-    gid = ops.product_duplicate(t, "gid://shopify/Product/1", "Nike - OUTLET")
-    assert gid == "gid://shopify/Product/999"
+    dup = ops.product_duplicate(t, "gid://shopify/Product/1", "Nike - OUTLET")
+    assert dup.product_gid == "gid://shopify/Product/999"
+    assert (dup.image_job_id, dup.image_job_done) == (None, None)     # no imageJob in the answer: tolerated
     assert t.calls[0]["variables"] == {
         "productId": "gid://shopify/Product/1",
         "newTitle": "Nike - OUTLET",
         "newStatus": "DRAFT",
+        "includeImages": True,
     }
+
+
+def test_product_duplicate_copies_the_images_and_returns_the_job_f3():
+    """§8 F3 (docs/f7.3-live-tests.md): ``includeImages`` defaults to false at 2026-10,
+    so an outlet duplicated without it has no images. D1 sends ``includeImages: true``
+    and selects ``imageJob { id done }`` — the copy is an asynchronous job."""
+    t = FakeTransport({"productDuplicate": {"newProduct": {"id": "gid://shopify/Product/999"},
+                                            "imageJob": {"id": "gid://shopify/Job/7", "done": False},
+                                            "userErrors": []}})
+    dup = ops.product_duplicate(t, "gid://shopify/Product/1", "Nike - OUTLET")
+    assert t.calls[0]["variables"]["includeImages"] is True
+    assert "$includeImages: Boolean" in t.calls[0]["query"]
+    assert "includeImages: $includeImages" in t.calls[0]["query"]
+    assert "imageJob { id done }" in t.calls[0]["query"]
+    assert (dup.product_gid, dup.image_job_id, dup.image_job_done) == (
+        "gid://shopify/Product/999", "gid://shopify/Job/7", False)
+
+
+def test_product_duplicate_tolerates_a_null_image_job():
+    t = FakeTransport({"productDuplicate": {"newProduct": {"id": "gid://shopify/Product/999"}, "imageJob": None,
+                                            "userErrors": []}})
+    dup = ops.product_duplicate(t, "gid://shopify/Product/1", "Nike - OUTLET")
+    assert (dup.product_gid, dup.image_job_id, dup.image_job_done) == ("gid://shopify/Product/999", None, None)
 
 
 def test_product_duplicate_forces_new_status_draft_fix1():
@@ -375,12 +400,14 @@ def test_adjust_request_sends_an_explicit_null_change_from():
     assert inp["changes"][0]["changeFromQuantity"] is None and "referenceDocumentUri" not in inp
 
 
-def test_activate_request_is_explicit_zero_and_keyed():
+def test_activate_request_is_an_explicit_zero_available_only_and_keyed():
+    """The pin refuses ``available`` and ``onHand`` together (F7.3 run 202610091404,
+    R053): the body names ``available`` 0 and nothing else."""
     import json
 
     doc = json.loads(ops.activate_request("i", "l", "k"))
-    v = doc["variables"]
-    assert (v["available"], v["onHand"], v["idempotencyKey"]) == (0, 0, "k")
+    assert doc["variables"] == {"inventoryItemId": "i", "locationId": "l", "available": 0, "idempotencyKey": "k"}
+    assert "onHand" not in doc["query"]
     assert "@idempotent(key: $idempotencyKey)" in doc["query"] and "userErrors { field message }" in doc["query"]
 
 
