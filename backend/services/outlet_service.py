@@ -25,8 +25,8 @@ The branches (rule 7: every variant a flow exposes is DENY + tracked first):
   ``changeFromQuantity``, keyed; no level precondition (``frozen_pre`` retired).
 * **DRAFT revive** — deferred while any ``RECONCILE`` row not closed records the
   product or one of its keys; first lowers to 0, relatively, every real-size
-  Promo variant with no shelf pair (a variant of another SKU: none of its own SKU,
-  F1), every held key's real-size variant and every
+  Promo variant with no shelf pair (a variant of another SKU or of none: always,
+  F1 / D1), every held key's real-size variant and every
   customisation-only variant with Promo > 0; activation, adds and the tail
   (``revive-tail``: DENY + tracked, ACTIVE, publish) only once every zeroing row
   has applied — else nothing is activated, added or exposed.
@@ -498,25 +498,14 @@ def revive_outlet(ctx: flows.Context, fresh: PlanAction, approved: PlanAction, *
     keys = tuple((sku, st.size) for st in targets)
     shelf_sizes = {p.size for p in ctx.register.shelf(sku)}
     held = {h.key for h in ctx.register.held_keys()}
-    foreign_sizes: Dict[str, Set[str]] = {}
-
-    def no_own_pair(v: Dict[str, Any]) -> bool:
-        """F1: a variant of another SKU has a shelf pair only under its own SKU;
-        one with no SKU has none (D59: no pair is CONSUMEd on it)."""
-        f = variants.foreign_sku(sku, v)
-        if f is None:
-            return False
-        if f == variants.BLANK_SKU:
-            return True
-        if f not in foreign_sizes:
-            foreign_sizes[f] = {p.size for p in ctx.register.shelf(f)}
-        return variants.variant_title(v) not in foreign_sizes[f]
 
     def must_zero(v: Dict[str, Any]) -> bool:
-        if variants.is_customisation_only(v):
+        # F1 / D1: a variant of another SKU, or of none (D59), is no key's variant here,
+        # whatever its own SKU's shelf holds — that pair may back a unit on its own outlet.
+        if variants.is_customisation_only(v) or variants.foreign_sku(sku, v) is not None:
             return True
         title = variants.variant_title(v)
-        return title in zero_titles or title not in shelf_sizes or (sku, title) in held or no_own_pair(v)
+        return title in zero_titles or title not in shelf_sizes or (sku, title) in held
 
     zero = [s for s in flows.zero_rows_for(ctx, inv, keys=keys, product=num, purpose=L.P_ZERO, which=must_zero)]
     tail = L.RowSpec(action=L.A_TAIL, keys=keys, product_id=num,

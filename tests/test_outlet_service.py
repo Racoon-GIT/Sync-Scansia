@@ -855,10 +855,11 @@ def test_f1_a_leading_space_is_another_sku_as_consume_reads_it():
 
 
 @pytest.mark.parametrize("own_pair", [False, True])
-def test_f1_a_revive_zeroes_a_unit_on_a_variant_of_another_sku_unless_that_sku_has_the_pair(own_pair):
-    """§3.3's revive zeroes every real-size variant with no shelf pair: a variant of
-    another SKU has one only under its own SKU — else the revive would expose a unit
-    whose sale CONSUMEs nothing."""
+def test_f1_a_revive_zeroes_a_unit_on_a_variant_of_another_sku_even_when_that_sku_has_the_pair(own_pair):
+    """§3.3's revive zeroes every real-size variant with no shelf pair of the key: a
+    variant of another SKU is no key's variant here, whatever its own SKU's shelf holds
+    (D1, coordinator verify r1: that pair may already back a unit on its own outlet —
+    two units, one pair; lowering errs to fewer)."""
     w = World()
     (e38,) = w.returned(sku=F1_SKU, size="38")
     w.returned(sku=F1_SKU, size="39")
@@ -869,7 +870,7 @@ def test_f1_a_revive_zeroes_a_unit_on_a_variant_of_another_sku_unless_that_sku_h
     assert [a.sku for a in plan.actions] == [F1_SKU]
     assert rep.outcomes[0].status == "REVIVED" and rep.outcomes[0].stamped_event_ids == (e38,)
     assert w.shop.products[out.gid].status == "ACTIVE" and w.shop.available(out.gid, "38") == 1
-    assert w.shop.available(out.gid, "39") == (1 if own_pair else 0)
+    assert w.shop.available(out.gid, "39") == 0
 
 
 def test_f1_the_apply_rereads_and_withholds_a_variant_respelled_after_the_plan():
