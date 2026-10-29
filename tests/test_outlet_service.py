@@ -26,7 +26,7 @@ from backend.persistence.records import (
     InsertAudit,
 )
 from backend.services import ledger as L
-from backend.services import outlet_service, passes
+from backend.services import outlet_service, passes, variants
 from backend.services.lease import PassLease
 from backend.shopify import ops
 
@@ -796,19 +796,52 @@ def test_f1_create_never_duplicates_for_a_size_whose_source_variant_is_another_s
     assert rep.outcomes[0].status == "NOTHING_TO_ADD" and w.mutated() == []
 
 
-@pytest.mark.parametrize("blank", [None, "", "   ", F1_SKU + "  "])
-def test_f1_a_blank_variant_sku_or_a_trailing_space_is_not_a_mismatch(blank):
-    """A blank SKU is no mismatch (the brief); a trailing space matches as CONSUME's
-    PAD SPACE ``utf8mb4_bin`` equality does (``scansia-sp-spec.md:44-46``)."""
+def test_f1_a_trailing_space_is_the_pairs_sku_as_consume_reads_it():
+    """A trailing space matches as CONSUME's PAD SPACE ``utf8mb4_bin`` equality does
+    (``scansia-sp-spec.md:44-46``)."""
     w = World()
-    (e,) = w.returned(sku=F1_SKU, size="39")
-    out = _f1_outlet(w, status="DRAFT", foreign=blank)
+    w.returned(sku=F1_SKU, size="39")
+    out = _f1_outlet(w, status="DRAFT", foreign=F1_SKU + "  ")
     plan, rep = w.run()
     (st,) = plan.actions[0].size_targets
     assert st.matched and st.variant_id == w.shop.variant(out.gid, "39").id
     assert not any(x.startswith("sku_mismatch_on_size") for x in plan.actions[0].warnings)
     assert rep.outcomes[0].status == "REVIVED" and w.shop.available(out.gid, "39") == 1
     assert w.unstamped() == []
+
+
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_f1_a_blank_variant_sku_is_withheld_like_another_sku(blank):
+    """D59 (coordinator, 2026-10-29): a blank-SKU variant's sale CONSUMEs no shelf pair
+    (``SKU = p_sku``) — withheld exactly like a variant of another SKU."""
+    w = World()
+    (e,) = w.returned(sku=F1_SKU, size="39")
+    out = _f1_outlet(w, status="DRAFT", foreign=blank)
+    plan, rep = w.run()
+    act = plan.actions[0]
+    assert act.unmatched_sizes == ("39",) and not act.size_targets[0].matched
+    assert f"sku_mismatch_on_size:39:{variants.BLANK_SKU}" in act.warnings
+    assert rep.outcomes[0].status == "NOTHING_TO_ADD" and w.mutated() == []
+    assert w.shop.available(out.gid, "39") == 0 and w.unstamped() == [e]
+
+
+def test_f1_an_absent_size_is_not_reported_as_a_blank_sku():
+    w = World()
+    w.returned(sku=F1_SKU, size="41")
+    _f1_outlet(w, status="DRAFT")
+    act = w.preview().actions[0]
+    assert act.unmatched_sizes == ("41",)
+    assert not any(x.startswith("sku_mismatch_on_size") for x in act.warnings)
+
+
+def test_f1_a_revive_zeroes_a_unit_on_a_blank_sku_variant():
+    w = World()
+    (e38,) = w.returned(sku=F1_SKU, size="38")
+    w.returned(sku=F1_SKU, size="39")
+    out = _f1_outlet(w, status="DRAFT", foreign=None, promo={"38": 0, "40": 0, "39": 1})
+    _plan, rep = w.run()
+    assert rep.outcomes[0].status == "REVIVED" and rep.outcomes[0].stamped_event_ids == (e38,)
+    assert w.shop.available(out.gid, "38") == 1 and w.shop.available(out.gid, "39") == 0
 
 
 def test_f1_a_leading_space_is_another_sku_as_consume_reads_it():
@@ -857,5 +890,8 @@ def test_f1_the_apply_rereads_and_withholds_a_variant_respelled_after_the_plan()
     assert specs == []
     assert [(i["kind"], i["size"], i["variant_sku"]) for i in ctx.report.items] == [
         ("sku_mismatch_withheld", "39", F1_FOREIGN)]
-    w.shop.variant(out.gid, "39").sku = None                            # blank: matched again
+    w.shop.variant(out.gid, "39").sku = None                            # blank: withheld too (D59)
+    assert outlet_service._add_specs(ctx, F1_SKU, [st], ctx.inventory(out.gid), 1) == []
+    assert ctx.report.items[-1]["variant_sku"] == variants.BLANK_SKU
+    w.shop.variant(out.gid, "39").sku = F1_SKU                          # the pair's own: matched again
     assert [s.action for s in outlet_service._add_specs(ctx, F1_SKU, [st], ctx.inventory(out.gid), 1)] == [L.A_ADJUST]

@@ -501,10 +501,13 @@ def revive_outlet(ctx: flows.Context, fresh: PlanAction, approved: PlanAction, *
     foreign_sizes: Dict[str, Set[str]] = {}
 
     def no_own_pair(v: Dict[str, Any]) -> bool:
-        """F1: a variant of another SKU has a shelf pair only under its own SKU."""
+        """F1: a variant of another SKU has a shelf pair only under its own SKU;
+        one with no SKU has none (D59: no pair is CONSUMEd on it)."""
         f = variants.foreign_sku(sku, v)
         if f is None:
             return False
+        if f == variants.BLANK_SKU:
+            return True
         if f not in foreign_sizes:
             foreign_sizes[f] = {p.size for p in ctx.register.shelf(f)}
         return variants.variant_title(v) not in foreign_sizes[f]

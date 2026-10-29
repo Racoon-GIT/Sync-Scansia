@@ -19,6 +19,7 @@ from backend.persistence.records import (
 from backend.services import baseline_service as B
 from backend.services import ledger as L
 from backend.services import relevel_service as R
+from backend.services import variants
 from backend.services.lease import PassLease
 
 from tests.fake_shop import PROMO
@@ -283,6 +284,22 @@ def test_f1_a_create_from_a_source_variant_of_another_sku_is_refused():
     plan, rep = relevel(env, [("SKU1", "42")])
     assert (plan.keys[0].branch, plan.keys[0].reason) == (R.BR_REFUSE, f"{R.F_SOURCE}:{R.F_SKU}:OTHER")
     assert "duplicate" not in env.shop.names()
+
+
+@pytest.mark.parametrize("on", ["outlet", "source"])
+def test_f1_a_blank_variant_sku_is_refused_like_another_sku(on):
+    """D59: a blank-SKU variant's sale CONSUMEs no shelf pair — not the key's variant."""
+    env = Env()
+    if on == "outlet":
+        env.shop.product("Nike - Outlet", sizes=("43",), promo={"43": 0, "42": 0}, extra_variants=(("42", None),))
+    else:
+        env.shop.product("Nike Air", outlet=False, sizes=("43",), extra_variants=(("42", None),))
+    env.imported(size="42", price_outlet="50.00", price_high="100.00")
+    env.run()
+    plan, _rep = relevel(env, [("SKU1", "42")])
+    why = f"{R.F_SKU}:{variants.BLANK_SKU}"
+    assert (plan.keys[0].branch, plan.keys[0].reason) == (R.BR_REFUSE, why if on == "outlet" else f"{R.F_SOURCE}:{why}")
+    assert not [c for c in env.shop.calls if c[0] in ("duplicate", "adjust", "activate")]
 
 
 def test_f1_a_relevel_of_n0_still_lowers_a_variant_of_another_sku():

@@ -942,9 +942,22 @@ def test_f1_a_draft_key_on_a_variant_of_another_sku_is_still_zeroed():
 
 
 @pytest.mark.parametrize("blank", [None, ""])
-def test_f1_a_blank_variant_sku_is_levelled_as_ever(blank):
+def test_f1_a_blank_variant_sku_is_held_like_another_sku(blank):
+    """D59: a blank-SKU variant's sale CONSUMEs no shelf pair — not the key's variant."""
     env = Env()
     out = _foreign_outlet(env, foreign=blank)
+    _, e = env.imported(size="42")
+    plan = env.preview()
+    kp = by_key(plan)[("SKU1", "42")]
+    assert (kp.action, kp.reason) == (B.ACT_HOLD, f"{B.R_SKU_MISMATCH}:{variants.BLANK_SKU}")
+    assert kp.outlets[0].foreign_sku == variants.BLANK_SKU
+    env.apply(plan)
+    assert env.shop.available(out.gid, "42") == 0 and env.unstamped() == [e]
+
+
+def test_f1_the_pairs_own_sku_is_levelled_as_ever():
+    env = Env()
+    out = _foreign_outlet(env, foreign="SKU1")
     env.imported(size="42")
     plan = env.preview()
     kp = by_key(plan)[("SKU1", "42")]

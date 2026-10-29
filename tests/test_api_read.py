@@ -286,11 +286,12 @@ def test_read_endpoints_require_auth(monkeypatch, method, path):
     assert getattr(client, method)(path).status_code == 401
 
 
-def test_join_shows_a_title_match_on_a_variant_of_another_sku_f1():
+@pytest.mark.parametrize("variant_sku, shown", [("OTHER", "OTHER"), (None, "(blank)")])
+def test_join_shows_a_title_match_on_a_variant_of_another_sku_f1(variant_sku, shown):
     be, shop = MemoryBackend(), FakeShop()
-    shop.product("SKU1 - Outlet", sizes=("43",), promo={"43": 0, "42": 1}, extra_variants=(("42", "OTHER"),))
+    shop.product("SKU1 - Outlet", sizes=("43",), promo={"43": 0, "42": 1}, extra_variants=(("42", variant_sku),))
     r = join_group("SKU1", _pairs(be, ("SKU1", "42")), shop, PROMO, now=_clock)
     (s,) = r.sizes
-    assert (s.matched, s.foreign_sku) == (True, "OTHER")
-    assert CHIP_MISMATCH in r.chips and "sku_mismatch_on_size:42:OTHER" in r.warnings
-    assert join_result_to_dict(r)["sizes"][0]["foreign_sku"] == "OTHER"
+    assert (s.matched, s.foreign_sku) == (True, shown)
+    assert CHIP_MISMATCH in r.chips and f"sku_mismatch_on_size:42:{shown}" in r.warnings
+    assert join_result_to_dict(r)["sizes"][0]["foreign_sku"] == shown
