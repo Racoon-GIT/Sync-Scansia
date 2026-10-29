@@ -7,7 +7,8 @@
   spelling-exact). A match found only after normalisation (case, comma / dot,
   inner spaces: ``42L`` vs ``42 L``) is a *twin*: surfaced for respelling at the
   source, never published — a ``42L`` pair published on ``42 L`` would sell
-  unrecorded.
+  unrecorded. A title match whose variant carries another, non-blank SKU is
+  never raised either (``foreign_sku``, F1) — same reason: it sells unrecorded.
 * **Customisation-only variants** (§3.3 rule 7) are identified by option value,
   never by a blank SKU (seven carry a real SKU): any option value or title
   containing "personalizzazione", case-folded — the measured spellings are
@@ -57,6 +58,22 @@ def match_exact(size: str, variants: Iterable[Dict[str, Any]]) -> Optional[Dict[
         if variant_title(v) == size:
             return v
     return None
+
+
+def foreign_sku(sku: str, variant: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The variant's SKU when it is non-blank and differs from the pair's ``sku``,
+    else ``None`` (a blank SKU is no mismatch). Such a title match is never raised
+    (F7.4 review, F1): its order line carries the variant's SKU, CONSUME finds no
+    shelf pair and the register never decrements — a phantom unit."""
+    vs = str((variant or {}).get("sku") or "").strip()
+    return vs if vs and vs != sku else None
+
+
+def match_to_raise(sku: str, size: str, variants: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """``match_exact`` for a flow that raises a Promo level: ``None`` on a
+    foreign-SKU match too — each flow's "size the outlet lacks" path."""
+    v = match_exact(size, variants)
+    return None if v is None or foreign_sku(sku, v) else v
 
 
 def twins(size: str, variants: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -111,6 +128,6 @@ def has_non_promo_stock(variants: Iterable[Dict[str, Any]], promo_id: str) -> bo
 
 __all__ = [
     "SIZE_OPTION_NAMES", "variant_title", "is_customisation_only", "real_size_variants",
-    "twin_form", "match_exact", "twins", "item_id", "promo_level", "promo_available",
+    "twin_form", "match_exact", "foreign_sku", "match_to_raise", "twins", "item_id", "promo_level", "promo_available",
     "has_non_promo_stock",
 ]

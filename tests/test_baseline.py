@@ -888,3 +888,60 @@ def test_a_shopify_failure_inside_one_key_holds_that_key_and_the_run_goes_on():
     assert outcome(rep, "A", "42").reason == "shopify_error:ShopifyOutcomeUnknown"
     assert outcome(rep, "B", "42").result == "levelled" and env.shop.available(b.gid, "42") == 1
     assert env.invariant() == {}
+
+
+# ---------------------------------------------------------------------------
+# F1 (F7.4 baseline review): no level-up on a title match of another SKU
+# ---------------------------------------------------------------------------
+def _foreign_outlet(env: Env, *, status="ACTIVE", foreign="OTHER", promo=None, absent=()):
+    """SKU1's outlet (it resolves by its 43) whose variant «42» carries ``foreign``."""
+    return env.shop.product("Nike - Outlet", status=status, sizes=("43",), promo=promo or {"43": 0, "42": 0},
+                            absent=absent, extra_variants=(("42", foreign),))
+
+
+@pytest.mark.parametrize("absent", [(), ("42",)])
+def test_f1_an_active_level_up_on_a_variant_of_another_sku_is_held(absent):
+    env = Env()
+    out = _foreign_outlet(env, absent=absent)
+    _, e = env.imported(size="42")
+    plan = env.preview()
+    kp = by_key(plan)[("SKU1", "42")]
+    assert (kp.action, kp.reason, kp.delta) == (B.ACT_HOLD, f"{B.R_SKU_MISMATCH}:OTHER", 0)
+    assert kp.outlets[0].foreign_sku == "OTHER"
+    env.apply(plan)
+    assert env.shop.available(out.gid, "42") == (None if absent else 0)
+    assert not [c for c in env.shop.calls if c[0] in ("adjust", "activate")]
+    assert env.held() == {("SKU1", "42"): f"{B.R_SKU_MISMATCH}:OTHER"} and env.unstamped() == [e]
+    assert env.invariant() == {}
+
+
+def test_f1_a_level_down_on_a_variant_of_another_sku_still_lowers():
+    env = Env()
+    out = _foreign_outlet(env, promo={"43": 0, "42": 2})
+    env.imported(size="42")
+    plan = env.preview()
+    kp = by_key(plan)[("SKU1", "42")]
+    assert (kp.action, kp.delta, kp.activate) == (B.ACT_LEVEL, -1, False)
+    env.apply(plan)
+    assert env.shop.available(out.gid, "42") == 1 and env.held() == {}   # lowering errs to fewer (§3.3)
+
+
+@pytest.mark.parametrize("blank", [None, ""])
+def test_f1_a_blank_variant_sku_is_levelled_as_ever(blank):
+    env = Env()
+    out = _foreign_outlet(env, foreign=blank)
+    env.imported(size="42")
+    plan = env.preview()
+    kp = by_key(plan)[("SKU1", "42")]
+    assert (kp.action, kp.delta) == (B.ACT_LEVEL, 1) and kp.outlets[0].foreign_sku is None
+    env.apply(plan)
+    assert env.shop.available(out.gid, "42") == 1 and env.held() == {}
+
+
+def test_f1_a_source_variant_of_another_sku_is_listed_for_the_create():
+    env = Env()
+    env.shop.product("Nike Air", outlet=False, sizes=("43",), extra_variants=(("42", "OTHER"),))
+    env.imported(size="42")
+    plan = env.preview()
+    assert by_key(plan)[("SKU1", "42")].action == B.ACT_NONE
+    assert [(c.sku, c.size, c.note) for c in plan.catalogue] == [("SKU1", "42", "sku_mismatch_on_source:OTHER")]

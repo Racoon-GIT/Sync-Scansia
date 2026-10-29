@@ -281,14 +281,15 @@ def _targets(sku: str, groups: Tuple[passes.KeyGroup, ...], live: List[Dict[str,
         delta = g.delta - sum(e.delta for e in g.events if e.pair_id in out_pairs)
         if delta <= 0:
             continue
-        v = variants.match_exact(g.key[1], live)
+        foreign = variants.foreign_sku(sku, variants.match_exact(g.key[1], live))
+        v = variants.match_to_raise(sku, g.key[1], live)
         twin_titles = tuple(variants.variant_title(t) for t in variants.twins(g.key[1], live))
         if v is None:
-            unmatched.append(g.key[1])
+            unmatched.append(g.key[1])                         # pending, surfaced (§3.3's size the outlet lacks)
             if twin_titles:
                 warns.append(f"size_twin:{g.key[1]}:{'|'.join(twin_titles)}")
-        elif v.get("sku") and str(v["sku"]).strip() and str(v["sku"]).strip() != sku:
-            warns.append(f"sku_mismatch_on_size:{g.key[1]}:{str(v['sku']).strip()}")
+            if foreign:
+                warns.append(f"sku_mismatch_on_size:{g.key[1]}:{foreign}")   # F1: respell the pair or the variant
         targets.append(SizeTarget(size=g.key[1], event_ids=tuple(e.event_id for e in events), delta=delta,
                                   matched=v is not None, variant_id=v.get("id") if v else None,
                                   inventory_item_id=variants.item_id(v), twins=twin_titles))
@@ -400,8 +401,11 @@ def _add_specs(ctx: flows.Context, sku: str, targets: List[SizeTarget], inv: Lis
                product: Optional[int]) -> List[L.RowSpec]:
     specs: List[L.RowSpec] = []
     for st in targets:
-        v = variants.match_exact(st.size, inv)
+        v = variants.match_to_raise(sku, st.size, inv)
         if v is None:
+            foreign = variants.foreign_sku(sku, variants.match_exact(st.size, inv))
+            if foreign:          # respelled since the plan: withheld, its events pending (F1)
+                ctx.report.surface("sku_mismatch_withheld", sku=sku, size=st.size, variant_sku=foreign)
             continue
         key = (sku, st.size)
         lvl = flows.promo_of(v, ctx.promo)
@@ -552,8 +556,9 @@ def create_outlet(ctx: flows.Context, fresh: PlanAction, approved: PlanAction) -
         return ApplyOutcome(sku, BRANCH_CREATE, "ERROR", None, fresh.warnings + ("duplicate_refused",))
     new_gid = dup.product_gid
     num = product_number(new_gid)
-    # The image copy runs on after the call (an async job): its id and `done` stay on
-    # the row, so an outlet whose copy failed can be traced (§8 F3).
+    # The store answers `imageJob: null` and the duplicate references the source's
+    # image files (F7.3 run 202610092018, D1); a job, if one is returned, stays on
+    # the row with its `done`, so its copy can be traced (§8 F3).
     job = ({"image_job": dup.image_job_id, "image_job_done": dup.image_job_done}
            if dup.image_job_id is not None else None)
     ctx.register.record_outcome(ctx.ledger.lease, row.row_id, expect=OPEN, product_id=num, step="1:duplicate:id",

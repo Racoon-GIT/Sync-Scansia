@@ -23,7 +23,9 @@ Semantics modelled (each from the 2026-10 docs the build read):
 * products: status, publication, variants (policy, tracked, title, SKU),
   collection membership (``inCollection``), ``productDuplicate`` (a DRAFT
   copy that inherits the source's levels; its images only with
-  ``includeImages: true``, answered with an ``imageJob``), ``productDelete``;
+  ``includeImages: true``; an ``imageJob`` whenever images exist — the live
+  store answers ``null`` and references the source's files, D1 — so both
+  answers are exercised), ``productDelete``;
   media: a product's image URLs (``media``; default one per handle).
 
 Fault injection: ``shop.fault(op, kind, times=1, when=...)`` with kinds
@@ -327,7 +329,7 @@ class FakeShop:
             self.truncated.add(gid)
         copied = self.images(src) if v.get("includeImages") is True else []   # includeImages defaults to false
         self.media[gid] = list(copied)
-        job = {"id": self._id("Job"), "done": False} if copied else None     # the copy is an async job
+        job = {"id": self._id("Job"), "done": False} if copied else None     # a job if images; the live store: null (D1)
         return {"productDuplicate": {"newProduct": {"id": gid, "title": v["newTitle"], "handle": "", "status": "DRAFT"},
                                      "imageJob": job, "userErrors": []}}
 

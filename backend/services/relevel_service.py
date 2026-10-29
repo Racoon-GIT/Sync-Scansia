@@ -79,6 +79,7 @@ F_UNRESOLVED = "unresolved"
 F_UNREADABLE = "outlet_unreadable"
 F_MULTI = "multi_outlet"
 F_SIZE = "size_absent"
+F_SKU = "sku_mismatch_on_size"         # + ":<variant sku>": a title match of another SKU is never raised (F1)
 F_STATUS = "unexpected_status"
 F_COMMITTED = "committed_on_upward_adjust"
 F_PRICE = "fix4"
@@ -163,7 +164,10 @@ def _source(transport: Any, sku: str, size: str) -> Tuple[Optional[Dict[str, Any
         v = variants.match_exact(size, ops.get_product_variants(transport, srcs[0]["product_gid"]))
     except (ShopifyTransportError, ShopifyUserError, RuntimeError) as e:
         return None, None, f"unreadable:{type(e).__name__}"
-    return (srcs[0], v, None) if v is not None else (None, None, "size_absent")
+    if v is None:
+        return None, None, "size_absent"
+    foreign = variants.foreign_sku(sku, v)
+    return (None, None, f"{F_SKU}:{foreign}") if foreign else (srcs[0], v, None)
 
 
 def _plan_key(register: Any, transport: Any, reader: BS.OutletReader, k: Key, holds: Sequence[Hold],
@@ -220,10 +224,14 @@ def _plan_key(register: Any, transport: Any, reader: BS.OutletReader, k: Key, ho
     if o.status == "ACTIVE":
         activate = not (f.level and f.active)
         delta = n - (0 if activate else (f.available or 0))
+        if (activate or delta > 0) and f.foreign_sku:
+            return refuse(f"{F_SKU}:{f.foreign_sku}", outlets=facts)   # the key stays held (§3.4)
         if (activate or delta > 0) and (f.committed or 0) > 0:
             return refuse(F_COMMITTED, outlets=facts)
         return RelevelKey(**base, branch=BR_ACTIVE, outlets=facts, delta=delta, activate=activate, **prices)
     if o.status == "DRAFT":
+        if f.foreign_sku:                          # zero-then-revive always adds N (> 0 here)
+            return refuse(f"{F_SKU}:{f.foreign_sku}", outlets=facts)
         return RelevelKey(**base, branch=BR_REVIVE, outlets=facts, delta=n - f.p, **prices)
     return refuse(f"{F_STATUS}:{o.status or 'NONE'}", outlets=facts)
 
@@ -461,7 +469,7 @@ def relevel_apply(
 
 __all__ = [
     "BR_ACTIVE", "BR_REVIVE", "BR_CREATE", "BR_LOWER", "BR_REFUSE",
-    "F_BLANK", "F_IN_FLIGHT", "F_UNRESOLVED", "F_UNREADABLE", "F_MULTI", "F_SIZE", "F_STATUS", "F_COMMITTED",
+    "F_BLANK", "F_IN_FLIGHT", "F_UNRESOLVED", "F_UNREADABLE", "F_MULTI", "F_SIZE", "F_SKU", "F_STATUS", "F_COMMITTED",
     "F_PRICE", "F_SOURCE", "R_MOVED",
     "ST_APPLIED", "ST_PRECONDITION_REFUSED", "ST_LEASE_UNAVAILABLE", "ST_BASELINE_MISSING", "ST_INCOMPLETE",
     "RELEVEL_TAKE_BOUND_S", "RelevelKey", "RelevelPlan", "RelevelOutcome", "RelevelReport",
