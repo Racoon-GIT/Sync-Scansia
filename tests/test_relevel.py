@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import List, Sequence, Tuple
 
+import pytest
+
 from backend.persistence.records import (
     HELD,
     KIND_BASELINE,
@@ -245,6 +247,22 @@ def test_f1_an_active_relevel_up_is_refused_until_the_variant_is_respelled():
     env.shop.variant(out.gid, "42").sku = "SKU1"                               # a person respells the variant
     _, rep = relevel(env, [("SKU1", "42")])
     assert result(rep, "SKU1", "42").result == "released" and env.shop.available(out.gid, "42") == 1
+
+
+@pytest.mark.parametrize("promo", [1, 2])
+def test_f1_an_active_relevel_at_or_above_n_on_a_variant_of_another_sku_is_refused_too(promo):
+    """Not the key's variant: a re-level never releases the key onto it (nor stamps,
+    nor sets ONLINE), whatever the direction — the hold's own lowering takes the excess."""
+    env = Env()
+    out = _f1_outlet(env, promo={"43": 0, "42": promo})
+    env.imported(size="42", price_outlet="50.00", price_high="100.00")
+    env.run()
+    assert held_keys(env) == [("SKU1", "42")] and env.shop.available(out.gid, "42") == 1
+    before = len(env.shop.calls)
+    plan, rep = relevel(env, [("SKU1", "42")])
+    assert (plan.keys[0].branch, plan.keys[0].reason) == (R.BR_REFUSE, f"{R.F_SKU}:OTHER")
+    assert not [c for c in env.shop.calls[before:] if c[0] in MUTATIONS]
+    assert held_keys(env) == [("SKU1", "42")] and not env.register().shelf("SKU1")[0].online
 
 
 def test_f1_a_zero_then_revive_onto_a_variant_of_another_sku_is_refused():

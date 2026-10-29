@@ -272,16 +272,20 @@ nothing (R025). The fake models the three answers (`tests/fake_shop.py`), so `sh
 
 Brief `IT/_scansia-programme/briefs/sync-scansia-F7.4-F1-guard.md`, on `fix/f7-f1-sku-guard`. F1 (`PROGRAM.md`, grep
 `F1 CONFIRMED`): pair 370 `AR-W-DNMLEOM` `39` matches by title variant «39» of a DRAFT outlet whose SKU is
-`AR-W-LEOM-DNM`; a revive would add +1 there and its sale would CONSUME no shelf pair. `variants.foreign_sku` names a
-title match whose variant SKU is non-blank (stripped) and not the pair's; every raising flow takes its own "size the
-outlet lacks" path on it (FIX5's warning used to warn and still add). Lowering flows (minus, Δ 0, the held-key
-lowering, the N-0 release, a re-level of N 0, a baseline level-down) still match by title: fewer, never more (§3.3).
+`AR-W-LEOM-DNM`; a revive would add +1 there and its sale would CONSUME no shelf pair (CONSUME: `SKU = p_sku`,
+`utf8mb4_bin` PAD SPACE — STOCK_Manager `docs/scansia-sp-spec.md:40-46`). `variants.foreign_sku` names a title match
+whose variant SKU is non-blank and, trailing spaces aside (PAD SPACE), not the pair's: it is not the key's variant.
+No flow raises, levels, stamps or sets `ONLINE` against it — each takes its own "size the outlet lacks" path (FIX5's
+warning used to warn and still add); a revive zeroes it unless its own SKU has the pair. Lowering flows (minus, Δ 0,
+the held-key lowering, the N-0 release, a re-level of N 0, a hold's excess, a DRAFT zero) still match by title:
+fewer, never more (§3.3).
 
 | Item | Mechanism | Pinned by |
 |---|---|---|
 | F1 publish | ACTIVE add / DRAFT revive / CREATE (on the source's variant): the size is unmatched, in `unmatched_sizes`, warned `sku_mismatch_on_size:<size>:<variant sku>` in the preview and the outcome; its events pending, never stamped, no row | `out` f1_a_pair_never_raises_a_variant_of_another_sku ×2 (DRAFT, ACTIVE); f1_a_revive_adds_the_sizes_of_its_own_sku_and_withholds_the_foreign_one; f1_create_never_duplicates…; size_primary_exact_match_withholds_a_variant_of_another_sku; fix5_sku_cross_check_fires_on_active_branch |
 | F1 apply | `_add_specs` re-matches the re-read inventory by the same rule: no row, `sku_mismatch_withheld` surfaced | `out` f1_the_apply_rereads_and_withholds_a_variant_respelled_after_the_plan |
-| F1 blank | a blank or NULL variant SKU is no mismatch: matched and raised as before | `out` f1_a_blank_variant_sku_is_not_a_mismatch ×3 (None, "", spaces); `base` f1_a_blank_variant_sku_is_levelled_as_ever ×2 |
-| F1 baseline | an ACTIVE level-up (`activate` or Δ > 0) on a foreign-SKU variant → key held `sku_mismatch_on_size:<variant sku>`, nothing written; a level-down still lowers; `VariantFacts.foreign_sku`; a CREATE key's source variant listed `sku_mismatch_on_source:<sku>` | `base` f1_an_active_level_up_on_a_variant_of_another_sku_is_held ×2 (level present, absent); f1_a_level_down…_still_lowers; f1_a_source_variant_of_another_sku_is_listed_for_the_create |
-| F1 re-level | ACTIVE up, zero-then-revive, CREATE from a foreign-SKU source variant → refused `sku_mismatch_on_size:…` (the key stays held) until respelled; N 0 still lowers; a respelling between preview and confirm is *moved* (`foreign_sku` in the facts compared) | `rel` f1_an_active_relevel_up_is_refused_until_the_variant_is_respelled; f1_a_zero_then_revive…; f1_a_create_from_a_source_variant…; f1_a_relevel_of_n0_still_lowers…; f1_a_variant_respelled…_is_moved |
+| F1 spelling | blank / NULL / spaces-only variant SKU: no mismatch; a trailing space matches (PAD SPACE); a leading space is another SKU | `out` f1_a_blank_variant_sku_or_a_trailing_space_is_not_a_mismatch ×4; f1_a_leading_space_is_another_sku_as_consume_reads_it; `base` f1_a_blank_variant_sku_is_levelled_as_ever ×2 |
+| F1 revive | §3.3's zeroing of a real-size variant with no shelf pair: a variant of another SKU has one only under its own SKU — zeroed before the tail exposes it, kept when its own SKU has the pair | `out` f1_a_revive_zeroes_a_unit_on_a_variant_of_another_sku_unless_that_sku_has_the_pair ×2 |
+| F1 baseline | ACTIVE, N > 0, on a foreign-SKU variant → key held `sku_mismatch_on_size:<variant sku>`, never levelled (the hold lowers its excess); a DRAFT key still zeroed; `VariantFacts.foreign_sku`; a CREATE key's source variant listed `sku_mismatch_on_source:<sku>` | `base` f1_an_active_level_up_on_a_variant_of_another_sku_is_held ×2 (level present, absent); f1_a_level_down_or_equal…_is_held_its_excess_lowered ×2; f1_a_draft_key…_is_still_zeroed; f1_a_source_variant_of_another_sku_is_listed_for_the_create |
+| F1 re-level | ACTIVE (any direction), zero-then-revive, CREATE from a foreign-SKU source variant → refused `sku_mismatch_on_size:…` (the key stays held) until respelled; N 0 still lowers; a respelling between preview and confirm is *moved* (`foreign_sku` in the facts compared) | `rel` f1_an_active_relevel_up_is_refused_until_the_variant_is_respelled; f1_an_active_relevel_at_or_above_n…_is_refused_too ×2; f1_a_zero_then_revive…; f1_a_create_from_a_source_variant…; f1_a_relevel_of_n0_still_lowers…; f1_a_variant_respelled…_is_moved |
 | F1 page | the inventory join shows the variant's SKU (`foreign_sku`, «SKU diversa»), chip mismatch, warning | `read` join_shows_a_title_match_on_a_variant_of_another_sku_f1 |

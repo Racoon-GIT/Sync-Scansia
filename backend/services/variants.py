@@ -63,10 +63,13 @@ def match_exact(size: str, variants: Iterable[Dict[str, Any]]) -> Optional[Dict[
 def foreign_sku(sku: str, variant: Optional[Dict[str, Any]]) -> Optional[str]:
     """The variant's SKU when it is non-blank and differs from the pair's ``sku``,
     else ``None`` (a blank SKU is no mismatch). Such a title match is never raised
-    (F7.4 review, F1): its order line carries the variant's SKU, CONSUME finds no
-    shelf pair and the register never decrements — a phantom unit."""
-    vs = str((variant or {}).get("sku") or "").strip()
-    return vs if vs and vs != sku else None
+    (F7.4 review, F1): its order line carries the variant's SKU, CONSUME matches
+    ``SKU = p_sku`` exactly (``utf8mb4_bin``, PAD SPACE: a trailing space still
+    matches, a leading one does not — STOCK_Manager ``docs/scansia-sp-spec.md:40-46``),
+    finds no shelf pair, and the register never decrements — a phantom unit."""
+    raw = str((variant or {}).get("sku") or "")
+    vs = raw.rstrip(" ")
+    return vs if raw.strip() and vs != sku else None
 
 
 def match_to_raise(sku: str, size: str, variants: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

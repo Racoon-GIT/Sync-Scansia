@@ -79,7 +79,7 @@ F_UNRESOLVED = "unresolved"
 F_UNREADABLE = "outlet_unreadable"
 F_MULTI = "multi_outlet"
 F_SIZE = "size_absent"
-F_SKU = "sku_mismatch_on_size"         # + ":<variant sku>": a title match of another SKU is never raised (F1)
+F_SKU = "sku_mismatch_on_size"         # + ":<variant sku>": a title match of another SKU is never levelled (F1)
 F_STATUS = "unexpected_status"
 F_COMMITTED = "committed_on_upward_adjust"
 F_PRICE = "fix4"
@@ -224,8 +224,8 @@ def _plan_key(register: Any, transport: Any, reader: BS.OutletReader, k: Key, ho
     if o.status == "ACTIVE":
         activate = not (f.level and f.active)
         delta = n - (0 if activate else (f.available or 0))
-        if (activate or delta > 0) and f.foreign_sku:
-            return refuse(f"{F_SKU}:{f.foreign_sku}", outlets=facts)   # the key stays held (§3.4)
+        if f.foreign_sku:                          # not the key's variant: never levelled (§3.4: stays held)
+            return refuse(f"{F_SKU}:{f.foreign_sku}", outlets=facts)
         if (activate or delta > 0) and (f.committed or 0) > 0:
             return refuse(F_COMMITTED, outlets=facts)
         return RelevelKey(**base, branch=BR_ACTIVE, outlets=facts, delta=delta, activate=activate, **prices)

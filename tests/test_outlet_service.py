@@ -796,8 +796,10 @@ def test_f1_create_never_duplicates_for_a_size_whose_source_variant_is_another_s
     assert rep.outcomes[0].status == "NOTHING_TO_ADD" and w.mutated() == []
 
 
-@pytest.mark.parametrize("blank", [None, "", "   "])
-def test_f1_a_blank_variant_sku_is_not_a_mismatch(blank):
+@pytest.mark.parametrize("blank", [None, "", "   ", F1_SKU + "  "])
+def test_f1_a_blank_variant_sku_or_a_trailing_space_is_not_a_mismatch(blank):
+    """A blank SKU is no mismatch (the brief); a trailing space matches as CONSUME's
+    PAD SPACE ``utf8mb4_bin`` equality does (``scansia-sp-spec.md:44-46``)."""
     w = World()
     (e,) = w.returned(sku=F1_SKU, size="39")
     out = _f1_outlet(w, status="DRAFT", foreign=blank)
@@ -807,6 +809,34 @@ def test_f1_a_blank_variant_sku_is_not_a_mismatch(blank):
     assert not any(x.startswith("sku_mismatch_on_size") for x in plan.actions[0].warnings)
     assert rep.outcomes[0].status == "REVIVED" and w.shop.available(out.gid, "39") == 1
     assert w.unstamped() == []
+
+
+def test_f1_a_leading_space_is_another_sku_as_consume_reads_it():
+    w = World()
+    (e,) = w.returned(sku=F1_SKU, size="39")
+    out = _f1_outlet(w, status="DRAFT", foreign=" " + F1_SKU)
+    plan, rep = w.run()
+    assert plan.actions[0].unmatched_sizes == ("39",)
+    assert rep.outcomes[0].status == "NOTHING_TO_ADD" and w.shop.available(out.gid, "39") == 0
+    assert w.unstamped() == [e]
+
+
+@pytest.mark.parametrize("own_pair", [False, True])
+def test_f1_a_revive_zeroes_a_unit_on_a_variant_of_another_sku_unless_that_sku_has_the_pair(own_pair):
+    """§3.3's revive zeroes every real-size variant with no shelf pair: a variant of
+    another SKU has one only under its own SKU — else the revive would expose a unit
+    whose sale CONSUMEs nothing."""
+    w = World()
+    (e38,) = w.returned(sku=F1_SKU, size="38")
+    w.returned(sku=F1_SKU, size="39")
+    if own_pair:
+        w.be.add_pair(F1_FOREIGN, "39")                                 # on the shelf, nothing pending
+    out = _f1_outlet(w, status="DRAFT", promo={"38": 0, "40": 0, "39": 1})
+    plan, rep = w.run()
+    assert [a.sku for a in plan.actions] == [F1_SKU]
+    assert rep.outcomes[0].status == "REVIVED" and rep.outcomes[0].stamped_event_ids == (e38,)
+    assert w.shop.products[out.gid].status == "ACTIVE" and w.shop.available(out.gid, "38") == 1
+    assert w.shop.available(out.gid, "39") == (1 if own_pair else 0)
 
 
 def test_f1_the_apply_rereads_and_withholds_a_variant_respelled_after_the_plan():

@@ -123,7 +123,7 @@ R_UNRESOLVED = "unresolved"
 R_UNREADABLE = "outlet_unreadable"
 R_MULTI_OUTLET = "multi_outlet"
 R_SIZE_ABSENT = "size_absent"
-R_SKU_MISMATCH = "sku_mismatch_on_size"   # + ":<variant sku>" — a level-up there is never written (F1)
+R_SKU_MISMATCH = "sku_mismatch_on_size"   # + ":<variant sku>": not the key's variant, never levelled (F1)
 R_STATUS = "unexpected_status"
 R_COMMITTED = "committed_on_upward_adjust"
 R_MOVED = "moved_at_confirm"
@@ -570,7 +570,7 @@ def _decide(k: Key, shelf: Sequence[PairRow], events: Sequence[EventRow], on_she
     if o.status == "ACTIVE":                          # (a)
         activate = n > 0 and not (f.level and f.active)
         delta = n - (0 if activate else (f.available or 0))
-        if (activate or delta > 0) and f.foreign_sku:
+        if n > 0 and f.foreign_sku:                   # not the key's variant: never levelled, its excess lowered
             return hold(f"{R_SKU_MISMATCH}:{f.foreign_sku}")   # a person respells the pair or the variant
         if (activate or delta > 0) and (f.committed or 0) > 0:
             return hold(R_COMMITTED)
@@ -766,11 +766,12 @@ def _catalogue(reader: OutletReader, keys: Sequence[KeyPlan]) -> List[CatalogueN
         else:
             for kp in kps:
                 v = variants.match_exact(kp.size, src_variants)
+                foreign = variants.foreign_sku(sku, v)
                 if v is None:
                     twins = tuple(variants.variant_title(t) for t in variants.twins(kp.size, src_variants))
                     out.append(CatalogueNote(sku, kp.size, "size_absent_on_source", twins))
-                elif variants.foreign_sku(sku, v):
-                    out.append(CatalogueNote(sku, kp.size, f"sku_mismatch_on_source:{variants.foreign_sku(sku, v)}"))
+                elif foreign:
+                    out.append(CatalogueNote(sku, kp.size, f"sku_mismatch_on_source:{foreign}"))
     return out
 
 

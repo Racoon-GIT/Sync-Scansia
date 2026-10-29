@@ -915,15 +915,30 @@ def test_f1_an_active_level_up_on_a_variant_of_another_sku_is_held(absent):
     assert env.invariant() == {}
 
 
-def test_f1_a_level_down_on_a_variant_of_another_sku_still_lowers():
+@pytest.mark.parametrize("promo, lowered_to", [(2, 1), (1, 1)])
+def test_f1_a_level_down_or_equal_on_a_variant_of_another_sku_is_held_its_excess_lowered(promo, lowered_to):
+    """Not the key's variant: never levelled, stamped or set ONLINE — held and listed;
+    the hold still lowers the excess (fewer, §3.3)."""
     env = Env()
-    out = _foreign_outlet(env, promo={"43": 0, "42": 2})
-    env.imported(size="42")
+    out = _foreign_outlet(env, promo={"43": 0, "42": promo})
+    pid, e = env.imported(size="42")
     plan = env.preview()
     kp = by_key(plan)[("SKU1", "42")]
-    assert (kp.action, kp.delta, kp.activate) == (B.ACT_LEVEL, -1, False)
+    assert (kp.action, kp.reason, kp.delta) == (B.ACT_HOLD, f"{B.R_SKU_MISMATCH}:OTHER", lowered_to - promo)
     env.apply(plan)
-    assert env.shop.available(out.gid, "42") == 1 and env.held() == {}   # lowering errs to fewer (§3.3)
+    assert env.shop.available(out.gid, "42") == lowered_to
+    assert env.held() == {("SKU1", "42"): f"{B.R_SKU_MISMATCH}:OTHER"} and env.unstamped() == [e]
+    assert not env.register().shelf("SKU1")[0].online
+
+
+def test_f1_a_draft_key_on_a_variant_of_another_sku_is_still_zeroed():
+    env = Env()
+    out = _foreign_outlet(env, status="DRAFT", promo={"43": 0, "42": 1})
+    _, e = env.imported(size="42")
+    plan = env.preview()
+    assert by_key(plan)[("SKU1", "42")].action == B.ACT_ZERO
+    env.apply(plan)
+    assert env.shop.available(out.gid, "42") == 0 and env.unstamped() == [e]   # its +1 withheld by the publish
 
 
 @pytest.mark.parametrize("blank", [None, ""])
