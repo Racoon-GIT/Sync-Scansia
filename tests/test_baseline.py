@@ -973,3 +973,17 @@ def test_f1_a_source_variant_of_another_sku_is_listed_for_the_create():
     plan = env.preview()
     assert by_key(plan)[("SKU1", "42")].action == B.ACT_NONE
     assert [(c.sku, c.size, c.note) for c in plan.catalogue] == [("SKU1", "42", "sku_mismatch_on_source:OTHER")]
+
+
+def test_f1_a_variant_respelled_between_the_preview_and_the_confirm_is_moved():
+    """Verify batch 2 m5 (review H6): the confirm's re-read compares ``foreign_sku`` —
+    a level planned on the pair's own SKU is never written once respelled."""
+    env = Env()
+    out = env.shop.product("Nike - Outlet", status="ACTIVE", promo={"42": 0, "43": 0})
+    env.imported(size="42")
+    plan = env.preview()
+    assert by_key(plan)[("SKU1", "42")].action == B.ACT_LEVEL
+    env.shop.variant(out.gid, "42").sku = "OTHER"
+    env.apply(plan)
+    assert env.held() == {("SKU1", "42"): B.R_MOVED} and env.shop.available(out.gid, "42") == 0
+    assert not [c for c in env.shop.calls if c[0] in ("adjust", "activate")]

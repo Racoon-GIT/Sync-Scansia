@@ -37,7 +37,8 @@ The branches (rule 7: every variant a flow exposes is DENY + tracked first):
   non-Promo level, zero every Promo variant, add the returned sizes, DENY +
   tracked + prices, then ACTIVE and publish LAST (an unconfirmed publish
   surfaced). Any failure after step 1 → the orphan drafted and zeroed, the row
-  ``HELD``.
+  ``HELD`` — a returned size the duplicate cannot raise (F1) is one, caught
+  before the zeroing and the adds: the row would stamp its events.
 """
 from __future__ import annotations
 
@@ -593,7 +594,12 @@ def create_outlet(ctx: flows.Context, fresh: PlanAction, approved: PlanAction) -
         zero_all = flows.zero_rows_for(ctx, inv, keys=keys, product=num, purpose=L.P_ZERO, include_nonpromo=True)
         nonpromo = [s for s in zero_all if s.location_id != ctx.promo]
         promo_zero = [s for s in zero_all if s.location_id == ctx.promo]
-        subs = nonpromo + promo_zero + _add_specs(ctx, sku, targets, inv, num)
+        adds = _add_specs(ctx, sku, targets, inv, num)
+        # F1 (verify batch 2 m1): the CREATE row stamps every target's events, so a size
+        # the duplicate cannot raise (respelled since the confirm) aborts before the zeroing and adds
+        if {st.size for st in targets} - {s.keys[0][1] for s in adds if s.action == L.A_ADJUST}:
+            raise _CreateAbort("size_withheld")
+        subs = nonpromo + promo_zero + adds
         sub_rows = ctx.ledger.write_group(subs, group_id=group) if subs else []
         zeroing = [r for r in sub_rows if r.action == L.A_DEACTIVATE
                    or (r.action == L.A_ADJUST and L.purpose(r) in (L.P_ZERO, L.P_NONPROMO))]

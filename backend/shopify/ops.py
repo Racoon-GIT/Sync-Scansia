@@ -732,7 +732,7 @@ def read_variant_inventory(
 
         {
           "id": <variant GID>,
-          "sku": <variant sku>,                     # another, non-blank SKU: never raised (F1)
+          "sku": <variant sku>,                     # another SKU, or none: never raised (F1, D59)
           "title": <variant title>,                 # F7 §3.2: the exact-size match key
           "inventoryPolicy": "DENY" | "CONTINUE",   # on the VARIANT (not the item)
           "selectedOptions": [{"name","value"}, ...],

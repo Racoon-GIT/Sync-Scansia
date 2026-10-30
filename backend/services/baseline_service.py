@@ -185,7 +185,7 @@ class VariantFacts:
     active: bool
     available: Optional[int]           # None when the level is absent
     committed: Optional[int]
-    foreign_sku: Optional[str] = None  # the variant's own SKU when non-blank and not the key's (F1)
+    foreign_sku: Optional[str] = None  # the variant's own SKU when not the key's, BLANK_SKU when it has none (F1, D59)
 
     @property
     def p(self) -> int:

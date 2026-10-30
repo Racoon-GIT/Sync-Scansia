@@ -327,3 +327,45 @@ def test_f1_a_variant_respelled_to_another_sku_between_preview_and_confirm_is_mo
     rep = R.relevel_apply(reg, env.shop, plan, promo_location_id=PROMO, dlq=env.dlq(plan),
                           lease=PassLease(reg, "relevel", sleep=lambda s: None), sleep=lambda s: None)
     assert result(rep, "SKU1", "42").result == "held" and env.shop.available(out.gid, "42") == 0
+
+
+def _create_key(env: Env):
+    src = env.shop.product("Nike Air", outlet=False, sizes=("42", "43"))
+    _, e = env.imported(size="42", price_outlet="50.00", price_high="100.00")
+    env.run()                                               # no outlet: the +1 pending
+    plan = R.relevel_preview(env.register(), env.shop, [("SKU1", "42")], promo_location_id=PROMO)
+    assert plan.keys[0].branch == R.BR_CREATE
+    return src, e, plan
+
+
+def _apply(env: Env, plan):
+    reg = env.register()
+    return R.relevel_apply(reg, env.shop, plan, promo_location_id=PROMO, dlq=env.dlq(plan),
+                           lease=PassLease(reg, "relevel", sleep=lambda s: None), sleep=lambda s: None)
+
+
+def test_f1_a_create_whose_source_is_respelled_after_the_preview_is_moved():
+    """Verify batch 2 m1 (review H2a): the confirm re-reads a CREATE's source variant —
+    respelled, the key is *moved* (held), nothing duplicated, its events pending."""
+    env = Env()
+    src, e, plan = _create_key(env)
+    assert held_keys(env) == []
+    env.shop.variant(src.gid, "42").sku = "OTHER"
+    rep = _apply(env, plan)
+    assert (result(rep, "SKU1", "42").result, result(rep, "SKU1", "42").reason) == ("held", R.R_MOVED)
+    assert "duplicate" not in env.shop.names()
+    assert e in env.unstamped() and [p.online for p in env.register().shelf("SKU1")] == [False]
+    assert held_keys(env) == [("SKU1", "42")]                           # now held: moved at confirm
+
+
+def test_f1_a_relevel_create_respelled_at_the_duplicate_fails_and_stamps_nothing():
+    """Verify batch 2 m1, second line: a respelling after the confirm's re-read is caught
+    on the duplicate itself — the CREATE aborts, the key is not released."""
+    env = Env()
+    src, e, plan = _create_key(env)
+    env.shop.on("duplicate", lambda shop: setattr(shop.variant(src.gid, "42"), "sku", "OTHER"))
+    rep = _apply(env, plan)
+    out = result(rep, "SKU1", "42")
+    assert out.result == "failed" and "size_withheld" in (out.reason or "")
+    assert e in env.unstamped() and [p.online for p in env.register().shelf("SKU1")] == [False]
+    assert held_keys(env) == [("SKU1", "42")]

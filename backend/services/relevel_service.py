@@ -310,7 +310,12 @@ class _Run:
         if tuple(sorted(e.event_id for e in snap.unstamped if e.key == kp.key)) != kp.event_ids:
             return True
         view = self.reader.sku_view(kp.sku, fresh=True)
-        return not view.readable or view.facts(kp.size, self.promo) != kp.outlets
+        if not view.readable or view.facts(kp.size, self.promo) != kp.outlets:
+            return True
+        if kp.branch == BR_CREATE:                 # F1 (verify batch 2 m1): its source variant, as approved
+            src, v, _why = _source(self.ctx.transport, kp.sku, kp.size)
+            return src is None or (src["product_gid"], v.get("id")) != (kp.source_gid, kp.source_variant_id)
+        return False
 
     # -- the branches: each returns the ids its BASELINE row still stamps, or None (not released)
     def _active(self, kp: RelevelKey) -> Optional[Tuple[int, ...]]:

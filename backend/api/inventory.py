@@ -93,7 +93,7 @@ class SizeStatus:
     matched: bool                    # a variant titled exactly SIZE
     promo_available: Optional[int]   # None: no exact variant, or its Promo level absent
     twins: Tuple[str, ...] = ()      # titles equal only after normalisation (respell)
-    foreign_sku: Optional[str] = None  # the exact variant carries another SKU: never raised (F1, respell)
+    foreign_sku: Optional[str] = None  # the exact variant carries another SKU, or none (BLANK_SKU): never raised (F1, D59, respell)
 
 
 @dataclass(frozen=True)

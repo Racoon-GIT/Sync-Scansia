@@ -896,3 +896,62 @@ def test_f1_the_apply_rereads_and_withholds_a_variant_respelled_after_the_plan()
     assert ctx.report.items[-1]["variant_sku"] == variants.BLANK_SKU
     w.shop.variant(out.gid, "39").sku = F1_SKU                          # the pair's own: matched again
     assert [s.action for s in outlet_service._add_specs(ctx, F1_SKU, [st], ctx.inventory(out.gid), 1)] == [L.A_ADJUST]
+
+
+def test_f1_a_create_whose_size_is_respelled_before_the_duplicate_aborts_and_stamps_nothing():
+    """Verify batch 2 m1 (review H2b): the duplicate's own variant is re-checked before
+    any write; a target it cannot raise aborts the CREATE — its events pending, ONLINE
+    untouched — never a stamp for a size nothing was added to (§3.2: «never … stamped»)."""
+    w = World()
+    (e,) = w.returned(sku="SKU1", size="42")
+    src = w.shop.product("Nike Air", outlet=False, sizes=("42", "43"))
+    plan = w.preview()
+    assert plan.actions[0].branch == "CREATE"
+    fired = []
+
+    def respell(shop):
+        if not fired:
+            fired.append(1)
+            shop.variant(src.gid, "42").sku = "OTHER"
+    w.shop.on("duplicate", respell)
+    rep = w.apply(plan)
+    out = rep.outcomes[0]
+    dup = next(g for g, p in w.shop.products.items() if p.title == "Nike Air - Outlet")
+    assert out.status == "CREATE_ABORTED" and "create_aborted:size_withheld" in out.warnings
+    assert out.stamped_event_ids == () and w.unstamped() == [e]
+    assert [p.online for p in w.register().shelf("SKU1")] == [False]
+    assert w.shop.products[dup].status == "DRAFT" and w.shop.available(dup, "42") == 0
+    assert any(i["kind"] == "sku_mismatch_withheld" for i in rep.surfaced)
+
+
+def test_f1_a_blank_pair_sku_is_never_a_match():
+    """Verify batch 2 m4 (review H3, flipped): CONSUME never matches a blank ``p_sku``."""
+    for blank in ("", None, "   "):
+        assert variants.foreign_sku("", {"sku": blank}) == variants.BLANK_SKU
+    assert variants.foreign_sku("", {"sku": "SKU1"}) == "SKU1"
+    assert variants.match_to_raise("", "42", [{"title": "42", "sku": None}]) is None
+    assert variants.match_to_raise("", "42", [{"title": "42", "sku": ""}]) is None
+
+
+def test_f1_the_predicate_compares_as_consume_does():
+    """Verify batch 2 m5 (review H3b): ``SKU = p_sku`` under ``utf8mb4_bin`` PAD SPACE —
+    code points, case-sensitive; only the space pads."""
+    t = variants.foreign_sku
+    assert t("A", {"sku": "A  "}) is None                   # PAD SPACE: trailing spaces match
+    assert t("A", {"sku": " A"}) == " A"                    # a leading space: no match
+    assert t("A", {"sku": "a"}) == "a"                      # case-sensitive
+    assert t("A", {"sku": "A\t"}) == "A\t"                  # a tab is not a pad character
+    assert t("A", {"sku": "A "}) == "A "          # nor NBSP
+    assert t("A", {"sku": "\t"}) == variants.BLANK_SKU      # named blank; CONSUME: no match either
+    assert t("A ", {"sku": "A"}) == "A"                     # the pair side is not padded (writers trim)
+
+
+@pytest.mark.parametrize("spelled", [F1_SKU.lower(), F1_SKU + "\t", F1_SKU + " "])
+def test_f1_case_tab_and_nbsp_are_other_skus_through_the_publish(spelled):
+    """Verify batch 2 m5 (review H8)."""
+    w = World()
+    (e,) = w.returned(sku=F1_SKU, size="39")
+    out = _f1_outlet(w, status="ACTIVE", foreign=spelled)
+    plan, _rep = w.run()
+    assert plan.actions[0].unmatched_sizes == ("39",)
+    assert w.shop.available(out.gid, "39") == 0 and w.unstamped() == [e]

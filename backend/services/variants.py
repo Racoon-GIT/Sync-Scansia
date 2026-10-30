@@ -72,12 +72,13 @@ def foreign_sku(sku: str, variant: Optional[Dict[str, Any]]) -> Optional[str]:
     else the variant's SKU, or ``BLANK_SKU`` when it has none (D59). Such a title
     match is not the key's variant (F7.4 review, F1): its order line carries that
     SKU, CONSUME finds no shelf pair and the register never decrements — a phantom
-    unit. ``None`` for no variant at all (a size the outlet lacks is not this)."""
+    unit. ``None`` for no variant at all (a size the outlet lacks is not this).
+    A blank pair SKU is never a match: CONSUME matches no blank ``p_sku``."""
     if variant is None:
         return None
     raw = str(variant.get("sku") or "")
     vs = raw.rstrip(" ")
-    if vs == sku:
+    if vs == sku and raw.strip():
         return None
     return vs if raw.strip() else BLANK_SKU
 
