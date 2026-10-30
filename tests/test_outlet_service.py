@@ -26,7 +26,7 @@ from backend.persistence.records import (
     InsertAudit,
 )
 from backend.services import ledger as L
-from backend.services import outlet_service, passes
+from backend.services import outlet_service, passes, variants
 from backend.services.lease import PassLease
 from backend.shopify import ops
 
@@ -185,15 +185,18 @@ def test_fix4_invalid_price_blocks_publish(outlet_price, high):
     assert len(w.unstamped()) == 2
 
 
-def test_size_primary_exact_match_ignores_sku():
+def test_size_primary_exact_match_withholds_a_variant_of_another_sku():
     w = World()
     w.returned(n=2)
     src = _source(w)
-    w.shop.variant(src.gid, "42").sku = "ZZZ"                          # SKU mismatch on the 42 variant
+    w.shop.variant(src.gid, "42").sku = "ZZZ"                          # SKU mismatch on the 42 variant (F1)
     plan, rep = w.run()
-    st = plan.actions[0].size_targets[0]
-    assert st.size == "42" and st.matched and st.variant_id == w.shop.variant(src.gid, "42").id
-    assert any(x.startswith("sku_mismatch_on_size:42:ZZZ") for x in plan.actions[0].warnings)
+    act = plan.actions[0]
+    st = act.size_targets[0]
+    assert st.size == "42" and not st.matched and st.variant_id is None and act.unmatched_sizes == ("42",)
+    assert "sku_mismatch_on_size:42:ZZZ" in act.warnings
+    assert rep.outcomes[0].status == "NOTHING_TO_ADD" and "duplicate" not in w.shop.names()
+    assert len(w.unstamped()) == 2
 
 
 def test_dry_run_preview_is_read_only():
@@ -210,7 +213,7 @@ def test_dry_run_preview_is_read_only():
 
 def test_create_outlet_carries_the_source_images_and_records_the_job_f3():
     """§8 F3: the outlet a CREATE makes has its source's images (``includeImages``),
-    and the image copy's job — asynchronous — is on the CREATE row."""
+    and an ``imageJob``, when Shopify returns one, is on the CREATE row."""
     w = World()
     w.returned(n=2)
     src = _source(w)
@@ -229,7 +232,7 @@ def test_create_without_an_image_job_applies_and_records_none():
     w = World()
     w.returned(n=2)
     src = _source(w)
-    w.shop.media[src.gid] = []                                          # nothing to copy: no imageJob
+    w.shop.media[src.gid] = []                                          # no imageJob: the live answer, even with images (D1)
     _plan, rep = w.run()
     assert rep.outcomes[0].status == "APPLIED"
     (create,) = [r for r in w.rows() if r.action == L.A_CREATE]
@@ -303,7 +306,10 @@ def test_fix5_sku_cross_check_fires_on_active_branch():
     w.shop.variant(out.gid, "42").sku = "OTHER-SKU"
     w.shop.variant(out.gid, "43").sku = "SKU1"                         # still resolves by SKU
     plan = w.preview()
-    assert any(x.startswith("sku_mismatch_on_size:42:OTHER-SKU") for x in plan.actions[0].warnings)
+    assert "sku_mismatch_on_size:42:OTHER-SKU" in plan.actions[0].warnings
+    rep = w.apply(plan)
+    assert rep.outcomes[0].status == "NOTHING_TO_ADD" and w.mutated() == []
+    assert w.shop.available(out.gid, "42") == 0 and len(w.unstamped()) == 2
 
 
 def test_create_quarantines_when_levels_truncated_after_duplicate_fix6b():
@@ -729,3 +735,249 @@ def test_a_publish_writes_the_outlet_id_of_a_member_and_title_outlet_never_a_fre
     w.run()
     ids = {p.sku: p.outlet_product_id for p in w.register().shelf()}
     assert ids == {"SKU1": int(out.gid.rsplit("/", 1)[1]), "SKU2": None}   # a CREATE is a `review` match
+
+
+# =============================================================================
+# F1 (F7.4 baseline review): a title match on a variant of ANOTHER SKU is never raised
+# =============================================================================
+F1_SKU, F1_FOREIGN = "AR-W-DNMLEOM", "AR-W-LEOM-DNM"
+
+
+def _f1_outlet(w: World, *, status: str, foreign: object = F1_FOREIGN, promo=None):
+    """PROGRAM `F1 CONFIRMED`: the outlet resolves by the pair's SKU (its other sizes),
+    its variant «39» carries another SKU."""
+    return w.shop.product("Birkenstock Arizona - Outlet", status=status, sizes=("38", "40"), sku=F1_SKU,
+                          promo=promo or {"38": 0, "40": 0, "39": 0}, extra_variants=(("39", foreign),))
+
+
+@pytest.mark.parametrize("status", ["DRAFT", "ACTIVE"])
+def test_f1_a_pair_never_raises_a_variant_of_another_sku(status):
+    w = World()
+    events = w.returned(sku=F1_SKU, size="39")
+    out = _f1_outlet(w, status=status)
+    plan = w.preview()
+    (act,) = plan.actions
+    assert act.publishable and act.branch == status
+    (st,) = act.size_targets
+    assert (st.size, st.matched, st.variant_id, st.inventory_item_id) == ("39", False, None, None)
+    assert act.unmatched_sizes == ("39",)
+    assert f"sku_mismatch_on_size:39:{F1_FOREIGN}" in act.warnings      # the preview says why
+    rep = w.apply(plan)
+    assert rep.outcomes[0].status == "NOTHING_TO_ADD"
+    assert f"sku_mismatch_on_size:39:{F1_FOREIGN}" in rep.outcomes[0].warnings
+    assert w.mutated() == [] and w.shop.available(out.gid, "39") == 0
+    assert w.unstamped() == events and w.rows() == []                   # pending, never stamped
+    assert w.shop.products[out.gid].status == status
+
+
+def test_f1_a_revive_adds_the_sizes_of_its_own_sku_and_withholds_the_foreign_one():
+    w = World()
+    (e38,) = w.returned(sku=F1_SKU, size="38")
+    (e39,) = w.returned(sku=F1_SKU, size="39")
+    out = _f1_outlet(w, status="DRAFT")
+    plan, rep = w.run()
+    act = plan.actions[0]
+    assert [(t.size, t.matched) for t in act.size_targets] == [("38", True), ("39", False)]
+    assert rep.outcomes[0].status == "REVIVED" and rep.outcomes[0].stamped_event_ids == (e38,)
+    assert w.shop.available(out.gid, "38") == 1 and w.shop.available(out.gid, "39") == 0
+    assert w.unstamped() == [e39]
+    assert not any(e39 in r.event_ids for r in w.rows())                # no row carries the withheld size
+
+
+def test_f1_create_never_duplicates_for_a_size_whose_source_variant_is_another_sku():
+    w = World()
+    w.returned(sku=F1_SKU, size="39")
+    w.shop.product("Birkenstock Arizona", outlet=False, sizes=("38",), sku=F1_SKU,
+                   extra_variants=(("39", F1_FOREIGN),))
+    plan, rep = w.run()
+    act = plan.actions[0]
+    assert act.branch == "CREATE" and act.unmatched_sizes == ("39",)
+    assert f"sku_mismatch_on_size:39:{F1_FOREIGN}" in act.warnings
+    assert rep.outcomes[0].status == "NOTHING_TO_ADD" and w.mutated() == []
+
+
+def test_f1_a_trailing_space_is_the_pairs_sku_as_consume_reads_it():
+    """A trailing space matches as CONSUME's PAD SPACE ``utf8mb4_bin`` equality does
+    (``scansia-sp-spec.md:44-46``)."""
+    w = World()
+    w.returned(sku=F1_SKU, size="39")
+    out = _f1_outlet(w, status="DRAFT", foreign=F1_SKU + "  ")
+    plan, rep = w.run()
+    (st,) = plan.actions[0].size_targets
+    assert st.matched and st.variant_id == w.shop.variant(out.gid, "39").id
+    assert not any(x.startswith("sku_mismatch_on_size") for x in plan.actions[0].warnings)
+    assert rep.outcomes[0].status == "REVIVED" and w.shop.available(out.gid, "39") == 1
+    assert w.unstamped() == []
+
+
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_f1_a_blank_variant_sku_is_withheld_like_another_sku(blank):
+    """D59 (coordinator, 2026-10-29): a blank-SKU variant's sale CONSUMEs no shelf pair
+    (``SKU = p_sku``) — withheld exactly like a variant of another SKU."""
+    w = World()
+    (e,) = w.returned(sku=F1_SKU, size="39")
+    out = _f1_outlet(w, status="DRAFT", foreign=blank)
+    plan, rep = w.run()
+    act = plan.actions[0]
+    assert act.unmatched_sizes == ("39",) and not act.size_targets[0].matched
+    assert f"sku_mismatch_on_size:39:{variants.BLANK_SKU}" in act.warnings
+    assert rep.outcomes[0].status == "NOTHING_TO_ADD" and w.mutated() == []
+    assert w.shop.available(out.gid, "39") == 0 and w.unstamped() == [e]
+
+
+def test_f1_an_absent_size_is_not_reported_as_a_blank_sku():
+    w = World()
+    w.returned(sku=F1_SKU, size="41")
+    _f1_outlet(w, status="DRAFT")
+    act = w.preview().actions[0]
+    assert act.unmatched_sizes == ("41",)
+    assert not any(x.startswith("sku_mismatch_on_size") for x in act.warnings)
+
+
+def test_f1_a_revive_zeroes_a_unit_on_a_blank_sku_variant():
+    w = World()
+    (e38,) = w.returned(sku=F1_SKU, size="38")
+    w.returned(sku=F1_SKU, size="39")
+    out = _f1_outlet(w, status="DRAFT", foreign=None, promo={"38": 0, "40": 0, "39": 1})
+    _plan, rep = w.run()
+    assert rep.outcomes[0].status == "REVIVED" and rep.outcomes[0].stamped_event_ids == (e38,)
+    assert w.shop.available(out.gid, "38") == 1 and w.shop.available(out.gid, "39") == 0
+
+
+def test_f1_a_leading_space_is_another_sku_as_consume_reads_it():
+    w = World()
+    (e,) = w.returned(sku=F1_SKU, size="39")
+    out = _f1_outlet(w, status="DRAFT", foreign=" " + F1_SKU)
+    plan, rep = w.run()
+    assert plan.actions[0].unmatched_sizes == ("39",)
+    assert rep.outcomes[0].status == "NOTHING_TO_ADD" and w.shop.available(out.gid, "39") == 0
+    assert w.unstamped() == [e]
+
+
+@pytest.mark.parametrize("own_pair", [False, True])
+def test_f1_a_revive_zeroes_a_unit_on_a_variant_of_another_sku_even_when_that_sku_has_the_pair(own_pair):
+    """§3.3's revive zeroes every real-size variant with no shelf pair of the key: a
+    variant of another SKU is no key's variant here, whatever its own SKU's shelf holds
+    (D1, coordinator verify r1: that pair may already back a unit on its own outlet —
+    two units, one pair; lowering errs to fewer)."""
+    w = World()
+    (e38,) = w.returned(sku=F1_SKU, size="38")
+    w.returned(sku=F1_SKU, size="39")
+    if own_pair:
+        w.be.add_pair(F1_FOREIGN, "39")                                 # on the shelf, nothing pending
+    out = _f1_outlet(w, status="DRAFT", promo={"38": 0, "40": 0, "39": 1})
+    plan, rep = w.run()
+    assert [a.sku for a in plan.actions] == [F1_SKU]
+    assert rep.outcomes[0].status == "REVIVED" and rep.outcomes[0].stamped_event_ids == (e38,)
+    assert w.shop.products[out.gid].status == "ACTIVE" and w.shop.available(out.gid, "38") == 1
+    assert w.shop.available(out.gid, "39") == 0
+
+
+def test_f1_the_apply_rereads_and_withholds_a_variant_respelled_after_the_plan():
+    """Second line: ``_add_specs`` matches the re-read inventory with the same rule."""
+    w = World()
+    w.returned(sku=F1_SKU, size="39")
+    out = _f1_outlet(w, status="ACTIVE", foreign=F1_SKU)
+    reg = w.register()
+    lease = PassLease(reg, "publish", sleep=lambda s: None)
+    lease.take(bound_s=0)
+    led = L.Ledger(reg, w.shop, lease, PROMO)
+    ctx = outlet_service.flows.Context(led)
+    plan = w.preview()
+    (st,) = plan.actions[0].size_targets
+    assert st.matched
+    w.shop.variant(out.gid, "39").sku = F1_FOREIGN                     # respelled between the plan and the write
+    specs = outlet_service._add_specs(ctx, F1_SKU, [st], ctx.inventory(out.gid), 1)
+    assert specs == []
+    assert [(i["kind"], i["size"], i["variant_sku"]) for i in ctx.report.items] == [
+        ("sku_mismatch_withheld", "39", F1_FOREIGN)]
+    w.shop.variant(out.gid, "39").sku = None                            # blank: withheld too (D59)
+    assert outlet_service._add_specs(ctx, F1_SKU, [st], ctx.inventory(out.gid), 1) == []
+    assert ctx.report.items[-1]["variant_sku"] == variants.BLANK_SKU
+    w.shop.variant(out.gid, "39").sku = F1_SKU                          # the pair's own: matched again
+    assert [s.action for s in outlet_service._add_specs(ctx, F1_SKU, [st], ctx.inventory(out.gid), 1)] == [L.A_ADJUST]
+
+
+def test_f1_a_create_whose_size_is_respelled_before_the_duplicate_aborts_and_stamps_nothing():
+    """Verify batch 2 m1 (review H2b): the duplicate's own variant is re-checked before
+    any write; a target it cannot raise aborts the CREATE — its events pending, ONLINE
+    untouched — never a stamp for a size nothing was added to (§3.2: «never … stamped»)."""
+    w = World()
+    (e,) = w.returned(sku="SKU1", size="42")
+    src = w.shop.product("Nike Air", outlet=False, sizes=("42", "43"))
+    plan = w.preview()
+    assert plan.actions[0].branch == "CREATE"
+    fired = []
+
+    def respell(shop):
+        if not fired:
+            fired.append(1)
+            shop.variant(src.gid, "42").sku = "OTHER"
+    w.shop.on("duplicate", respell)
+    rep = w.apply(plan)
+    out = rep.outcomes[0]
+    dup = next(g for g, p in w.shop.products.items() if p.title == "Nike Air - Outlet")
+    assert out.status == "CREATE_ABORTED" and "create_aborted:size_withheld" in out.warnings
+    assert out.stamped_event_ids == () and w.unstamped() == [e]
+    assert [p.online for p in w.register().shelf("SKU1")] == [False]
+    assert w.shop.products[dup].status == "DRAFT" and w.shop.available(dup, "42") == 0
+    assert any(i["kind"] == "sku_mismatch_withheld" for i in rep.surfaced)
+
+
+def test_f1_a_blank_pair_sku_is_never_a_match():
+    """Verify batch 2 m4 (review H3, flipped): CONSUME never matches a blank ``p_sku``."""
+    for blank in ("", None, "   "):
+        assert variants.foreign_sku("", {"sku": blank}) == variants.BLANK_SKU
+    assert variants.foreign_sku("", {"sku": "SKU1"}) == "SKU1"
+    assert variants.match_to_raise("", "42", [{"title": "42", "sku": None}]) is None
+    assert variants.match_to_raise("", "42", [{"title": "42", "sku": ""}]) is None
+
+
+def test_f1_the_predicate_compares_as_consume_does():
+    """Verify batch 2 m5 (review H3b): ``SKU = p_sku`` under ``utf8mb4_bin`` PAD SPACE —
+    code points, case-sensitive; only the space pads."""
+    t = variants.foreign_sku
+    assert t("A", {"sku": "A  "}) is None                   # PAD SPACE: trailing spaces match
+    assert t("A", {"sku": " A"}) == " A"                    # a leading space: no match
+    assert t("A", {"sku": "a"}) == "a"                      # case-sensitive
+    assert t("A", {"sku": "A\t"}) == "A\t"                  # a tab is not a pad character
+    assert t("A", {"sku": "A "}) == "A "          # nor NBSP
+    assert t("A", {"sku": "\t"}) == variants.BLANK_SKU      # named blank; CONSUME: no match either
+    assert t("A ", {"sku": "A"}) == "A"                     # the pair side is not padded (writers trim)
+
+
+@pytest.mark.parametrize("spelled", [F1_SKU.lower(), F1_SKU + "\t", F1_SKU + " "])
+def test_f1_case_tab_and_nbsp_are_other_skus_through_the_publish(spelled):
+    """Verify batch 2 m5 (review H8)."""
+    w = World()
+    (e,) = w.returned(sku=F1_SKU, size="39")
+    out = _f1_outlet(w, status="ACTIVE", foreign=spelled)
+    plan, _rep = w.run()
+    assert plan.actions[0].unmatched_sizes == ("39",)
+    assert w.shop.available(out.gid, "39") == 0 and w.unstamped() == [e]
+
+
+def test_f1_a_create_whose_size_is_absent_on_the_duplicate_aborts_and_stamps_nothing():
+    """The same duplicate-time check (verify batch 2 m1, the lane's decision): a returned
+    size the duplicate lacks altogether (the source's variant removed since the confirm)
+    is one the CREATE row would stamp too — aborted, never a lost publication."""
+    w = World()
+    (e,) = w.returned(sku="SKU1", size="42")
+    src = w.shop.product("Nike Air", outlet=False, sizes=("42", "43"))
+    plan = w.preview()
+    assert plan.actions[0].branch == "CREATE"
+    fired = []
+
+    def remove(shop):
+        if not fired:
+            fired.append(1)
+            shop.products[src.gid].variants = [v for v in shop.products[src.gid].variants if v.title != "42"]
+    w.shop.on("duplicate", remove)
+    rep = w.apply(plan)
+    out = rep.outcomes[0]
+    dup = next(g for g, p in w.shop.products.items() if p.title == "Nike Air - Outlet")
+    assert [v.title for v in w.shop.products[dup].variants] == ["43"]
+    assert out.status == "CREATE_ABORTED" and "create_aborted:size_withheld" in out.warnings
+    assert out.stamped_event_ids == () and w.unstamped() == [e]
+    assert [p.online for p in w.register().shelf("SKU1")] == [False]
+    assert not any(i["kind"] == "sku_mismatch_withheld" for i in rep.surfaced)   # absent, not respelled

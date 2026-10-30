@@ -97,6 +97,14 @@ that contradicts the plan is a defect: it goes to the orchestrator (`scansia-f6`
   orphan from live, the CREATE's own step rows still `OPEN` are closed, never sent again — never sent → `FAILED`;
   a sent +Δ → `HELD` (a stalled one may still land; the N-0 release waits out its retention); any other sent row →
   `FAILED` — in the live abort path and in recovery alike (a re-sent add would land on the drafted orphan).
+- F1 (the F7.4 baseline review): a title match whose variant carries another SKU, or none (D59, the
+  coordinator's ruling: a blank-SKU sale CONSUMEs no pair either; named `(blank)`), is not the key's variant
+  (`variants.foreign_sku`; trailing spaces match, leading ones do not — CONSUME's `utf8mb4_bin` PAD SPACE
+  equality, STOCK_Manager `docs/scansia-sp-spec.md:40-46`). The publish treats the size
+  as one the outlet lacks (pending, warned `sku_mismatch_on_size`); a revive zeroes such a variant unless its own
+  SKU has the pair; the baseline holds an ACTIVE key with N > 0 on it, a re-level refuses (the key stays held).
+  Lowerings still match by title. The person's remedy: respell the pair (X8 + B2) or the variant's SKU. The rule
+  narrows §3.2's title-only match, on §3.2's own reason; coverage map §15.
 - A preview is a read and runs no recovery: a key held in flight by an `OPEN` row plans nothing (listed
   `held_positive`) until an apply's prologue resolves the row; the next preview then plans it.
 - `referenceDocumentUri` of every inventory write: `gid://scansia-manager/OutletReconcile/<row id>` (Shopify's

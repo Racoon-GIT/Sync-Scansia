@@ -7,6 +7,8 @@
   spelling-exact). A match found only after normalisation (case, comma / dot,
   inner spaces: ``42L`` vs ``42 L``) is a *twin*: surfaced for respelling at the
   source, never published — a ``42L`` pair published on ``42 L`` would sell
+  unrecorded. A title match whose variant carries another SKU, or none (D59),
+  is not the key's variant either (``foreign_sku``, F1) — same reason: it sells
   unrecorded.
 * **Customisation-only variants** (§3.3 rule 7) are identified by option value,
   never by a blank SKU (seven carry a real SKU): any option value or title
@@ -26,6 +28,10 @@ from typing import Any, Dict, Iterable, List, Optional
 SIZE_OPTION_NAMES = frozenset({"size", "taglia", "numero"})
 
 _CUSTOMISATION_MARK = "personalizzazione"
+
+# How a variant with no SKU is named where ``foreign_sku`` is shown (D59: a blank
+# SKU is a mismatch too — its sale CONSUMEs no shelf pair).
+BLANK_SKU = "(blank)"
 
 
 def variant_title(variant: Dict[str, Any]) -> str:
@@ -57,6 +63,31 @@ def match_exact(size: str, variants: Iterable[Dict[str, Any]]) -> Optional[Dict[
         if variant_title(v) == size:
             return v
     return None
+
+
+def foreign_sku(sku: str, variant: Optional[Dict[str, Any]]) -> Optional[str]:
+    """``None`` when the variant's SKU is the pair's ``sku`` as CONSUME compares
+    them (``SKU = p_sku``, ``utf8mb4_bin`` PAD SPACE: a trailing space still
+    matches, a leading one does not — STOCK_Manager ``docs/scansia-sp-spec.md:40-46``);
+    else the variant's SKU, or ``BLANK_SKU`` when it has none (D59). Such a title
+    match is not the key's variant (F7.4 review, F1): its order line carries that
+    SKU, CONSUME finds no shelf pair and the register never decrements — a phantom
+    unit. ``None`` for no variant at all (a size the outlet lacks is not this).
+    A blank pair SKU is never a match: CONSUME matches no blank ``p_sku``."""
+    if variant is None:
+        return None
+    raw = str(variant.get("sku") or "")
+    vs = raw.rstrip(" ")
+    if vs == sku and raw.strip():
+        return None
+    return vs if raw.strip() else BLANK_SKU
+
+
+def match_to_raise(sku: str, size: str, variants: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """``match_exact`` for a flow that raises a Promo level: ``None`` on a
+    foreign-SKU match too — each flow's "size the outlet lacks" path."""
+    v = match_exact(size, variants)
+    return None if v is None or foreign_sku(sku, v) else v
 
 
 def twins(size: str, variants: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -110,7 +141,7 @@ def has_non_promo_stock(variants: Iterable[Dict[str, Any]], promo_id: str) -> bo
 
 
 __all__ = [
-    "SIZE_OPTION_NAMES", "variant_title", "is_customisation_only", "real_size_variants",
-    "twin_form", "match_exact", "twins", "item_id", "promo_level", "promo_available",
+    "SIZE_OPTION_NAMES", "BLANK_SKU", "variant_title", "is_customisation_only", "real_size_variants",
+    "twin_form", "match_exact", "foreign_sku", "match_to_raise", "twins", "item_id", "promo_level", "promo_available",
     "has_non_promo_stock",
 ]

@@ -123,6 +123,7 @@ R_UNRESOLVED = "unresolved"
 R_UNREADABLE = "outlet_unreadable"
 R_MULTI_OUTLET = "multi_outlet"
 R_SIZE_ABSENT = "size_absent"
+R_SKU_MISMATCH = "sku_mismatch_on_size"   # + ":<variant sku>": not the key's variant, never levelled (F1)
 R_STATUS = "unexpected_status"
 R_COMMITTED = "committed_on_upward_adjust"
 R_MOVED = "moved_at_confirm"
@@ -184,6 +185,7 @@ class VariantFacts:
     active: bool
     available: Optional[int]           # None when the level is absent
     committed: Optional[int]
+    foreign_sku: Optional[str] = None  # the variant's own SKU when not the key's, BLANK_SKU when it has none (F1, D59)
 
     @property
     def p(self) -> int:
@@ -417,12 +419,14 @@ def _status(raw: Any) -> str:
     return str(raw or "").upper()
 
 
-def _variant_facts(product_id: int, status: str, v: Dict[str, Any], promo: str) -> VariantFacts:
+def _variant_facts(product_id: int, status: str, v: Dict[str, Any], promo: str,
+                   sku: Optional[str] = None) -> VariantFacts:
     lvl = variants.promo_level(v, promo)
+    foreign = variants.foreign_sku(sku, v) if sku is not None else None
     if lvl is None:
-        return VariantFacts(product_id, status, v.get("id"), variants.item_id(v), False, False, None, None)
+        return VariantFacts(product_id, status, v.get("id"), variants.item_id(v), False, False, None, None, foreign)
     return VariantFacts(product_id, status, v.get("id"), variants.item_id(v), True,
-                        bool(lvl.get("is_active")), lvl.get("available"), lvl.get("committed"))
+                        bool(lvl.get("is_active")), lvl.get("available"), lvl.get("committed"), foreign)
 
 
 def plan_digest(doc: Dict[str, Any]) -> str:
@@ -442,11 +446,11 @@ class _Outlet:
     inventory: Optional[List[Dict[str, Any]]]
     unreadable: Optional[str] = None
 
-    def facts(self, size: str, promo: str) -> VariantFacts:
+    def facts(self, size: str, promo: str, sku: Optional[str] = None) -> VariantFacts:
         v = variants.match_exact(size, self.inventory or ())
         if v is None:
             return VariantFacts(self.product_id, self.status, None, None, False, False, None, None)
-        return _variant_facts(self.product_id, self.status, v, promo)
+        return _variant_facts(self.product_id, self.status, v, promo, sku)
 
 
 @dataclass
@@ -461,7 +465,7 @@ class SkuView:
         return self.clean and all(o.inventory is not None for o in self.outlets)
 
     def facts(self, size: str, promo: str) -> Tuple[VariantFacts, ...]:
-        return tuple(sorted((o.facts(size, promo) for o in self.outlets), key=lambda f: f.product_id))
+        return tuple(sorted((o.facts(size, promo, self.sku) for o in self.outlets), key=lambda f: f.product_id))
 
 
 class OutletReader:
@@ -566,6 +570,8 @@ def _decide(k: Key, shelf: Sequence[PairRow], events: Sequence[EventRow], on_she
     if o.status == "ACTIVE":                          # (a)
         activate = n > 0 and not (f.level and f.active)
         delta = n - (0 if activate else (f.available or 0))
+        if n > 0 and f.foreign_sku:                   # not the key's variant: never levelled, its excess lowered
+            return hold(f"{R_SKU_MISMATCH}:{f.foreign_sku}")   # a person respells the pair or the variant
         if (activate or delta > 0) and (f.committed or 0) > 0:
             return hold(R_COMMITTED)
         return KeyPlan(**base, action=ACT_LEVEL, outlets=facts, target=n, delta=delta, activate=activate)
@@ -759,9 +765,13 @@ def _catalogue(reader: OutletReader, keys: Sequence[KeyPlan]) -> List[CatalogueN
             out.append(CatalogueNote(sku, None, "multi_source"))
         else:
             for kp in kps:
-                if variants.match_exact(kp.size, src_variants) is None:
+                v = variants.match_exact(kp.size, src_variants)
+                foreign = variants.foreign_sku(sku, v)
+                if v is None:
                     twins = tuple(variants.variant_title(t) for t in variants.twins(kp.size, src_variants))
                     out.append(CatalogueNote(sku, kp.size, "size_absent_on_source", twins))
+                elif foreign:
+                    out.append(CatalogueNote(sku, kp.size, f"sku_mismatch_on_source:{foreign}"))
     return out
 
 
@@ -1144,7 +1154,7 @@ def baseline_apply(
 
 __all__ = [
     "RULE_LEVEL", "ACT_LEVEL", "ACT_ZERO", "ACT_PARKED", "ACT_NONE", "ACT_STAMP", "ACT_LOWER", "ACT_HOLD",
-    "R_BLANK_SKU", "R_HELD_BEFORE", "R_UNRESOLVED", "R_UNREADABLE", "R_MULTI_OUTLET", "R_SIZE_ABSENT",
+    "R_BLANK_SKU", "R_HELD_BEFORE", "R_UNRESOLVED", "R_UNREADABLE", "R_MULTI_OUTLET", "R_SIZE_ABSENT", "R_SKU_MISMATCH",
     "R_STATUS", "R_COMMITTED", "R_MOVED", "R_NORMALISE", "R_WRITE", "R_PENDING", "R_UNIT_HELD",
     "SEED", "SEED_CONFLICT", "SEED_UNPARSEABLE", "SEED_INVALID", "SEED_PRICED",
     "B_KEPT", "B_MISSING", "B_DRAFT", "B_SOLD_OUT", "B_MULTI", "B_UNRESOLVED", "B_BLANK",

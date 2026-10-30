@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import List, Sequence, Tuple
 
+import pytest
+
 from backend.persistence.records import (
     HELD,
     KIND_BASELINE,
@@ -17,10 +19,11 @@ from backend.persistence.records import (
 from backend.services import baseline_service as B
 from backend.services import ledger as L
 from backend.services import relevel_service as R
+from backend.services import variants
 from backend.services.lease import PassLease
 
 from tests.fake_shop import PROMO
-from tests.test_baseline import Env
+from tests.test_baseline import MUTATIONS, Env
 
 
 def relevel(env: Env, keys: Sequence[Tuple[str, str]], *, dlq="default", **kw):
@@ -220,3 +223,149 @@ def test_a_refused_publish_re_run_is_surfaced_and_the_level_still_releases_the_k
     assert result(rep, "SKU1", "42").result == "released" and env.shop.available(out.gid, "42") == 1
     assert "relevel_publish_not_applied" in [i["kind"] for i in rep.surfaced]
     assert not env.shop.products[out.gid].published               # S13 alarms it; a re-level re-runs it
+
+
+# ---------------------------------------------------------------------------
+# F1 (F7.4 baseline review): a re-level never raises a variant of another SKU
+# ---------------------------------------------------------------------------
+def _f1_outlet(env: Env, *, status="ACTIVE", promo=None):
+    return env.shop.product("Nike - Outlet", status=status, sizes=("43",), promo=promo or {"43": 0, "42": 0},
+                            extra_variants=(("42", "OTHER"),))
+
+
+def test_f1_an_active_relevel_up_is_refused_until_the_variant_is_respelled():
+    env = Env()
+    out = _f1_outlet(env)
+    env.imported(size="42", price_outlet="50.00", price_high="100.00")
+    env.run()
+    assert held_keys(env) == [("SKU1", "42")]
+    before = len(env.shop.calls)
+    plan, rep = relevel(env, [("SKU1", "42")])
+    assert (plan.keys[0].branch, plan.keys[0].reason) == (R.BR_REFUSE, f"{R.F_SKU}:OTHER")
+    assert result(rep, "SKU1", "42").result == "refused"
+    assert not [c for c in env.shop.calls[before:] if c[0] in MUTATIONS]
+    assert env.shop.available(out.gid, "42") == 0 and held_keys(env) == [("SKU1", "42")]
+    env.shop.variant(out.gid, "42").sku = "SKU1"                               # a person respells the variant
+    _, rep = relevel(env, [("SKU1", "42")])
+    assert result(rep, "SKU1", "42").result == "released" and env.shop.available(out.gid, "42") == 1
+
+
+@pytest.mark.parametrize("promo", [1, 2])
+def test_f1_an_active_relevel_at_or_above_n_on_a_variant_of_another_sku_is_refused_too(promo):
+    """Not the key's variant: a re-level never releases the key onto it (nor stamps,
+    nor sets ONLINE), whatever the direction — the hold's own lowering takes the excess."""
+    env = Env()
+    out = _f1_outlet(env, promo={"43": 0, "42": promo})
+    env.imported(size="42", price_outlet="50.00", price_high="100.00")
+    env.run()
+    assert held_keys(env) == [("SKU1", "42")] and env.shop.available(out.gid, "42") == 1
+    before = len(env.shop.calls)
+    plan, rep = relevel(env, [("SKU1", "42")])
+    assert (plan.keys[0].branch, plan.keys[0].reason) == (R.BR_REFUSE, f"{R.F_SKU}:OTHER")
+    assert not [c for c in env.shop.calls[before:] if c[0] in MUTATIONS]
+    assert held_keys(env) == [("SKU1", "42")] and not env.register().shelf("SKU1")[0].online
+
+
+def test_f1_a_zero_then_revive_onto_a_variant_of_another_sku_is_refused():
+    env = Env()
+    out = _f1_outlet(env, status="DRAFT")
+    env.imported(size="42", price_outlet="50.00", price_high="100.00")
+    env.run()                                                                   # DRAFT: zero, its +1 pending
+    plan, rep = relevel(env, [("SKU1", "42")])
+    assert (plan.keys[0].branch, plan.keys[0].reason) == (R.BR_REFUSE, f"{R.F_SKU}:OTHER")
+    assert env.shop.available(out.gid, "42") == 0 and env.shop.products[out.gid].status == "DRAFT"
+
+
+def test_f1_a_create_from_a_source_variant_of_another_sku_is_refused():
+    env = Env()
+    env.shop.product("Nike Air", outlet=False, sizes=("43",), extra_variants=(("42", "OTHER"),))
+    env.imported(size="42", price_outlet="50.00", price_high="100.00")
+    env.run()
+    plan, rep = relevel(env, [("SKU1", "42")])
+    assert (plan.keys[0].branch, plan.keys[0].reason) == (R.BR_REFUSE, f"{R.F_SOURCE}:{R.F_SKU}:OTHER")
+    assert "duplicate" not in env.shop.names()
+
+
+@pytest.mark.parametrize("on", ["outlet", "source"])
+def test_f1_a_blank_variant_sku_is_refused_like_another_sku(on):
+    """D59: a blank-SKU variant's sale CONSUMEs no shelf pair — not the key's variant."""
+    env = Env()
+    if on == "outlet":
+        env.shop.product("Nike - Outlet", sizes=("43",), promo={"43": 0, "42": 0}, extra_variants=(("42", None),))
+    else:
+        env.shop.product("Nike Air", outlet=False, sizes=("43",), extra_variants=(("42", None),))
+    env.imported(size="42", price_outlet="50.00", price_high="100.00")
+    env.run()
+    plan, _rep = relevel(env, [("SKU1", "42")])
+    why = f"{R.F_SKU}:{variants.BLANK_SKU}"
+    assert (plan.keys[0].branch, plan.keys[0].reason) == (R.BR_REFUSE, why if on == "outlet" else f"{R.F_SOURCE}:{why}")
+    assert not [c for c in env.shop.calls if c[0] in ("duplicate", "adjust", "activate")]
+
+
+def test_f1_a_relevel_of_n0_still_lowers_a_variant_of_another_sku():
+    env = Env()
+    out = _f1_outlet(env, promo={"43": 0, "42": 1})
+    env.departed(size="42")
+    env.run()
+    assert env.shop.available(out.gid, "42") == 0
+    env.shop.levels[(env.shop.variant(out.gid, "42").item, PROMO)].available = 1   # a Shopify-side restock
+    plan, rep = relevel(env, [("SKU1", "42")])
+    assert plan.keys[0].branch == R.BR_LOWER and env.shop.available(out.gid, "42") == 0
+
+
+def test_f1_a_variant_respelled_to_another_sku_between_preview_and_confirm_is_moved():
+    env = Env()
+    out = env.shop.product("Nike - Outlet", promo={"42": 0})
+    env.imported(size="42", price_outlet="50.00", price_high="100.00")
+    env.run()
+    lvl = env.shop.levels[(env.shop.variant(out.gid, "42").item, PROMO)]
+    lvl.available, lvl.on_hand = 0, 0                                           # a hand edit: the re-level adds 1
+    plan = R.relevel_preview(env.register(), env.shop, [("SKU1", "42")], promo_location_id=PROMO)
+    assert (plan.keys[0].branch, plan.keys[0].delta) == (R.BR_ACTIVE, 1)
+    env.shop.variant(out.gid, "42").sku = "OTHER"                               # respelled before the confirm
+    reg = env.register()
+    rep = R.relevel_apply(reg, env.shop, plan, promo_location_id=PROMO, dlq=env.dlq(plan),
+                          lease=PassLease(reg, "relevel", sleep=lambda s: None), sleep=lambda s: None)
+    assert result(rep, "SKU1", "42").result == "held" and env.shop.available(out.gid, "42") == 0
+
+
+def _create_key(env: Env):
+    src = env.shop.product("Nike Air", outlet=False, sizes=("42", "43"))
+    _, e = env.imported(size="42", price_outlet="50.00", price_high="100.00")
+    env.run()                                               # no outlet: the +1 pending
+    plan = R.relevel_preview(env.register(), env.shop, [("SKU1", "42")], promo_location_id=PROMO)
+    assert plan.keys[0].branch == R.BR_CREATE
+    return src, e, plan
+
+
+def _apply(env: Env, plan):
+    reg = env.register()
+    return R.relevel_apply(reg, env.shop, plan, promo_location_id=PROMO, dlq=env.dlq(plan),
+                           lease=PassLease(reg, "relevel", sleep=lambda s: None), sleep=lambda s: None)
+
+
+def test_f1_a_create_whose_source_is_respelled_after_the_preview_is_moved():
+    """Verify batch 2 m1 (review H2a): the confirm re-reads a CREATE's source variant —
+    respelled, the key is *moved* (held), nothing duplicated, its events pending."""
+    env = Env()
+    src, e, plan = _create_key(env)
+    assert held_keys(env) == []
+    env.shop.variant(src.gid, "42").sku = "OTHER"
+    rep = _apply(env, plan)
+    assert (result(rep, "SKU1", "42").result, result(rep, "SKU1", "42").reason) == ("held", R.R_MOVED)
+    assert "duplicate" not in env.shop.names()
+    assert e in env.unstamped() and [p.online for p in env.register().shelf("SKU1")] == [False]
+    assert held_keys(env) == [("SKU1", "42")]                           # now held: moved at confirm
+
+
+def test_f1_a_relevel_create_respelled_at_the_duplicate_fails_and_stamps_nothing():
+    """Verify batch 2 m1, second line: a respelling after the confirm's re-read is caught
+    on the duplicate itself — the CREATE aborts, the key is not released."""
+    env = Env()
+    src, e, plan = _create_key(env)
+    env.shop.on("duplicate", lambda shop: setattr(shop.variant(src.gid, "42"), "sku", "OTHER"))
+    rep = _apply(env, plan)
+    out = result(rep, "SKU1", "42")
+    assert out.result == "failed" and "size_withheld" in (out.reason or "")
+    assert e in env.unstamped() and [p.online for p in env.register().shelf("SKU1")] == [False]
+    assert held_keys(env) == [("SKU1", "42")]

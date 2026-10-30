@@ -25,7 +25,8 @@ The branches (rule 7: every variant a flow exposes is DENY + tracked first):
   ``changeFromQuantity``, keyed; no level precondition (``frozen_pre`` retired).
 * **DRAFT revive** — deferred while any ``RECONCILE`` row not closed records the
   product or one of its keys; first lowers to 0, relatively, every real-size
-  Promo variant with no shelf pair, every held key's real-size variant and every
+  Promo variant with no shelf pair (a variant of another SKU or of none: always,
+  F1 / D1), every held key's real-size variant and every
   customisation-only variant with Promo > 0; activation, adds and the tail
   (``revive-tail``: DENY + tracked, ACTIVE, publish) only once every zeroing row
   has applied — else nothing is activated, added or exposed.
@@ -36,7 +37,8 @@ The branches (rule 7: every variant a flow exposes is DENY + tracked first):
   non-Promo level, zero every Promo variant, add the returned sizes, DENY +
   tracked + prices, then ACTIVE and publish LAST (an unconfirmed publish
   surfaced). Any failure after step 1 → the orphan drafted and zeroed, the row
-  ``HELD``.
+  ``HELD`` — a returned size the duplicate cannot raise (F1) is one, caught
+  before the zeroing and the adds: the row would stamp its events.
 """
 from __future__ import annotations
 
@@ -281,14 +283,15 @@ def _targets(sku: str, groups: Tuple[passes.KeyGroup, ...], live: List[Dict[str,
         delta = g.delta - sum(e.delta for e in g.events if e.pair_id in out_pairs)
         if delta <= 0:
             continue
-        v = variants.match_exact(g.key[1], live)
+        foreign = variants.foreign_sku(sku, variants.match_exact(g.key[1], live))
+        v = variants.match_to_raise(sku, g.key[1], live)
         twin_titles = tuple(variants.variant_title(t) for t in variants.twins(g.key[1], live))
         if v is None:
-            unmatched.append(g.key[1])
+            unmatched.append(g.key[1])                         # pending, surfaced (§3.3's size the outlet lacks)
             if twin_titles:
                 warns.append(f"size_twin:{g.key[1]}:{'|'.join(twin_titles)}")
-        elif v.get("sku") and str(v["sku"]).strip() and str(v["sku"]).strip() != sku:
-            warns.append(f"sku_mismatch_on_size:{g.key[1]}:{str(v['sku']).strip()}")
+            if foreign:
+                warns.append(f"sku_mismatch_on_size:{g.key[1]}:{foreign}")   # F1: respell the pair or the variant
         targets.append(SizeTarget(size=g.key[1], event_ids=tuple(e.event_id for e in events), delta=delta,
                                   matched=v is not None, variant_id=v.get("id") if v else None,
                                   inventory_item_id=variants.item_id(v), twins=twin_titles))
@@ -400,8 +403,11 @@ def _add_specs(ctx: flows.Context, sku: str, targets: List[SizeTarget], inv: Lis
                product: Optional[int]) -> List[L.RowSpec]:
     specs: List[L.RowSpec] = []
     for st in targets:
-        v = variants.match_exact(st.size, inv)
+        v = variants.match_to_raise(sku, st.size, inv)
         if v is None:
+            foreign = variants.foreign_sku(sku, variants.match_exact(st.size, inv))
+            if foreign:          # respelled since the plan: withheld, its events pending (F1)
+                ctx.report.surface("sku_mismatch_withheld", sku=sku, size=st.size, variant_sku=foreign)
             continue
         key = (sku, st.size)
         lvl = flows.promo_of(v, ctx.promo)
@@ -495,7 +501,9 @@ def revive_outlet(ctx: flows.Context, fresh: PlanAction, approved: PlanAction, *
     held = {h.key for h in ctx.register.held_keys()}
 
     def must_zero(v: Dict[str, Any]) -> bool:
-        if variants.is_customisation_only(v):
+        # F1 / D1: a variant of another SKU, or of none (D59), is no key's variant here,
+        # whatever its own SKU's shelf holds — that pair may back a unit on its own outlet.
+        if variants.is_customisation_only(v) or variants.foreign_sku(sku, v) is not None:
             return True
         title = variants.variant_title(v)
         return title in zero_titles or title not in shelf_sizes or (sku, title) in held
@@ -552,8 +560,9 @@ def create_outlet(ctx: flows.Context, fresh: PlanAction, approved: PlanAction) -
         return ApplyOutcome(sku, BRANCH_CREATE, "ERROR", None, fresh.warnings + ("duplicate_refused",))
     new_gid = dup.product_gid
     num = product_number(new_gid)
-    # The image copy runs on after the call (an async job): its id and `done` stay on
-    # the row, so an outlet whose copy failed can be traced (§8 F3).
+    # The store answers `imageJob: null` and the duplicate references the source's
+    # image files (F7.3 run 202610092018, D1); a job, if one is returned, stays on
+    # the row with its `done`, so its copy can be traced (§8 F3).
     job = ({"image_job": dup.image_job_id, "image_job_done": dup.image_job_done}
            if dup.image_job_id is not None else None)
     ctx.register.record_outcome(ctx.ledger.lease, row.row_id, expect=OPEN, product_id=num, step="1:duplicate:id",
@@ -585,7 +594,12 @@ def create_outlet(ctx: flows.Context, fresh: PlanAction, approved: PlanAction) -
         zero_all = flows.zero_rows_for(ctx, inv, keys=keys, product=num, purpose=L.P_ZERO, include_nonpromo=True)
         nonpromo = [s for s in zero_all if s.location_id != ctx.promo]
         promo_zero = [s for s in zero_all if s.location_id == ctx.promo]
-        subs = nonpromo + promo_zero + _add_specs(ctx, sku, targets, inv, num)
+        adds = _add_specs(ctx, sku, targets, inv, num)
+        # F1 (verify batch 2 m1): the CREATE row stamps every target's events, so a size
+        # the duplicate cannot raise (respelled since the confirm) aborts before the zeroing and adds
+        if {st.size for st in targets} - {s.keys[0][1] for s in adds if s.action == L.A_ADJUST}:
+            raise _CreateAbort("size_withheld")
+        subs = nonpromo + promo_zero + adds
         sub_rows = ctx.ledger.write_group(subs, group_id=group) if subs else []
         zeroing = [r for r in sub_rows if r.action == L.A_DEACTIVATE
                    or (r.action == L.A_ADJUST and L.purpose(r) in (L.P_ZERO, L.P_NONPROMO))]

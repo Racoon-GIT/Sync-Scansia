@@ -93,6 +93,7 @@ class SizeStatus:
     matched: bool                    # a variant titled exactly SIZE
     promo_available: Optional[int]   # None: no exact variant, or its Promo level absent
     twins: Tuple[str, ...] = ()      # titles equal only after normalisation (respell)
+    foreign_sku: Optional[str] = None  # the exact variant carries another SKU, or none (BLANK_SKU): never raised (F1, D59, respell)
 
 
 @dataclass(frozen=True)
@@ -174,13 +175,18 @@ def join_group(sku: str, shelf: List[PairRow], transport: Any, promo_id: str, *,
         for size, n in counts.items():
             v = V.match_exact(size, inv)
             twin_titles = tuple(V.variant_title(t) for t in V.twins(size, inv))
+            foreign = V.foreign_sku(sku, v)
             if v is None:
                 chips.add(CHIP_MISMATCH)
                 warnings.append(f"unmatched_size:{size}")
                 if twin_titles:
                     warnings.append(f"size_twin:{size}:{'|'.join(twin_titles)}")
+            elif foreign:
+                chips.add(CHIP_MISMATCH)
+                warnings.append(f"sku_mismatch_on_size:{size}:{foreign}")
             sizes.append(SizeStatus(size, n, v is not None,
-                                    V.promo_available(v, promo_id) if v is not None else None, twin_titles))
+                                    V.promo_available(v, promo_id) if v is not None else None, twin_titles,
+                                    foreign))
         if promo_absent:
             stale = True
             warnings.append("promo_level_absent")
@@ -206,7 +212,7 @@ def join_result_to_dict(r: JoinResult) -> Dict[str, Any]:
         "live_status": r.live_status,
         "chips": list(r.chips),
         "sizes": [{"size": s.size, "n": s.n, "matched": s.matched, "promo_available": s.promo_available,
-                   "twins": list(s.twins)} for s in r.sizes],
+                   "twins": list(s.twins), "foreign_sku": s.foreign_sku} for s in r.sizes],
         "pair_ids": list(r.pair_ids),
         "warnings": list(r.warnings),
         "fetched_at": r.fetched_at,

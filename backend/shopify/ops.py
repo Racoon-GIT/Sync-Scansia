@@ -19,8 +19,10 @@ with F7 §3.8; the lines cited are ``git show 8aab2a3:src/sync.py``):
   metafields sync.py:562, images sync.py:513-515) or raised only on 4xx. The
   M1a norm is: real failures propagate. Two cases never reach a mutation:
     - an already-active level is never re-activated (``ledger.send_activate``
-      reads ``isActive`` first; the store answers ``userErrors`` there — F7.3
-      run 202610091404, R053);
+      reads ``isActive`` first: there the call's quantities would be an
+      absolute, unfenced set, E15); the activation sends ``available`` 0 only —
+      the store refused ``available`` and ``onHand`` together (F7.3 run
+      202610091404, R053; on an absent level too, run 202610092018, R045);
     - deactivating a null/absent inventory level is a no-op (the level-id
       lookup returns ``None`` before any mutation runs).
 * **fix7** — image copy is a single declarative ``productSet`` (full replace):
@@ -101,8 +103,8 @@ mutation($productId: ID!, $newTitle: String!, $newStatus: ProductStatus, $includ
 
 @dataclass(frozen=True)
 class Duplicated:
-    """What ``productDuplicate`` answered: the duplicate's GID and the image copy's
-    job (``imageJob``) — ``None`` when Shopify returns no job."""
+    """What ``productDuplicate`` answered: the duplicate's GID and ``imageJob`` —
+    ``None`` when Shopify returns no job (the live store's answer, D1)."""
 
     product_gid: str
     image_job_id: Optional[str] = None
@@ -111,7 +113,7 @@ class Duplicated:
 
 def product_duplicate(transport: ShopifyTransport, source_gid: str, new_title: str) -> Duplicated:
     """Duplicate a product by title, FORCING the duplicate to DRAFT and copying its
-    images; return its GID and the image copy's job.
+    images; return its GID and the ``imageJob`` Shopify answered, if any.
 
     fix1 (post-review, 2026-07): Shopify 2025-07's ``productDuplicate`` with NO
     ``newStatus`` INHERITS the source product's status. Since the source is a
@@ -129,10 +131,12 @@ def product_duplicate(transport: ShopifyTransport, source_gid: str, new_title: s
 
     Images (``docs/f7.3-live-tests.md`` §8 F3): ``includeImages`` defaults to
     false (``productDuplicate.md:52-58`` at 2026-10), so without it every outlet
-    was born without images. The copy is the duplicate's own and asynchronous:
-    ``imageJob`` is "the asynchronous job that duplicates the product images"
-    (``:102-106``), not done when the call returns — its id and ``done`` are
-    returned for the caller to record. :func:`set_product_media` is not used:
+    was born without images. The docs call ``imageJob`` "the asynchronous job
+    that duplicates the product images" (``:102-106``), but the store answers
+    ``imageJob: null`` and the duplicate references the source's own image
+    files — a delete removes only that product's reference (F7.3 run
+    202610092018, D1). A job, when one is returned, is passed back (``id``,
+    ``done``) for the caller to record. :func:`set_product_media` is not used:
     its ``productSet`` input carries ``ProductSetInput.id``, deprecated at the
     pin (§8 F1). The handle is the one Shopify generates; no caller rewrites it.
     """
@@ -728,7 +732,7 @@ def read_variant_inventory(
 
         {
           "id": <variant GID>,
-          "sku": <variant sku>,                     # secondary cross-check key
+          "sku": <variant sku>,                     # another SKU, or none: never raised (F1, D59)
           "title": <variant title>,                 # F7 §3.2: the exact-size match key
           "inventoryPolicy": "DENY" | "CONTINUE",   # on the VARIANT (not the item)
           "selectedOptions": [{"name","value"}, ...],

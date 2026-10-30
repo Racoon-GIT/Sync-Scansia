@@ -388,12 +388,14 @@
     inventoryBySku: {}, // sku -> join result (chips + freshness)
   };
 
-  // The live join's verdict on this pair's size: exact match (the SPs' rule), a twin
-  // spelling to respell at the source, or no variant.
+  // The live join's verdict on this pair's size: exact match (the SPs' rule), a variant
+  // of another SKU or of none, or a twin spelling, to respell at the source, or no variant.
   function sizeCell(join, size) {
     if (!join || join.failed) return "";
     const s = (join.sizes || []).find(function (x) { return x.size === size; });
     if (!s) return "";
+    if (s.foreign_sku === "(blank)") return "SKU vuota";               // variants.BLANK_SKU
+    if (s.foreign_sku) return "SKU diversa: " + esc(s.foreign_sku);
     if (s.matched) return "esatta (Promo " + esc(s.promo_available) + ")";
     if ((s.twins || []).length) return "da riscrivere: " + esc(s.twins.join(" | "));
     return "assente";

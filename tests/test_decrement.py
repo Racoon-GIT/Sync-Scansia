@@ -398,3 +398,47 @@ def test_d33_n0_held_unit_no_stamp_then_unit_back_minus_applied_or_shipped_relea
         (rel,) = [b for b in env.register().audit_rows(KIND_BASELINE) if (b.payload or {}).get("scope") == SCOPE_KEY]
         assert rel.payload["reason"] == "N 0" and rel.payload["stamped"] == [e] and rel.payload["released"] is False
         assert "n0_released" in rep.report.kinds()
+
+
+# ---------------------------------------------------------------------------
+# F1 guard: a lowering still reads a title match of another SKU (or of none) —
+# only raising flows refuse it; the unit there is lowered, never left online
+# ---------------------------------------------------------------------------
+F1_FOREIGN = "SKU9"
+
+
+def _f1_outlet(env: Env, foreign, **kw):
+    """The outlet resolves by SKU1 (its «43»); its «42» carries ``foreign``."""
+    return env.shop.product("Nike - Outlet", sizes=("43",), extra_variants=(("42", foreign),), **kw)
+
+
+@pytest.mark.parametrize("foreign", [F1_FOREIGN, None])
+def test_f1_a_minus_lowers_a_unit_on_a_title_match_of_another_sku(foreign):
+    env = Env()
+    out_p = _f1_outlet(env, foreign, promo={"42": 1, "43": 0})
+    env.sold(pairs=2)                                           # N 1: the group, not the N-0 release
+    rep = env.decrement()
+    assert rep.applied == {"SKU1|42": "stamped"} and env.unstamped() == []
+    assert env.shop.available(out_p.gid, "42") == 0
+    assert env.shop.products[out_p.gid].status == "DRAFT"          # then the product-total rule
+
+
+@pytest.mark.parametrize("foreign", [F1_FOREIGN, None])
+def test_f1_the_n0_release_waits_on_a_held_unit_on_a_title_match_of_another_sku(foreign):
+    env = Env()
+    _f1_outlet(env, foreign, promo={"42": 0, "43": 0}, committed={"42": 1})
+    e = env.sold()                                             # N 0
+    env.decrement()
+    assert env.unstamped() == [e] and env.shop.count("adjust") == 0
+    assert [b for b in env.register().audit_rows(KIND_BASELINE)
+            if (b.payload or {}).get("scope") == SCOPE_KEY] == []
+
+
+@pytest.mark.parametrize("foreign", [F1_FOREIGN, None])
+def test_f1_an_outlet_line_sale_on_a_title_match_of_another_sku_runs_the_product_total_rule(foreign):
+    env = Env()
+    out_p = _f1_outlet(env, foreign, promo={"42": 0, "43": 0})
+    env.sold(outlet_line=True, pairs=2)
+    rep = env.decrement()
+    assert rep.applied == {"SKU1|42": "stamp_only"} and env.unstamped() == []
+    assert env.shop.products[out_p.gid].status == "DRAFT"

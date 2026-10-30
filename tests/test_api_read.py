@@ -24,6 +24,7 @@ from backend.api.inventory import (
     CHIP_PUBLISHED,
     CHIP_SOLD_OUT,
     join_group,
+    join_result_to_dict,
     pair_to_dict,
     run_inventory_join,
 )
@@ -251,7 +252,8 @@ def test_endpoint_inventory_submit_then_poll(monkeypatch):
     rec = client.get(f"/scansia/inventory/{sub.json()['job_id']}", headers=_auth()).json()
     assert rec["status"] == "done" and rec["result"]["count"] == 1
     (res,) = rec["result"]["results"]
-    assert res["sizes"] == [{"size": "42", "n": 1, "matched": True, "promo_available": 1, "twins": []}]
+    assert res["sizes"] == [{"size": "42", "n": 1, "matched": True, "promo_available": 1, "twins": [],
+                              "foreign_sku": None}]
 
 
 def test_endpoint_inventory_second_submit_while_busy_is_409(monkeypatch):
@@ -282,3 +284,14 @@ def test_endpoint_audit_reads_the_audit_rows_newest_window(monkeypatch):
 def test_read_endpoints_require_auth(monkeypatch, method, path):
     client, _be, _shop = _client(monkeypatch)
     assert getattr(client, method)(path).status_code == 401
+
+
+@pytest.mark.parametrize("variant_sku, shown", [("OTHER", "OTHER"), (None, "(blank)")])
+def test_join_shows_a_title_match_on_a_variant_of_another_sku_f1(variant_sku, shown):
+    be, shop = MemoryBackend(), FakeShop()
+    shop.product("SKU1 - Outlet", sizes=("43",), promo={"43": 0, "42": 1}, extra_variants=(("42", variant_sku),))
+    r = join_group("SKU1", _pairs(be, ("SKU1", "42")), shop, PROMO, now=_clock)
+    (s,) = r.sizes
+    assert (s.matched, s.foreign_sku) == (True, shown)
+    assert CHIP_MISMATCH in r.chips and f"sku_mismatch_on_size:42:{shown}" in r.warnings
+    assert join_result_to_dict(r)["sizes"][0]["foreign_sku"] == shown
