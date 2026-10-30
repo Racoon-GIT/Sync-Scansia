@@ -515,7 +515,7 @@
     setStatus(statusEl, "calcolo piano...");
     try {
       const sub = await api("POST", "/outlet/publish/preview", undefined);
-      const rec = await pollJob("/outlet/publish/preview/" + sub.job_id);
+      const rec = await pollJob("/outlet/publish/preview/" + sub.job_id, INIT_POLL);
       if (rec.status === "failed") {
         setStatus(statusEl, jobFailureMessage(rec), "error");
         return;
@@ -553,7 +553,7 @@
     setStatus(statusEl, "applico...");
     try {
       const sub = await api("POST", "/outlet/publish/apply", publishState.pending);
-      const rec = await pollJob("/outlet/publish/apply/" + sub.job_id);
+      const rec = await pollJob("/outlet/publish/apply/" + sub.job_id, INIT_POLL);
       const failMsg = jobFailureMessage(rec);
       if (failMsg) {
         setStatus(statusEl, failMsg, "error");

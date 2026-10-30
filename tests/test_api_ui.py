@@ -104,3 +104,18 @@ def test_ui_router_only_exposes_static_routes():
     router = build_ui_router()
     paths = {r.path for r in router.routes}
     assert paths == {"/", "/app.js", "/app.css"}
+
+
+# ===========================================================================
+# The publish tab's long jobs poll with the 30-minute budget (F7.4): the live
+# preview ran 175 s, past pollJob's 120 s default. No JS harness exists, so
+# the pin is on the source text; it needs no web deps.
+# ===========================================================================
+def test_publish_polls_use_the_long_budget():
+    from pathlib import Path
+
+    js = (Path(__file__).resolve().parent.parent / "backend" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    for path in ("/outlet/publish/preview/", "/outlet/publish/apply/"):
+        assert f'pollJob("{path}" + sub.job_id, INIT_POLL)' in js, path
