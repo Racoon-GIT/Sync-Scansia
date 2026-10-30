@@ -955,3 +955,29 @@ def test_f1_case_tab_and_nbsp_are_other_skus_through_the_publish(spelled):
     plan, _rep = w.run()
     assert plan.actions[0].unmatched_sizes == ("39",)
     assert w.shop.available(out.gid, "39") == 0 and w.unstamped() == [e]
+
+
+def test_f1_a_create_whose_size_is_absent_on_the_duplicate_aborts_and_stamps_nothing():
+    """The same duplicate-time check (verify batch 2 m1, the lane's decision): a returned
+    size the duplicate lacks altogether (the source's variant removed since the confirm)
+    is one the CREATE row would stamp too — aborted, never a lost publication."""
+    w = World()
+    (e,) = w.returned(sku="SKU1", size="42")
+    src = w.shop.product("Nike Air", outlet=False, sizes=("42", "43"))
+    plan = w.preview()
+    assert plan.actions[0].branch == "CREATE"
+    fired = []
+
+    def remove(shop):
+        if not fired:
+            fired.append(1)
+            shop.products[src.gid].variants = [v for v in shop.products[src.gid].variants if v.title != "42"]
+    w.shop.on("duplicate", remove)
+    rep = w.apply(plan)
+    out = rep.outcomes[0]
+    dup = next(g for g, p in w.shop.products.items() if p.title == "Nike Air - Outlet")
+    assert [v.title for v in w.shop.products[dup].variants] == ["43"]
+    assert out.status == "CREATE_ABORTED" and "create_aborted:size_withheld" in out.warnings
+    assert out.stamped_event_ids == () and w.unstamped() == [e]
+    assert [p.online for p in w.register().shelf("SKU1")] == [False]
+    assert not any(i["kind"] == "sku_mismatch_withheld" for i in rep.surfaced)   # absent, not respelled
