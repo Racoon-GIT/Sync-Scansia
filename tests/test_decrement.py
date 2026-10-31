@@ -496,3 +496,25 @@ def test_backfill_a_second_pass_makes_no_resolver_call_and_an_offline_pair_none_
     assert calls == ["SKU1"]
     env.decrement()
     assert calls == ["SKU1"]
+
+
+def test_backfill_one_skus_failure_is_surfaced_and_never_aborts_the_pass(monkeypatch):
+    from backend.services import flows
+    from backend.shopify.ops import ShopifyUserError
+
+    env = Env()
+    env.shop.product("Nike - Outlet")
+    env.shop.product("Adidas - Outlet", sku="SKU2")
+    env.be.add_shelf_pair("SKU1", "42", reconciled=True, online=True)
+    env.be.add_shelf_pair("SKU2", "42", reconciled=True, online=True)
+    real = flows.maybe_set_outlet_product
+
+    def flaky(ctx, sku, res):
+        if sku == "SKU1":
+            raise ShopifyUserError("productUpdate", [{"message": "boom"}])
+        return real(ctx, sku, res)
+
+    monkeypatch.setattr(flows, "maybe_set_outlet_product", flaky)
+    rep = env.decrement()
+    assert "outlet_product_backfill_error" in rep.report.kinds()
+    assert [p.outlet_product_id is None for p in env.register().shelf()] == [True, False]   # SKU1 retried next pass
