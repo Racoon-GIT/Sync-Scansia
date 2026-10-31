@@ -143,6 +143,21 @@ class Holder:
         self.lease.release()
 
 
+def _backfill_outlet_products(ctx: flows.Context, out: PassReport) -> None:
+    """§3.1 on every pass: a published shelf pair (``ONLINE`` 1) still lacking
+    ``OUTLET_PRODUCT_ID`` — the publish resolved it before the collection
+    re-indexed, a ``review`` match — gets it once the SKU resolves to one
+    non-``review`` outlet. One resolver read per such SKU; none once filled."""
+    skus = sorted({p.sku for p in ctx.register.shelf() if p.online and p.outlet_product_id is None})
+    for sku in skus:
+        try:
+            flows.maybe_set_outlet_product(ctx, sku, ctx.resolve(sku))
+        except LeaseLost:
+            raise
+        except (ShopifyUserError, ShopifyTransportError, ProductNotFound, StoreError) as e:
+            out.report.surface("outlet_product_backfill_error", sku=sku, error=type(e).__name__)
+
+
 def decrement_pass(
     register: Any,
     transport: Any,
@@ -166,6 +181,7 @@ def decrement_pass(
     try:
         prologue(ctx, CLASS_DECREMENT)
         flows.n0_release(ctx)
+        _backfill_outlet_products(ctx, out)
         pend = register.pending_deltas()
         for e in pend.keyless:
             out.report.surface("consume_miss", event_id=e.event_id)

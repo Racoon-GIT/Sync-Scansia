@@ -442,3 +442,57 @@ def test_f1_an_outlet_line_sale_on_a_title_match_of_another_sku_runs_the_product
     rep = env.decrement()
     assert rep.applied == {"SKU1|42": "stamp_only"} and env.unstamped() == []
     assert env.shop.products[out_p.gid].status == "DRAFT"
+
+
+# ---------------------------------------------------------------------------
+# §3.1 backfill: a published pair whose publish saw a `review` match gets its id on a later pass
+# ---------------------------------------------------------------------------
+def _backfill_calls(monkeypatch):
+    from backend.services import resolvers
+
+    real, calls = resolvers.outlet_resolver, []
+
+    def spy(transport, sku):
+        calls.append(sku)
+        return real(transport, sku)
+
+    monkeypatch.setattr(resolvers, "outlet_resolver", spy)
+    return calls
+
+
+def test_backfill_writes_the_outlet_product_id_on_an_online_shelf_pair_with_one_register_row():
+    from backend.persistence.records import KIND_REGISTER
+    from backend.services import flows
+
+    env = Env()
+    out_p = env.shop.product("Nike - Outlet")
+    pid, _ = env.be.add_shelf_pair("SKU1", "42", reconciled=True, online=True)
+    assert env.unstamped() == []
+    env.decrement()
+    assert [p.outlet_product_id for p in env.register().shelf("SKU1")] == [flows.product_number(out_p.gid)]
+    rows = [r for r in env.register().audit_rows(KIND_REGISTER) if r.action == "set_outlet_product_id"]
+    assert len(rows) == 1 and [p["pair_id"] for p in rows[0].payload["pairs"]] == [pid]
+
+
+def test_backfill_never_writes_a_review_match():
+    from backend.persistence.records import KIND_REGISTER
+
+    env = Env()
+    env.shop.product("Nike - Outlet", outlet=False)           # title says outlet, the collection has not caught up
+    env.be.add_shelf_pair("SKU1", "42", reconciled=True, online=True)
+    env.decrement()
+    assert [p.outlet_product_id for p in env.register().shelf("SKU1")] == [None]
+    assert [r for r in env.register().audit_rows(KIND_REGISTER) if r.action == "set_outlet_product_id"] == []
+
+
+def test_backfill_a_second_pass_makes_no_resolver_call_and_an_offline_pair_none_at_all(monkeypatch):
+    env = Env()
+    env.shop.product("Nike - Outlet")
+    env.shop.product("Adidas - Outlet", sku="SKU2")
+    env.be.add_shelf_pair("SKU1", "42", reconciled=True, online=True)
+    env.be.add_shelf_pair("SKU2", "42", reconciled=True)            # ONLINE 0: not published, not resolved
+    calls = _backfill_calls(monkeypatch)
+    env.decrement()
+    assert calls == ["SKU1"]
+    env.decrement()
+    assert calls == ["SKU1"]

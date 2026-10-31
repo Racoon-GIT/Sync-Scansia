@@ -92,6 +92,7 @@ test_api_init · `gate` test_promo_gate · `co` test_create_order (§14).
 | M19 | one price and compare-at per SKU | `out` one_price_per_sku…; a_new_return_with_no_price…; active_refreshes_price_and_compare_at…; `price` two_compare_ats_on_one_sku_list_and_block_it |
 | M20 | `ONLINE` set by the baseline, the publish, a re-level, a revive | `base` online_is_set_from_the_result…; `out` online_is_set_on_the_pairs_whose_plus_one_applied; `rel` a_size_absent_hold_is_released…; `cov` z17 |
 | M21 | one audit row per register write | `reg` every_register_write_is_one_transaction_with_its_audit_row; outlet_product_set_on_shelf_and_cleared_in_any_state |
+| M21a | §3.1 on every decrement pass: an `ONLINE` 1 shelf pair lacking `OUTLET_PRODUCT_ID` gets it (one REGISTER row), never from a `review` match, one resolver read per such SKU and none once filled (W5) | `dec` backfill_writes_the_outlet_product_id…; backfill_never_writes_a_review_match; backfill_a_second_pass_makes_no_resolver_call… |
 | M22 | `available` ≤ 0 | `dec` available_at_or_below_zero…; a_negative_available_is_never_raised |
 | M23 | customisation-only excluded from counts | `dec` customisation_only_units…; `base` a_customisation_only_variant_never_counts_as_a_key; `read` join_zero_promo_is_sold_out_and_customisation_only_never_counts |
 | M24 | a failed / multi / truncated resolution ≠ none | `dec` a_failed_resolution_is_not_none…; `cov` m24; t2 |
