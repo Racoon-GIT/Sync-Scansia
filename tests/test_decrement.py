@@ -518,3 +518,79 @@ def test_backfill_one_skus_failure_is_surfaced_and_never_aborts_the_pass(monkeyp
     rep = env.decrement()
     assert "outlet_product_backfill_error" in rep.report.kinds()
     assert [p.outlet_product_id is None for p in env.register().shelf()] == [True, False]   # SKU1 retried next pass
+
+
+def test_backfill_renews_the_lease_before_every_resolve(monkeypatch):
+    from backend.services import resolvers
+    from tests.test_lease import Mono
+
+    env = Env()
+    for sku in ("SKU1", "SKU2"):
+        env.shop.product("Nike - Outlet", sku=sku, outlet=False)    # review: nothing is written, nothing else renews
+        env.be.add_shelf_pair(sku, "42", reconciled=True, online=True)
+    mono = Mono()
+    reg = env.register()
+    lease = PassLease(reg, "decrement", clock=mono, sleep=lambda s: None)
+    window = (lease.ttl_ms - lease.send_margin_ms) / 1000.0
+    left, real = [], resolvers.outlet_resolver
+
+    def slow(transport, sku):
+        left.append(lease.send_deadline() - mono())
+        mono.t += lease.renew_after_ms / 1000.0                     # a resolve takes as long as a renew is due
+        return real(transport, sku)
+
+    monkeypatch.setattr(resolvers, "outlet_resolver", slow)
+    passes.decrement_pass(reg, env.shop, PROMO, lease=lease, sleep=lambda s: None)
+    assert left == [window, window]
+
+
+def test_backfill_a_lost_lease_aborts_the_pass_and_releases(monkeypatch):
+    from backend.persistence.records import LeaseLost
+    from backend.services import flows
+
+    env = Env()
+    env.shop.product("Nike - Outlet", promo={"42": 1, "43": 0})
+    env.shop.product("Adidas - Outlet", sku="SKU2")
+    e = env.sold()                                                   # a pending group that must NOT be applied
+    env.be.add_shelf_pair("SKU2", "42", reconciled=True, online=True)
+    seen = []
+
+    def lost(ctx, sku, res):
+        seen.append(sku)
+        raise LeaseLost("taken over")
+
+    monkeypatch.setattr(flows, "maybe_set_outlet_product", lost)
+    reg = env.register()
+    lease = PassLease(reg, "decrement", sleep=lambda s: None)
+    with pytest.raises(LeaseLost):
+        passes.decrement_pass(reg, env.shop, PROMO, lease=lease, sleep=lambda s: None)
+    assert seen == ["SKU2"] and not lease.held
+    assert env.unstamped() == [e] and env.shop.count("adjust") == 0
+
+
+def test_backfill_a_store_error_on_one_write_is_surfaced_and_the_groups_still_apply(monkeypatch):
+    from backend.persistence.records import GuardMismatch
+    from backend.services import flows
+
+    env = Env()
+    out_p = env.shop.product("Nike - Outlet", promo={"42": 1, "43": 0})
+    env.shop.product("Adidas - Outlet", sku="SKU2")
+    env.shop.product("Puma - Outlet", sku="SKU3")
+    env.sold()                                                       # SKU1|42: a group the pass must still apply
+    env.be.add_shelf_pair("SKU2", "42", reconciled=True, online=True)
+    env.be.add_shelf_pair("SKU3", "42", reconciled=True, online=True)
+    real = flows.maybe_set_outlet_product
+
+    def flaky(ctx, sku, res):
+        if sku == "SKU2":
+            raise GuardMismatch(1, 2, 1)
+        return real(ctx, sku, res)
+
+    monkeypatch.setattr(flows, "maybe_set_outlet_product", flaky)
+    rep = env.decrement()
+    assert [i for i in rep.report.items if i["kind"] == "outlet_product_backfill_error"] == [
+        {"kind": "outlet_product_backfill_error", "sku": "SKU2", "error": "GuardMismatch"}]
+    ids = {p.sku: p.outlet_product_id for p in env.register().shelf()}
+    assert ids["SKU2"] is None and ids["SKU3"] is not None          # the next SKU was filled
+    assert rep.applied == {"SKU1|42": "stamped"} and env.unstamped() == []
+    assert env.shop.available(out_p.gid, "42") == 0

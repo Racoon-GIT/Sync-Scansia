@@ -151,6 +151,7 @@ def _backfill_outlet_products(ctx: flows.Context, out: PassReport) -> None:
     skus = sorted({p.sku for p in ctx.register.shelf() if p.online and p.outlet_product_id is None})
     for sku in skus:
         try:
+            ctx.ledger.lease.keepalive()                  # pure Shopify reads: nothing else renews across the loop
             flows.maybe_set_outlet_product(ctx, sku, ctx.resolve(sku))
         except LeaseLost:
             raise
